@@ -2,7 +2,7 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue?logo=windows)
 
 CloneWiper is a high-performance, modern duplicate file detection tool built with Python and PySide6 (Qt). It follows **Material Design 3** principles to provide a premium, seamless experience for managing your file library.
 
