@@ -164,7 +164,7 @@ CloneWiper/
 └── LICENSE               # License file
 ```
 
-## 🛠️ Development
+##  Development
 
 ### Running Tests
 ```bash
@@ -175,7 +175,7 @@ python -m pytest
 ### Code Style
 This project follows PEP 8 style guidelines.
 
-## 🤝 Contributing
+##  Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
@@ -185,11 +185,11 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 4. Push to the branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
 
-## 📝 License
+##  License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🙏 Acknowledgments
+##  Acknowledgments
 
 - **PySide6** - Qt for Python
 - **Pillow** - Image processing
@@ -203,5 +203,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 For issues, questions, or suggestions, please open an issue on GitHub.
 
 ---
-
-Made with ❤️ using Python and PySide6
