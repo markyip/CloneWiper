@@ -1498,7 +1498,12 @@ class CustomDialog(QDialog):
     def __init__(self, parent=None, title="", message="", buttons=None):
         super().__init__(parent)
         self.setWindowTitle("CloneWiper")
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.MSWindowsFixedSizeDialogHint | Qt.WindowType.FramelessWindowHint)
+        # Cross-platform window flags (MSWindowsFixedSizeDialogHint is Windows-only)
+        import platform
+        flags = Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
+        if platform.system() == "Windows":
+            flags |= Qt.WindowType.MSWindowsFixedSizeDialogHint
+        self.setWindowFlags(flags)
         self.setModal(True)
         
         # Default buttons

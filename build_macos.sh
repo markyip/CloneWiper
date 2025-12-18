@@ -65,7 +65,8 @@ echo ""
 echo "Building application bundle..."
 
 # Build PyInstaller command
-PYINSTALLER_CMD="pyinstaller --onefile --windowed --name=CloneWiper"
+# Use --onedir (not --onefile) for macOS to create proper .app bundle
+PYINSTALLER_CMD="pyinstaller --onedir --windowed --name=CloneWiper"
 
 # Add icon if specified
 if [ -n "$ICON_ARG" ]; then
