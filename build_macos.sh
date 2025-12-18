@@ -66,7 +66,8 @@ echo "Building application bundle..."
 
 # Build PyInstaller command
 # Use --onedir (not --onefile) for macOS to create proper .app bundle
-PYINSTALLER_CMD="pyinstaller --onedir --windowed --name=CloneWiper"
+# Add --osx-bundle-identifier for proper macOS app bundle
+PYINSTALLER_CMD="pyinstaller --onedir --windowed --name=CloneWiper --osx-bundle-identifier=com.clonewiper.app"
 
 # Add icon if specified
 if [ -n "$ICON_ARG" ]; then
@@ -120,6 +121,27 @@ fi
 # PyInstaller creates a .app bundle on macOS
 if [ -d "dist/CloneWiper.app" ]; then
     echo ""
+    echo "Post-processing app bundle..."
+    
+    # Fix permissions for the executable
+    if [ -f "dist/CloneWiper.app/Contents/MacOS/CloneWiper" ]; then
+        chmod +x "dist/CloneWiper.app/Contents/MacOS/CloneWiper"
+        echo "Set executable permissions on CloneWiper binary"
+    fi
+    
+    # Create Info.plist if it doesn't exist or update it
+    INFO_PLIST="dist/CloneWiper.app/Contents/Info.plist"
+    if [ -f "$INFO_PLIST" ]; then
+        # Update minimum macOS version if needed
+        /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion 10.14" "$INFO_PLIST" 2>/dev/null || \
+        /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 10.14" "$INFO_PLIST" 2>/dev/null
+        echo "Updated Info.plist"
+    fi
+    
+    # Remove quarantine attribute (allows app to run without Gatekeeper blocking)
+    xattr -cr "dist/CloneWiper.app" 2>/dev/null || echo "Note: Could not remove quarantine attributes (may need to allow in System Settings)"
+    
+    echo ""
     echo "Creating DMG..."
     
     # Create DMG using create-dmg
@@ -132,7 +154,7 @@ if [ -d "dist/CloneWiper.app" ]; then
         --hide-extension "CloneWiper.app" \
         --app-drop-link 425 190 \
         "dist/CloneWiper.dmg" \
-        "dist/CloneWiper.app"
+        "dist/CloneWiper.app" 2>&1
     
     if [ $? -eq 0 ]; then
         echo ""
@@ -146,13 +168,25 @@ if [ -d "dist/CloneWiper.app" ]; then
         echo "DMG location: dist/CloneWiper.dmg"
         echo "App bundle: dist/CloneWiper.app"
         echo ""
+        echo "IMPORTANT: If the app doesn't launch when double-clicked:"
+        echo "1. Right-click the app and select 'Open' (first time only)"
+        echo "2. Or go to System Settings > Privacy & Security and allow the app"
+        echo "3. Or run from terminal: open dist/CloneWiper.app"
+        echo ""
     else
         echo ""
         echo "DMG creation failed, but app bundle is available at: dist/CloneWiper.app"
+        echo ""
+        echo "To test the app bundle:"
+        echo "  open dist/CloneWiper.app"
+        echo "  or"
+        echo "  dist/CloneWiper.app/Contents/MacOS/CloneWiper"
+        echo ""
     fi
 else
     echo ""
     echo "App bundle not found. Build may have failed."
+    echo "Check the error messages above for details."
     exit 1
 fi
 
