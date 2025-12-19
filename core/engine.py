@@ -149,6 +149,8 @@ class ScanEngine:
         self._phash_db = None
         self._phash_db_lock = threading.Lock()
         self._phash_db_path = self._get_default_phash_db_path()
+        # Debug: Always log the database path being used
+        print(f"DEBUG: Cache database path: {self._phash_db_path}")
         self._cache_db_ro_local = None
         
         # Cache stats
@@ -186,10 +188,13 @@ class ScanEngine:
             return set()
     
     def _get_default_phash_db_path(self) -> str:
-        """Choose a writable cache location (cross-platform)."""
+        """Choose a writable cache location (cross-platform).
+        
+        Always uses platform-specific cache directories to ensure EXE and main.py use the same database.
+        """
         import platform
         
-        # Try platform-specific cache directories
+        # Always try platform-specific cache directories first (same for EXE and main.py)
         try:
             system = platform.system()
             if system == "Windows":
@@ -197,19 +202,39 @@ class ScanEngine:
                 if base:
                     cache_dir = os.path.join(base, "CloneWiper")
                     os.makedirs(cache_dir, exist_ok=True)
-                    return os.path.join(cache_dir, "phash_cache.sqlite3")
+                    db_path = os.path.join(cache_dir, "phash_cache.sqlite3")
+                    # Debug: Log the database path being used
+                    if hasattr(self, '_debug_mode') and self._debug_mode:
+                        print(f"DEBUG: Using cache DB path: {db_path}")
+                    return db_path
             elif system == "Darwin":  # macOS
                 cache_dir = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "CloneWiper")
                 os.makedirs(cache_dir, exist_ok=True)
-                return os.path.join(cache_dir, "phash_cache.sqlite3")
-        except Exception:
-            pass
+                db_path = os.path.join(cache_dir, "phash_cache.sqlite3")
+                if hasattr(self, '_debug_mode') and self._debug_mode:
+                    print(f"DEBUG: Using cache DB path: {db_path}")
+                return db_path
+        except Exception as e:
+            # Log error but continue to fallback
+            print(f"DEBUG: Failed to use platform cache directory: {e}")
         
-        # Fallback to project directory
+        # Fallback: Use user's home directory (works for both EXE and main.py)
         try:
-            cache_dir = os.path.join(os.path.dirname(__file__), "..", ".cache")
-            os.makedirs(cache_dir, exist_ok=True)
-            return os.path.join(cache_dir, "phash_cache.sqlite3")
+            home = os.path.expanduser("~")
+            if home:
+                cache_dir = os.path.join(home, ".CloneWiper")
+                os.makedirs(cache_dir, exist_ok=True)
+                db_path = os.path.join(cache_dir, "phash_cache.sqlite3")
+                print(f"DEBUG: Using fallback cache DB path: {db_path}")
+                return db_path
+        except Exception as e:
+            print(f"DEBUG: Fallback to home directory failed: {e}")
+        
+        # Last resort: current directory (not recommended, but ensures it works)
+        try:
+            db_path = os.path.abspath("phash_cache.sqlite3")
+            print(f"DEBUG: Using last resort cache DB path: {db_path}")
+            return db_path
         except Exception:
             return "phash_cache.sqlite3"
     
@@ -227,21 +252,71 @@ class ScanEngine:
                     conn.execute("PRAGMA synchronous=NORMAL;")
                 except Exception:
                     pass
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS phash_cache (
-                        path TEXT NOT NULL,
-                        size INTEGER NOT NULL,
-                        mtime_ns INTEGER NOT NULL,
-                        algo TEXT NOT NULL,
-                        hash TEXT NOT NULL,
-                        updated INTEGER NOT NULL,
-                        PRIMARY KEY (path, algo)
+                
+                # Check if table exists and has correct structure
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='phash_cache'")
+                table_exists = cursor.fetchone() is not None
+                
+                if table_exists:
+                    # Check PRIMARY KEY structure
+                    cursor.execute("PRAGMA table_info(phash_cache)")
+                    columns = cursor.fetchall()
+                    pk_columns = [col[1] for col in columns if col[5] == 1]  # col[5] is pk flag
+                    
+                    # If PRIMARY KEY is only (path), need to migrate
+                    if len(pk_columns) == 1 and pk_columns[0] == 'path':
+                        try:
+                            print("DEBUG: Migrating phash_cache table structure from PRIMARY KEY (path) to PRIMARY KEY (path, algo)...")
+                            # Step 1: Create new table
+                            cursor.execute("""
+                                CREATE TABLE phash_cache_new (
+                                    path TEXT NOT NULL,
+                                    size INTEGER NOT NULL,
+                                    mtime_ns INTEGER NOT NULL,
+                                    algo TEXT NOT NULL,
+                                    hash TEXT NOT NULL,
+                                    updated INTEGER NOT NULL,
+                                    PRIMARY KEY (path, algo)
+                                )
+                            """)
+                            # Step 2: Copy data
+                            cursor.execute("""
+                                INSERT INTO phash_cache_new (path, size, mtime_ns, algo, hash, updated)
+                                SELECT path, size, mtime_ns, algo, hash, updated
+                                FROM phash_cache
+                            """)
+                            migrated_count = cursor.rowcount
+                            # Step 3: Drop old table
+                            cursor.execute("DROP TABLE phash_cache")
+                            # Step 4: Rename new table
+                            cursor.execute("ALTER TABLE phash_cache_new RENAME TO phash_cache")
+                            # Step 5: Recreate indexes
+                            cursor.execute("CREATE INDEX IF NOT EXISTS idx_phash_updated ON phash_cache(updated)")
+                            cursor.execute("CREATE INDEX IF NOT EXISTS idx_phash_path_algo ON phash_cache(path, algo)")
+                            conn.commit()
+                            print(f"DEBUG: Migration completed successfully. Migrated {migrated_count} entries.")
+                        except Exception as migrate_error:
+                            print(f"DEBUG: Migration failed: {migrate_error}")
+                            conn.rollback()
+                            # Continue with old structure - backward compatibility will handle it
+                else:
+                    # Table doesn't exist, create with correct structure
+                    conn.execute(
+                        """
+                        CREATE TABLE phash_cache (
+                            path TEXT NOT NULL,
+                            size INTEGER NOT NULL,
+                            mtime_ns INTEGER NOT NULL,
+                            algo TEXT NOT NULL,
+                            hash TEXT NOT NULL,
+                            updated INTEGER NOT NULL,
+                            PRIMARY KEY (path, algo)
+                        )
+                        """
                     )
-                    """
-                )
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_phash_updated ON phash_cache(updated)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_phash_path_algo ON phash_cache(path, algo)")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_phash_updated ON phash_cache(updated)")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_phash_path_algo ON phash_cache(path, algo)")
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS md5_cache (
@@ -326,14 +401,34 @@ class ScanEngine:
                 "SELECT hash FROM phash_cache WHERE path=? AND algo=? AND size=? AND mtime_ns=?",
                 (p, str(algo), int(size), int(mtime_ns)),
             ).fetchone()
-        except Exception:
+            
+            # If not found, try legacy algorithm names for backward compatibility
+            if not row:
+                legacy_algo = None
+                if algo == "single_hash":
+                    legacy_algo = "average_hash"
+                elif algo == "video_single_hash":
+                    legacy_algo = "video_average_hash"
+                
+                if legacy_algo:
+                    row = conn.execute(
+                        "SELECT hash FROM phash_cache WHERE path=? AND algo=? AND size=? AND mtime_ns=?",
+                        (p, legacy_algo, int(size), int(mtime_ns)),
+                    ).fetchone()
+        except Exception as e:
+            # Log cache query errors for debugging (only in debug mode)
+            if hasattr(self, '_debug_mode') and self._debug_mode:
+                print(f"DEBUG: Cache query error for {os.path.basename(file_path)}: {e}")
             return None
         if not row:
             return None
         try:
             h0 = row[0]
             return str(h0)
-        except Exception:
+        except Exception as e:
+            # Log cache result parsing errors for debugging
+            if hasattr(self, '_debug_mode') and self._debug_mode:
+                print(f"DEBUG: Cache result parsing error for {os.path.basename(file_path)}: {e}")
             return None
     
     def _phash_cache_put(self, file_path: str, size: int, mtime_ns: int, algo: str, hash_str: str):
@@ -610,6 +705,9 @@ class ScanEngine:
                                     self._phash_cache_misses += 1
                             except Exception:
                                 pass
+                            # Debug: Log cache miss for multi_hash to help diagnose
+                            if self.use_multi_hash and self._phash_cache_misses % 100 == 0:
+                                print(f"DEBUG: Cache miss for multi_hash: {os.path.basename(file_path)} (algo={algo}, size={size}, mtime_ns={mtime_ns})")
                     
                     try:
                         img = None
@@ -1445,8 +1543,12 @@ class ScanEngine:
             print(f"DEBUG:   - Total files in groups: {total_files_in_groups}")
             print(f"DEBUG:   - use_imagehash={self.use_imagehash}, use_multi_hash={self.use_multi_hash}")
             print(f"DEBUG: Cache stats - pHash: {phash_lookups} lookups, {phash_hits} hits, {phash_misses} misses, {phash_puts} puts")
+            if phash_lookups > 0:
+                hit_rate = (phash_hits / phash_lookups) * 100
+                print(f"DEBUG: pHash cache hit rate: {hit_rate:.1f}%")
             print(f"DEBUG: Cache stats - MD5: {md5_lookups} lookups, {md5_hits} hits, {md5_misses} misses, {md5_puts} puts")
             print(f"DEBUG: Cache DB path: {self._phash_db_path}")
+            print(f"DEBUG: Hash mode - use_imagehash: {self.use_imagehash}, use_multi_hash: {self.use_multi_hash}")
             
             self.file_groups_raw = duplicate_groups
             print(f"DEBUG: Calling results_callback with {len(duplicate_groups)} groups")
