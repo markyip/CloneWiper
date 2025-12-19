@@ -1927,29 +1927,50 @@ class CloneWiperApp(QMainWindow):
         # Add stretch to push controls to the right
         control_layout.addStretch()
         
-        # PHash Toggle
-        self.phash_check = QCheckBox("Multi-Algorithm Perceptual Hash")
-        self.phash_check.setStyleSheet(f"""
-            QCheckBox {{
-                color: {MD3_COLORS['on_surface']};
-                background-color: transparent;
-                font-size: 13px;
-                spacing: 8px;
-                padding: 4px;
-            }}
-            QCheckBox::indicator {{
-                width: 18px;
-                height: 18px;
-                border: 2px solid {MD3_COLORS['outline']};
-                border-radius: 4px;
+        # Hash Mode Selection
+        hash_mode_label = QLabel("Hash Mode:")
+        hash_mode_label.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; font-size: 13px;")
+        control_layout.addWidget(hash_mode_label)
+        
+        self.hash_mode_combo = QComboBox()
+        self.hash_mode_combo.addItems(["MD5 Only", "Single Perceptual Hash", "Multi-Algorithm Perceptual Hash"])
+        self.hash_mode_combo.setCurrentIndex(2)  # Default to multi-algorithm
+        self.hash_mode_combo.setFixedHeight(32)
+        self.hash_mode_combo.setStyleSheet(f"""
+            QComboBox {{
                 background-color: {MD3_COLORS['bg_subtle']};
+                color: {MD3_COLORS['on_surface']};
+                border: 1px solid {MD3_COLORS['outline']};
+                border-radius: 8px;
+                padding: 4px 12px;
+                font-size: 13px;
+                font-weight: 500;
+                min-width: 200px;
             }}
-            QCheckBox::indicator:checked {{
-                background-color: {MD3_COLORS['primary']};
+            QComboBox:hover {{
                 border-color: {MD3_COLORS['primary']};
             }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {MD3_COLORS['bg_subtle']};
+                color: {MD3_COLORS['on_surface']};
+                border: 1px solid {MD3_COLORS['outline']};
+                border-radius: 8px;
+                selection-background-color: {MD3_COLORS['primary_container']};
+                selection-color: {MD3_COLORS['on_primary_container']};
+                font-size: 13px;
+                font-weight: 500;
+                padding: 4px;
+            }}
+            QComboBox QAbstractItemView::item {{
+                padding: 6px 12px;
+                border-radius: 4px;
+            }}
         """)
-        control_layout.addWidget(self.phash_check)
+        control_layout.addWidget(self.hash_mode_combo)
         
         # Scan Button (Filled)
         self.scan_btn = QPushButton("Start Scanning")
@@ -2429,7 +2450,10 @@ class CloneWiperApp(QMainWindow):
         self.progress_bar.setValue(0)
         self.status_label.setText("Starting scan...")
         
-        use_imagehash = self.phash_check.isChecked()
+        # Get hash mode: 0=MD5, 1=Single Perceptual, 2=Multi-Algorithm
+        hash_mode = self.hash_mode_combo.currentIndex()
+        use_imagehash = hash_mode > 0  # True for single or multi-algorithm
+        use_multi_hash = hash_mode == 2  # True only for multi-algorithm
         
         # Clear previous results
         self.file_groups = {}
@@ -2470,7 +2494,7 @@ class CloneWiperApp(QMainWindow):
                 self.engine.status_callback("Scan thread started...")
                 self.engine.progress_callback(0.01)
                 
-                self.engine.scan_duplicate_files(valid_paths, use_imagehash)
+                self.engine.scan_duplicate_files(valid_paths, use_imagehash, use_multi_hash)
                 print("DEBUG: Scan completed")
             except Exception as e:
                 import traceback

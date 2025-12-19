@@ -143,6 +143,7 @@ class ScanEngine:
         self.phash_cache_enabled = True
         self.md5_cache_enabled = True
         self.use_imagehash = False
+        self.use_multi_hash = False  # True for multi-algorithm, False for single algorithm
         
         # Persistent cache DB
         self._phash_db = None
@@ -438,6 +439,42 @@ class ScanEngine:
     def is_epub_file(self, file_path: str) -> bool:
         return os.path.splitext(file_path.lower())[1] in self.EPUB_EXTENSIONS
     
+    def _calculate_single_hash(self, img: Image.Image) -> Optional[str]:
+        """
+        Calculate single perceptual hash using phash (perceptual hash) algorithm.
+        phash is more accurate than average_hash and is a good balance between speed and accuracy.
+        
+        Args:
+            img: PIL Image object
+            
+        Returns:
+            Hash string or None on error
+        """
+        try:
+            if not IMAGEHASH_AVAILABLE:
+                return None
+            
+            # Convert to RGB if needed
+            try:
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+            except Exception as convert_error:
+                print(f"DEBUG: Image mode conversion failed, using original mode: {convert_error}")
+            
+            # Use phash (perceptual hash) - more accurate than average_hash
+            try:
+                return str(imagehash.phash(img))
+            except Exception as e:
+                print(f"DEBUG: phash failed: {e}")
+                # Fallback to average_hash if phash fails
+                try:
+                    return str(imagehash.average_hash(img))
+                except Exception:
+                    return None
+        except Exception as e:
+            print(f"DEBUG: Single hash calculation failed: {e}")
+            return None
+    
     def _calculate_multi_hash(self, img: Image.Image) -> Optional[str]:
         """
         Calculate combined perceptual hash using multiple algorithms for better accuracy.
@@ -551,7 +588,7 @@ class ScanEngine:
                         size = 0
                         mtime_ns = 0
                     
-                    algo = "multi_hash"  # Updated algorithm name
+                    algo = "multi_hash" if self.use_multi_hash else "single_hash"  # Algorithm name based on mode
                     if st is not None:
                         try:
                             with self._phash_stats_lock:
@@ -625,8 +662,11 @@ class ScanEngine:
                                     img = None
                         
                         if img is not None:
-                            # Use multi-hash algorithm for better accuracy
-                            img_hash = self._calculate_multi_hash(img)
+                            # Use single or multi-hash algorithm based on setting
+                            if self.use_multi_hash:
+                                img_hash = self._calculate_multi_hash(img)
+                            else:
+                                img_hash = self._calculate_single_hash(img)
                             img.close()  # Explicitly close to free memory
                             
                             if st is not None and img_hash:
@@ -660,7 +700,7 @@ class ScanEngine:
                 size = 0
                 mtime_ns = 0
             
-            algo = "video_multi_hash"  # Updated algorithm name
+            algo = "video_multi_hash" if self.use_multi_hash else "video_single_hash"  # Algorithm name based on mode
             if st is not None:
                 try:
                     with self._phash_stats_lock:
@@ -738,7 +778,10 @@ class ScanEngine:
                             # Convert to PIL Image and calculate multi-hash
                             img = Image.fromarray(frame_rgb)
                             # Use multi-hash algorithm for each frame
-                            frame_hash = self._calculate_multi_hash(img)
+                            if self.use_multi_hash:
+                                frame_hash = self._calculate_multi_hash(img)
+                            else:
+                                frame_hash = self._calculate_single_hash(img)
                             if frame_hash:
                                 frame_hashes.append(frame_hash)
                             img.close()
@@ -1109,17 +1152,19 @@ class ScanEngine:
         
         return merged_groups
     
-    def scan_duplicate_files(self, scan_paths: List[str], use_imagehash: bool = False):
+    def scan_duplicate_files(self, scan_paths: List[str], use_imagehash: bool = False, use_multi_hash: bool = True):
         """
         Main scanning function.
         
         Args:
             scan_paths: List of directory paths to scan
             use_imagehash: Whether to use perceptual hashing for images and videos
+            use_multi_hash: If True, use multi-algorithm hash; if False, use single algorithm (phash)
         """
         try:
             self.scan_cancelled = False
             self.use_imagehash = use_imagehash and IMAGEHASH_AVAILABLE
+            self.use_multi_hash = use_multi_hash if self.use_imagehash else False
             
             self.file_groups = defaultdict(list)
             self.files_scanned = 0
