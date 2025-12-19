@@ -2,7 +2,7 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue?logo=windows)
+![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-orange?logo=buy-me-a-coffee)](https://www.buymeacoffee.com/markyip)
 ![Downloads](https://img.shields.io/github/downloads/markyip/CloneWiper/total) 
 
@@ -15,7 +15,7 @@ CloneWiper is a high-performance, modern duplicate file detection tool built wit
   - **Multi-Algorithm Perceptual Hashing**: Combines average_hash, phash (perceptual), dhash (difference), and whash (wavelet) for superior accuracy
   - **Image Support**: Works with common formats (JPEG, PNG, GIF, BMP, TIFF, WebP) and RAW files (CR2, NEF, ARW, etc.)
   - **Video Support**: Perceptual hashing for video files using keyframe extraction
-- **Cross-Platform Support**: Works on Windows, macOS, and Linux
+- **Cross-Platform Support**: Works on Windows (macOS support from source code only)
 - **High Performance**: Asynchronous processing with multi-threaded file scanning
 - **Persistent Caching**: SQLite-backed cache for fast re-scans
 
@@ -40,7 +40,7 @@ CloneWiper is a high-performance, modern duplicate file detection tool built wit
 ## 📋 Prerequisites
 
 - **Python 3.8+**
-- **Windows 10/11**, **macOS 10.14+**, or **Linux**
+- **Windows 10/11** (macOS: run from source code only, executable build not currently supported)
 
 ## 🚀 Installation
 
@@ -84,15 +84,14 @@ launch.bat
 python main.py
 ```
 
-### macOS / Linux
+### macOS (Source Code Only)
+**Note**: macOS executable build is currently not supported. You can run from source code:
+
 ```bash
-# Make launch script executable (first time only)
-chmod +x launch.sh
+# Install dependencies
+pip3 install -r requirements.txt
 
-# Run
-./launch.sh
-
-# Or directly
+# Run directly
 python3 main.py
 ```
 
@@ -124,25 +123,9 @@ python3 main.py
 
    The executable will be in `dist/CloneWiper.exe`
 
-### macOS (DMG)
+### macOS Build
 
-1. Install PyInstaller and create-dmg:
-   ```bash
-   pip install pyinstaller
-   npm install -g create-dmg
-   ```
-
-2. **Optional**: Create `icons/app.icns` for better icon quality (see `icons/README.md`)
-
-3. Run the build script:
-   ```bash
-   chmod +x build_macos.sh
-   ./build_macos.sh
-   ```
-
-   The DMG will be in `dist/CloneWiper.dmg`
-
-   **Note**: The build script will automatically use `icons/app.icns` if available, otherwise fall back to `favicon.ico`
+**Note**: macOS executable build is currently not supported. Please run from source code using `python3 main.py`.
 
 ## 📁 Project Structure
 
@@ -158,9 +141,7 @@ CloneWiper/
 ├── requirements.txt       # Python dependencies
 ├── favicon.ico           # Application icon (Windows)
 ├── launch.bat            # Windows launch script
-├── launch.sh             # macOS/Linux launch script
 ├── build_windows.bat     # Windows build script
-├── build_macos.sh        # macOS build script
 ├── BUILD.md              # Build instructions
 ├── README.md             # This file
 └── LICENSE               # License file

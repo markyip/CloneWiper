@@ -55,6 +55,8 @@ Cache/
 *.phash.db
 *.phash_cache.db
 *.md5_cache.db
+phash_cache.sqlite3
+.md5_cache.db
 
 # OS
 .DS_Store
@@ -90,6 +92,9 @@ htmlcov/
 # Documentation
 docs/_build/
 site/
+
+# Troubleshooting guides (macOS specific - optional, can be kept for reference)
+# macOS_PDF_TROUBLESHOOTING.md  # Keep this if users run from source on macOS
 
 # Jupyter Notebook
 .ipynb_checkpoints

@@ -456,7 +456,19 @@ class ThumbnailWorker(QRunnable):
                         try:
                             import pypdfium2 as pdfium
                             from PIL import Image
+                            import platform
+                            
+                            # Check if file exists and is readable
+                            if not os.path.exists(self.file_path):
+                                raise FileNotFoundError(f"PDF file not found: {self.file_path}")
+                            if not os.access(self.file_path, os.R_OK):
+                                raise PermissionError(f"PDF file not readable: {self.file_path}")
+                            
                             pdf = pdfium.PdfDocument(self.file_path)
+                            if len(pdf) == 0:
+                                pdf.close()
+                                raise ValueError("PDF has no pages")
+                            
                             page = pdf[0]
                             bitmap = page.render(scale=2, rotation=0)
                             pil_image = bitmap.to_pil()
@@ -475,41 +487,60 @@ class ThumbnailWorker(QRunnable):
                             return
                         except ImportError as e:
                             pdfium_error = f"pypdfium2 not installed: {e}"
+                            print(f"DEBUG: pypdfium2 import failed: {e}")
                         except Exception as e:
+                            import traceback
                             pdfium_error = f"pypdfium2 error: {e}"
+                            print(f"DEBUG: pypdfium2 processing failed for {os.path.basename(self.file_path)}: {e}")
+                            print(f"DEBUG: Traceback: {traceback.format_exc()}")
 
                     # DOCUMENT FALLBACK/PRIMARY: PyMuPDF (fitz)
                     try:
                         import fitz  # PyMuPDF
+                        from PIL import Image
+                        import platform
+                        
+                        # Check if file exists and is readable
+                        if not os.path.exists(self.file_path):
+                            raise FileNotFoundError(f"Document file not found: {self.file_path}")
+                        if not os.access(self.file_path, os.R_OK):
+                            raise PermissionError(f"Document file not readable: {self.file_path}")
+                        
                         doc = fitz.open(self.file_path)
-                        if doc.page_count > 0:
-                            page = doc.load_page(0)
-                            pix = page.get_pixmap(alpha=False)
-                            from PIL import Image
-                            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                            width, height = img.size
-                            aspect = width / height
-                            base_width = min(self.max_width, 512)
-                            scale = base_width / width
-                            new_height = int(height * scale)
-                            img_resized = img.resize((base_width, new_height), Image.Resampling.LANCZOS)
-                            img_bytes = img_resized.tobytes('raw', 'RGB')
-                            qimg = QImage(img_bytes, base_width, new_height, QImage.Format.Format_RGB888)
-                            pixmap = QPixmap.fromImage(qimg)
-                            self.signals.thumb_ready.emit(self.file_path, pixmap, aspect)
-                            
-                            meta = "Ebook"
-                            if ext == '.pdf': meta = f"{doc.page_count} pages"
-                            elif ext == '.epub': meta = "Ebook (EPUB)"
-                            elif ext == '.mobi': meta = "Ebook (MOBI)"
-                            elif ext == '.azw3': meta = "Ebook (AZW3)"
-                            self.signals.meta_ready.emit(self.file_path, meta)
+                        if doc.page_count == 0:
+                            doc.close()
+                            raise ValueError("Document has no pages")
+                        
+                        page = doc.load_page(0)
+                        pix = page.get_pixmap(alpha=False)
+                        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                        width, height = img.size
+                        aspect = width / height
+                        base_width = min(self.max_width, 512)
+                        scale = base_width / width
+                        new_height = int(height * scale)
+                        img_resized = img.resize((base_width, new_height), Image.Resampling.LANCZOS)
+                        img_bytes = img_resized.tobytes('raw', 'RGB')
+                        qimg = QImage(img_bytes, base_width, new_height, QImage.Format.Format_RGB888)
+                        pixmap = QPixmap.fromImage(qimg)
+                        self.signals.thumb_ready.emit(self.file_path, pixmap, aspect)
+                        
+                        meta = "Ebook"
+                        if ext == '.pdf': meta = f"{doc.page_count} pages"
+                        elif ext == '.epub': meta = "Ebook (EPUB)"
+                        elif ext == '.mobi': meta = "Ebook (MOBI)"
+                        elif ext == '.azw3': meta = "Ebook (AZW3)"
+                        self.signals.meta_ready.emit(self.file_path, meta)
                         doc.close()
                         return
                     except ImportError as e:
                         pymupdf_error = f"PyMuPDF not installed: {e}"
+                        print(f"DEBUG: PyMuPDF import failed: {e}")
                     except Exception as e:
+                        import traceback
                         pymupdf_error = f"PyMuPDF error: {e}"
+                        print(f"DEBUG: PyMuPDF processing failed for {os.path.basename(self.file_path)}: {e}")
+                        print(f"DEBUG: Traceback: {traceback.format_exc()}")
 
                     # EPUB SPECIAL: Deep Manifest Parsing (Last Resort if fitz fails)
                     if ext == '.epub':
@@ -571,11 +602,17 @@ class ThumbnailWorker(QRunnable):
                     
                     # If both PDF libraries failed, emit error with helpful message
                     if ext == '.pdf' and pdfium_error and pymupdf_error:
-                        error_msg = f"PDF thumbnail failed. Install pypdfium2 or PyMuPDF: {pymupdf_error}"
+                        import platform
+                        system = platform.system()
+                        install_cmd = "pip3" if system == "Darwin" else "pip"
+                        error_msg = f"PDF thumbnail failed. Both libraries failed:\n  pypdfium2: {pdfium_error}\n  PyMuPDF: {pymupdf_error}\n\nInstall one of them:\n  {install_cmd} install pypdfium2\n  or\n  {install_cmd} install PyMuPDF"
                         print(f"DEBUG: PDF thumbnail error for {os.path.basename(self.file_path)}: {error_msg}")
                         self.signals.error.emit(self.file_path, error_msg)
                     elif ext in {'.epub', '.mobi', '.azw3'} and pymupdf_error:
-                        error_msg = f"Ebook thumbnail failed. Install PyMuPDF: {pymupdf_error}"
+                        import platform
+                        system = platform.system()
+                        install_cmd = "pip3" if system == "Darwin" else "pip"
+                        error_msg = f"Ebook thumbnail failed. Install PyMuPDF:\n  {install_cmd} install PyMuPDF\n\nError: {pymupdf_error}"
                         print(f"DEBUG: Ebook thumbnail error for {os.path.basename(self.file_path)}: {error_msg}")
                         self.signals.error.emit(self.file_path, error_msg)
 

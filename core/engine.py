@@ -181,12 +181,6 @@ class ScanEngine:
                 'users', 'volumes', 'cores', 'private', 'usr', 'bin',
                 'sbin', 'opt', 'dev', 'etc', 'tmp', 'var', 'net'
             }
-        elif system == "Linux":
-            return {
-                'proc', 'sys', 'dev', 'run', 'tmp', 'var', 'boot',
-                'lost+found', 'mnt', 'media', 'root', 'sbin', 'bin',
-                'usr', 'etc', 'opt', 'srv', 'lib', 'lib64'
-            }
         else:
             return set()
     
@@ -205,12 +199,6 @@ class ScanEngine:
                     return os.path.join(cache_dir, "phash_cache.sqlite3")
             elif system == "Darwin":  # macOS
                 cache_dir = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "CloneWiper")
-                os.makedirs(cache_dir, exist_ok=True)
-                return os.path.join(cache_dir, "phash_cache.sqlite3")
-            elif system == "Linux":
-                # Use XDG cache directory if available
-                base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-                cache_dir = os.path.join(base, "CloneWiper")
                 os.makedirs(cache_dir, exist_ok=True)
                 return os.path.join(cache_dir, "phash_cache.sqlite3")
         except Exception:
