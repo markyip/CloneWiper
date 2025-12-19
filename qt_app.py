@@ -3039,15 +3039,78 @@ class CloneWiperApp(QMainWindow):
         if result == "Yes":
             try:
                 import send2trash
+                deleted_count = 0
+                failed_count = 0
                 for path in selected:
                     try:
                         send2trash.send2trash(path)
+                        deleted_count += 1
                     except Exception as e:
                         print(f"Failed to delete {path}: {e}")
-                dialog = CustomDialog(self, title="Done", message=f"Deleted {len(selected)} files", buttons=["OK"])
+                        failed_count += 1
+                
+                # Remove deleted files from file_groups and file_groups_raw
+                deleted_set = set(selected)
+                if self.file_groups:
+                    # Update file_groups
+                    updated_groups = {}
+                    for group_id, files in self.file_groups.items():
+                        remaining_files = [f for f in files if f not in deleted_set and os.path.exists(f)]
+                        if len(remaining_files) > 1:  # Keep groups with at least 2 files
+                            updated_groups[group_id] = remaining_files
+                        elif len(remaining_files) == 1:
+                            # Single file left, remove from groups (no longer a duplicate)
+                            pass
+                    self.file_groups = updated_groups
+                
+                if self.file_groups_raw:
+                    # Update file_groups_raw
+                    updated_groups_raw = {}
+                    for group_id, files in self.file_groups_raw.items():
+                        remaining_files = [f for f in files if f not in deleted_set and os.path.exists(f)]
+                        if len(remaining_files) > 1:  # Keep groups with at least 2 files
+                            updated_groups_raw[group_id] = remaining_files
+                    self.file_groups_raw = updated_groups_raw
+                
+                # Clear selection state for deleted files
+                for path in selected:
+                    self.selection_state.pop(path, None)
+                
+                # Update delete button UI
+                self._update_delete_ui()
+                
+                # Show result message
+                if failed_count > 0:
+                    message = f"Deleted {deleted_count} files.\n{failed_count} files failed to delete."
+                else:
+                    message = f"Deleted {deleted_count} files."
+                dialog = CustomDialog(self, title="Done", message=message, buttons=["OK"])
                 dialog.exec()
-                # Refresh
-                self._refresh_display()
+                
+                # Refresh display to show updated results
+                if self.file_groups:
+                    # Re-apply sorting to updated groups
+                    current_sort = self.sort_combo.currentText()
+                    self.file_groups = self.engine.apply_sorting(
+                        self.file_groups_raw,
+                        current_sort,
+                        group_by_type=False
+                    )
+                    # Update status
+                    self.status_label.setText(f"Found {len(self.file_groups)} duplicate groups")
+                    # Refresh current page
+                    self._refresh_display()
+                else:
+                    # No more duplicate groups
+                    self.status_label.setText("No duplicate files found.")
+                    self._group_widgets.clear()
+                    while self.results_layout.count() > 1:
+                        item = self.results_layout.takeAt(0)
+                        if item.widget():
+                            item.widget().deleteLater()
+                    self.page_label.setText("1/1")
+                    self.prev_btn.setEnabled(False)
+                    self.next_btn.setEnabled(False)
             except ImportError:
                 dialog = CustomDialog(self, title="Error", message="send2trash not available", buttons=["OK"])
                 dialog.exec()
