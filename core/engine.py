@@ -230,16 +230,18 @@ class ScanEngine:
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS phash_cache (
-                        path TEXT PRIMARY KEY,
+                        path TEXT NOT NULL,
                         size INTEGER NOT NULL,
                         mtime_ns INTEGER NOT NULL,
                         algo TEXT NOT NULL,
                         hash TEXT NOT NULL,
-                        updated INTEGER NOT NULL
+                        updated INTEGER NOT NULL,
+                        PRIMARY KEY (path, algo)
                     )
                     """
                 )
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_phash_updated ON phash_cache(updated)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_phash_path_algo ON phash_cache(path, algo)")
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS md5_cache (
@@ -319,8 +321,8 @@ class ScanEngine:
             p = file_path
         try:
             row = conn.execute(
-                "SELECT size, mtime_ns, algo, hash FROM phash_cache WHERE path=?",
-                (p,),
+                "SELECT size, mtime_ns, algo, hash FROM phash_cache WHERE path=? AND algo=?",
+                (p, str(algo)),
             ).fetchone()
         except Exception:
             return None
@@ -351,10 +353,9 @@ class ScanEngine:
                     """
                     INSERT INTO phash_cache(path, size, mtime_ns, algo, hash, updated)
                     VALUES(?,?,?,?,?,?)
-                    ON CONFLICT(path) DO UPDATE SET
+                    ON CONFLICT(path, algo) DO UPDATE SET
                       size=excluded.size,
                       mtime_ns=excluded.mtime_ns,
-                      algo=excluded.algo,
                       hash=excluded.hash,
                       updated=excluded.updated
                     """,
@@ -727,7 +728,8 @@ class ScanEngine:
                 import cv2
             except ImportError:
                 # OpenCV not available, fall back to MD5
-                print(f"DEBUG: OpenCV not available for video hash, falling back to MD5 for {file_path}")
+                print(f"DEBUG: OpenCV not available for video hash, falling back to MD5 for {os.path.basename(file_path)}")
+                # Return None to trigger MD5 fallback in calculate_file_hash
                 return None
             
             # Extract keyframes from video
@@ -1166,6 +1168,18 @@ class ScanEngine:
             self.use_imagehash = use_imagehash and IMAGEHASH_AVAILABLE
             self.use_multi_hash = use_multi_hash if self.use_imagehash else False
             
+            # Debug: Log hash mode and availability
+            print(f"DEBUG: scan_duplicate_files called with use_imagehash={use_imagehash}, IMAGEHASH_AVAILABLE={IMAGEHASH_AVAILABLE}")
+            print(f"DEBUG: Final settings: use_imagehash={self.use_imagehash}, use_multi_hash={self.use_multi_hash}")
+            
+            # Check OpenCV availability for video hashing
+            try:
+                import cv2
+                OPENCV_AVAILABLE = True
+            except ImportError:
+                OPENCV_AVAILABLE = False
+            print(f"DEBUG: OpenCV available for video hashing: {OPENCV_AVAILABLE}")
+            
             self.file_groups = defaultdict(list)
             self.files_scanned = 0
             self.total_files = 0
@@ -1391,9 +1405,49 @@ class ScanEngine:
             
             # Merge RAW/JPEG pairs based on timestamp correlation
             if self.use_imagehash:
+                groups_before_merge = len(duplicate_groups)
                 duplicate_groups = self._merge_raw_jpeg_by_timestamp(duplicate_groups)
+                groups_after_merge = len(duplicate_groups)
+                if groups_before_merge != groups_after_merge:
+                    print(f"DEBUG: RAW/JPEG merge: {groups_before_merge} -> {groups_after_merge} groups ({groups_before_merge - groups_after_merge} merged)")
+            
+            # Debug: Count groups by file type
+            image_groups = 0
+            video_groups = 0
+            other_groups = 0
+            total_files_in_groups = 0
+            for hash_val, files in duplicate_groups.items():
+                total_files_in_groups += len(files)
+                if files:
+                    ext = os.path.splitext(files[0])[1].lower()
+                    if ext in self.IMAGE_EXTENSIONS:
+                        image_groups += 1
+                    elif ext in self.VIDEO_EXTENSIONS:
+                        video_groups += 1
+                    else:
+                        other_groups += 1
+            
+            # Debug: Cache statistics
+            with self._phash_stats_lock:
+                phash_lookups = self._phash_cache_lookups
+                phash_hits = self._phash_cache_hits
+                phash_misses = self._phash_cache_misses
+                phash_puts = self._phash_cache_puts
+                md5_lookups = self._md5_cache_lookups
+                md5_hits = self._md5_cache_hits
+                md5_misses = self._md5_cache_misses
+                md5_puts = self._md5_cache_puts
             
             print(f"DEBUG: Found {len(duplicate_groups)} duplicate groups")
+            print(f"DEBUG:   - Image groups: {image_groups}")
+            print(f"DEBUG:   - Video groups: {video_groups}")
+            print(f"DEBUG:   - Other groups: {other_groups}")
+            print(f"DEBUG:   - Total files in groups: {total_files_in_groups}")
+            print(f"DEBUG:   - use_imagehash={self.use_imagehash}, use_multi_hash={self.use_multi_hash}")
+            print(f"DEBUG: Cache stats - pHash: {phash_lookups} lookups, {phash_hits} hits, {phash_misses} misses, {phash_puts} puts")
+            print(f"DEBUG: Cache stats - MD5: {md5_lookups} lookups, {md5_hits} hits, {md5_misses} misses, {md5_puts} puts")
+            print(f"DEBUG: Cache DB path: {self._phash_db_path}")
+            
             self.file_groups_raw = duplicate_groups
             print(f"DEBUG: Calling results_callback with {len(duplicate_groups)} groups")
             self.results_callback(duplicate_groups)
@@ -1575,8 +1629,58 @@ class ScanEngine:
                         continue
                 if not details:
                     continue
+                # Sort by: area (desc), maxd (desc), mind (desc), size (desc), mtime (asc), path length (asc), path (asc)
+                # Priority: 1) Highest resolution (area, max dimension, min dimension)
+                #           2) Largest file size (better quality, less compression)
+                #           3) When all other factors are equal, prefer shorter path (consistent with Keep Newest/Oldest)
+                keep = min(
+                    details,
+                    key=lambda d: (-d["area"], -d["maxd"], -d["mind"], -d["size"], d["mtime"], len(d["path"]), d["path"])
+                )["path"]
+                if keep not in img_files and img_files:
+                    keep = img_files[0]
+                for fp in img_files:
+                    decisions[fp] = (fp != keep)
+        
+        elif mode == 'keep_smallest':
+            # Keep highest resolution image, but smallest file size (save space)
+            for hash_val, files in items:
+                if len(files) < 2:
+                    continue
+                img_files = [fp for fp in files if self.is_image_file(fp)]
+                if len(img_files) < 2:
+                    continue
+                details = []
+                for fp in img_files:
+                    try:
+                        st = os.stat(fp)
+                        size_bytes = int(getattr(st, "st_size", 0) or 0)
+                        mtime = float(getattr(st, "st_mtime", 0.0) or 0.0)
+                        w = h = 0
+                        try:
+                            with Image.open(fp) as im:
+                                w, h = im.size
+                        except Exception:
+                            w = h = 0
+                        maxd = int(max(w, h))
+                        mind = int(min(w, h))
+                        area = int(maxd * mind)
+                        details.append({
+                            "path": fp,
+                            "area": area,
+                            "maxd": maxd,
+                            "mind": mind,
+                            "size": size_bytes,
+                            "mtime": mtime,
+                        })
+                    except Exception:
+                        continue
+                if not details:
+                    continue
                 # Sort by: area (desc), maxd (desc), mind (desc), size (asc), mtime (asc), path length (asc), path (asc)
-                # When all other factors are equal, prefer shorter path (consistent with Keep Newest/Oldest)
+                # Priority: 1) Highest resolution (area, max dimension, min dimension)
+                #           2) Smallest file size (save space while maintaining quality)
+                #           3) When all other factors are equal, prefer shorter path (consistent with Keep Newest/Oldest)
                 keep = min(
                     details,
                     key=lambda d: (-d["area"], -d["maxd"], -d["mind"], d["size"], d["mtime"], len(d["path"]), d["path"])

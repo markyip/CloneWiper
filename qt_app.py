@@ -2134,6 +2134,12 @@ class CloneWiperApp(QMainWindow):
         self.keep_best_btn.clicked.connect(lambda: self._quick_select('best_res'))
         footer_layout.addWidget(self.keep_best_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         
+        self.keep_smallest_btn = QPushButton("Keep Smallest")
+        self.keep_smallest_btn.setFixedHeight(40)
+        self.keep_smallest_btn.setStyleSheet(outlined_button_style)
+        self.keep_smallest_btn.clicked.connect(lambda: self._quick_select('keep_smallest'))
+        footer_layout.addWidget(self.keep_smallest_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+        
         self.keep_raw_btn = QPushButton("Keep RAW")
         self.keep_raw_btn.setFixedHeight(40)
         self.keep_raw_btn.setStyleSheet(outlined_button_style)
@@ -2979,9 +2985,10 @@ class CloneWiperApp(QMainWindow):
             self.clear_select_btn.setEnabled(selected_count > 0)
     
     def _update_image_button_visibility(self):
-        """Update visibility of Keep Best and Keep RAW buttons based on applicable files."""
+        """Update visibility of Keep Best, Keep Smallest, and Keep RAW buttons based on applicable files."""
         if not self.file_groups:
             self.keep_best_btn.setVisible(False)
+            self.keep_smallest_btn.setVisible(False)
             self.keep_raw_btn.setVisible(False)
             return
         
@@ -3011,6 +3018,7 @@ class CloneWiperApp(QMainWindow):
                 break
         
         self.keep_best_btn.setVisible(has_applicable_images)
+        self.keep_smallest_btn.setVisible(has_applicable_images)
         self.keep_raw_btn.setVisible(has_raw_mixed)
 
     def _quick_select(self, mode: str):
