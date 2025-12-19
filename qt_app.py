@@ -543,6 +543,7 @@ class ThumbnailWorker(QRunnable):
                         print(f"DEBUG: Traceback: {traceback.format_exc()}")
 
                     # EPUB SPECIAL: Deep Manifest Parsing (Last Resort if fitz fails)
+                    epub_fallback_success = False
                     if ext == '.epub':
                         import zipfile
                         import xml.etree.ElementTree as ET
@@ -596,9 +597,12 @@ class ThumbnailWorker(QRunnable):
                                         pixmap = QPixmap.fromImage(qimg)
                                         self.signals.thumb_ready.emit(self.file_path, pixmap, aspect)
                                         self.signals.meta_ready.emit(self.file_path, "Ebook (EPUB-M)")
+                                        epub_fallback_success = True
+                                        return
                         except Exception as epub_error:
-                            # If EPUB special parsing fails, just pass (will be caught by outer exception handler)
-                            pass
+                            # If EPUB special parsing fails, log but don't fail yet
+                            print(f"DEBUG: EPUB fallback parsing failed for {os.path.basename(self.file_path)}: {epub_error}")
+                            epub_fallback_success = False
                     
                     # If both PDF libraries failed, emit error with helpful message
                     if ext == '.pdf' and pdfium_error and pymupdf_error:
@@ -608,7 +612,16 @@ class ThumbnailWorker(QRunnable):
                         error_msg = f"PDF thumbnail failed. Both libraries failed:\n  pypdfium2: {pdfium_error}\n  PyMuPDF: {pymupdf_error}\n\nInstall one of them:\n  {install_cmd} install pypdfium2\n  or\n  {install_cmd} install PyMuPDF"
                         print(f"DEBUG: PDF thumbnail error for {os.path.basename(self.file_path)}: {error_msg}")
                         self.signals.error.emit(self.file_path, error_msg)
-                    elif ext in {'.epub', '.mobi', '.azw3'} and pymupdf_error:
+                    elif ext == '.epub' and pymupdf_error and not epub_fallback_success:
+                        # EPUB: Only show error if both PyMuPDF and fallback parsing failed
+                        import platform
+                        system = platform.system()
+                        install_cmd = "pip3" if system == "Darwin" else "pip"
+                        error_msg = f"EPUB thumbnail failed.\n\nTo fix this, install PyMuPDF:\n  {install_cmd} install PyMuPDF\n\nError details: {pymupdf_error}\n\nNote: Some EPUB files may work without PyMuPDF if they contain cover images in the correct format."
+                        print(f"DEBUG: EPUB thumbnail error for {os.path.basename(self.file_path)}: {error_msg}")
+                        self.signals.error.emit(self.file_path, error_msg)
+                    elif ext in {'.mobi', '.azw3'} and pymupdf_error:
+                        # MOBI/AZW3: Require PyMuPDF (no fallback)
                         import platform
                         system = platform.system()
                         install_cmd = "pip3" if system == "Darwin" else "pip"
