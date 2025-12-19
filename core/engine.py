@@ -320,21 +320,21 @@ class ScanEngine:
         except Exception:
             p = file_path
         try:
+            # Query cache with path, algo, size, and mtime_ns to ensure exact match
+            # This ensures we only return cached hash if file hasn't been modified
             row = conn.execute(
-                "SELECT size, mtime_ns, algo, hash FROM phash_cache WHERE path=? AND algo=?",
-                (p, str(algo)),
+                "SELECT hash FROM phash_cache WHERE path=? AND algo=? AND size=? AND mtime_ns=?",
+                (p, str(algo), int(size), int(mtime_ns)),
             ).fetchone()
         except Exception:
             return None
         if not row:
             return None
         try:
-            s0, m0, a0, h0 = row
-            if int(s0) == int(size) and int(m0) == int(mtime_ns) and str(a0) == str(algo):
-                return str(h0)
+            h0 = row[0]
+            return str(h0)
         except Exception:
             return None
-        return None
     
     def _phash_cache_put(self, file_path: str, size: int, mtime_ns: int, algo: str, hash_str: str):
         if not self.phash_cache_enabled:

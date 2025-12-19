@@ -50,3 +50,5 @@ If you have a high-resolution PNG (1024x1024), you can use a script to generate 
 - Windows builds use `favicon.ico` from the project root
 
 
+
+

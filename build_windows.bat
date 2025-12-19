@@ -34,9 +34,39 @@ if exist "icons\favicon.ico" (
 
 echo.
 echo Cleaning previous builds...
-if exist "build" rmdir /s /q "build"
-if exist "dist" rmdir /s /q "dist"
-if exist "CloneWiper.spec" del /q "CloneWiper.spec"
+REM Try to close CloneWiper.exe if it's running
+echo Checking for running CloneWiper.exe...
+tasklist /FI "IMAGENAME eq CloneWiper.exe" 2>NUL | find /I /N "CloneWiper.exe">NUL
+if "%ERRORLEVEL%"=="0" (
+    echo CloneWiper.exe is running. Attempting to close it...
+    taskkill /F /IM CloneWiper.exe >NUL 2>&1
+    if errorlevel 1 (
+        echo Warning: Could not close CloneWiper.exe. Please close it manually and try again.
+        pause
+        exit /b 1
+    )
+    echo Waiting for process to terminate...
+    timeout /t 2 /nobreak >NUL
+)
+
+REM Clean build directories
+echo Removing old build files...
+if exist "build" (
+    rmdir /s /q "build" 2>NUL
+    if exist "build" (
+        echo Warning: Could not remove build directory. Some files may be locked.
+    )
+)
+if exist "dist" (
+    rmdir /s /q "dist" 2>NUL
+    if exist "dist" (
+        echo Warning: Could not remove dist directory. Some files may be locked.
+        echo Please close CloneWiper.exe and any file explorers that may have the folder open.
+        pause
+        exit /b 1
+    )
+)
+if exist "CloneWiper.spec" del /q "CloneWiper.spec" 2>NUL
 
 echo.
 echo Building executable (optimized for size)...
@@ -55,6 +85,7 @@ pyinstaller --onefile ^
     --hidden-import=PIL ^
     --hidden-import=PIL.Image ^
     --hidden-import=imagehash ^
+    --hidden-import=numpy ^
     --hidden-import=rawpy ^
     --hidden-import=send2trash ^
     --hidden-import=mutagen ^
@@ -64,12 +95,11 @@ pyinstaller --onefile ^
     --hidden-import=mutagen.oggvorbis ^
     --hidden-import=mutagen.oggopus ^
     --hidden-import=fitz ^
-    --hidden-import=PyMuPDF ^
     --hidden-import=pypdfium2 ^
     --collect-binaries=PySide6 ^
     --collect-data=PySide6 ^
     --collect-data=PIL ^
-    --collect-all=PyMuPDF ^
+    --collect-all=fitz ^
     --collect-all=mutagen ^
     --exclude-module=PySide6.scripts.deploy_lib ^
     --exclude-module=PySide6.QtBluetooth ^
@@ -108,7 +138,6 @@ pyinstaller --onefile ^
     --exclude-module=IPython ^
     --exclude-module=opencv ^
     --exclude-module=cv2 ^
-    --exclude-module=numpy ^
     --exclude-module=scipy ^
     --exclude-module=pandas ^
     --exclude-module=sklearn ^
