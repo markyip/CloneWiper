@@ -43,7 +43,8 @@ try:
         QVariantAnimation, QEasingCurve, QPropertyAnimation, QEvent
     )
     from PySide6.QtGui import (
-        QPixmap, QPainter, QFont, QColor, QPen, QBrush, QImage, QIcon, QPainterPath
+        QPixmap, QPainter, QFont, QColor, QPen, QBrush, QImage, QIcon, QPainterPath,
+        QDragEnterEvent, QDropEvent
     )
     PYSIDE6_AVAILABLE = True
 except ImportError:
@@ -1726,6 +1727,85 @@ class CustomDialog(QDialog):
         return self.result_text
 
 
+class DragDropResultsWidget(QWidget):
+    """Custom widget that supports drag and drop for folder selection."""
+    
+    folders_dropped = Signal(list)  # Emitted when folders are dropped (list of paths)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self._drag_active = False
+    
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        """Handle drag enter event."""
+        if event.mimeData().hasUrls():
+            # Check if any URL is a directory
+            urls = event.mimeData().urls()
+            has_folder = any(url.isLocalFile() and os.path.isdir(url.toLocalFile()) for url in urls)
+            if has_folder:
+                event.acceptProposedAction()
+                self._drag_active = True
+                self.update()  # Trigger repaint for visual feedback
+                return
+        event.ignore()
+    
+    def dragLeaveEvent(self, event):
+        """Handle drag leave event."""
+        self._drag_active = False
+        self.update()  # Trigger repaint to remove visual feedback
+        super().dragLeaveEvent(event)
+    
+    def dropEvent(self, event: QDropEvent):
+        """Handle drop event - supports multiple folders."""
+        self._drag_active = False
+        self.update()  # Trigger repaint to remove visual feedback
+        
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            folders = []
+            for url in urls:
+                if url.isLocalFile():
+                    path = url.toLocalFile()
+                    if os.path.isdir(path):
+                        # Normalize path
+                        path = os.path.normpath(path)
+                        folders.append(path)
+            
+            if folders:
+                # Emit all folders at once
+                self.folders_dropped.emit(folders)
+                event.acceptProposedAction()
+                return
+        event.ignore()
+    
+    def paintEvent(self, event):
+        """Paint event to show drag and drop visual feedback."""
+        super().paintEvent(event)
+        
+        if self._drag_active:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            
+            # Draw dashed border to indicate drop zone
+            pen = QPen(QColor(MD3_COLORS['primary']), 2, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(QBrush(QColor(MD3_COLORS['primary_container'] + '40')))  # Semi-transparent
+            
+            rect = self.rect().adjusted(10, 10, -10, -10)
+            painter.drawRoundedRect(rect, 12, 12)
+            
+            # Draw text hint
+            painter.setPen(QColor(MD3_COLORS['primary']))
+            font = QFont("Roboto", 16, QFont.Weight.Medium)
+            painter.setFont(font)
+            text = "Drop folder here to add to scan list"
+            text_rect = painter.fontMetrics().boundingRect(text)
+            text_x = (self.width() - text_rect.width()) // 2
+            text_y = self.height() // 2
+            painter.drawText(text_x, text_y, text)
+
+
 class CloneWiperApp(QMainWindow):
     """Main CloneWiper application window."""
     
@@ -1795,6 +1875,10 @@ class CloneWiperApp(QMainWindow):
         self.selection_state: Dict[str, bool] = {}  # path -> should_delete
         self.current_page = 0
         self.groups_per_page = 50
+        
+        # Initialize file_groups to track scan state
+        self.file_groups = None
+        self.file_groups_raw = None
         self._scroll_anchor: Optional[Tuple[str, int]] = None  # (group_id, scroll_value) for refresh restore
         
         # Thumbnail cache
@@ -2050,8 +2134,10 @@ class CloneWiperApp(QMainWindow):
             }}
         """)
         
-        self.results_container = QWidget()
+        # Create drag-and-drop enabled results container
+        self.results_container = DragDropResultsWidget()
         self.results_container.setStyleSheet(f"background-color: {MD3_COLORS['bg_tertiary']};")
+        self.results_container.folders_dropped.connect(self._on_folders_dropped)
         self.results_layout = QVBoxLayout(self.results_container)
         self.results_layout.setContentsMargins(24, 16, 24, 16)
         self.results_layout.setSpacing(16)
@@ -2352,18 +2438,66 @@ class CloneWiperApp(QMainWindow):
         self.prev_btn.clicked.connect(self._prev_page)
         footer_layout.addWidget(self.prev_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         
-        self.page_label = QLabel("1/1")
-        self.page_label.setFixedWidth(80)
-        self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
-        self.page_label.setStyleSheet(f"""
-            color: {MD3_COLORS['on_surface']};
-            font-size: 14px;
-            font-weight: 500;
-            font-family: 'Roboto', 'Segoe UI', sans-serif;
-            padding: 0px;
-            background-color: transparent;
+        # Page selector combo box (clickable page indicator)
+        self.page_combo = CenteredComboBox()
+        self.page_combo.setFixedSize(90, 40)
+        self.page_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: transparent;
+                color: {MD3_COLORS['on_surface']};
+                font-size: 14px;
+                font-weight: 500;
+                font-family: 'Roboto', 'Segoe UI', sans-serif;
+                padding: 0px 8px;
+                border: 1px solid {MD3_COLORS['outline']};
+                border-radius: 20px;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 24px;
+                background-color: transparent;
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                padding: 0px 4px;
+            }}
+            QComboBox:hover {{
+                border-color: {MD3_COLORS['on_surface']};
+                background-color: {MD3_COLORS['surface_variant']};
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                width: 0px;
+                height: 0px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {MD3_COLORS['surface']};
+                border: 1px solid {MD3_COLORS['outline']};
+                border-radius: 8px;
+                selection-background-color: {MD3_COLORS['primary_container']};
+                selection-color: {MD3_COLORS['on_primary_container']};
+                outline: none;
+                padding: 4px;
+            }}
+            QComboBox QAbstractItemView::item {{
+                padding: 8px 16px;
+                border-radius: 4px;
+                min-height: 20px;
+                text-align: center;
+                font-size: 14px;
+                font-weight: 500;
+                font-family: 'Roboto', 'Segoe UI', sans-serif;
+            }}
+            QComboBox QAbstractItemView::item:hover {{
+                background-color: {MD3_COLORS['surface_variant']};
+            }}
+            QComboBox QAbstractItemView::item:selected {{
+                background-color: {MD3_COLORS['primary_container']};
+                color: {MD3_COLORS['on_primary_container']};
+            }}
         """)
-        footer_layout.addWidget(self.page_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self.page_combo.setItemDelegate(CenteredComboDelegate(self.page_combo))
+        self.page_combo.currentIndexChanged.connect(self._on_page_selected)
+        footer_layout.addWidget(self.page_combo, alignment=Qt.AlignmentFlag.AlignVCenter)
         
         self.next_btn = QPushButton("▶")
         self.next_btn.setFixedSize(40, 40)
@@ -2461,9 +2595,18 @@ class CloneWiperApp(QMainWindow):
             # Save the selected path for next time (but don't auto-add to list)
             self.settings.setValue("last_browse_path", path)
             # Add to list if not already there
-            items = [self.path_list_widget.item(i).text() for i in range(self.path_list_widget.count())]
-            if path not in items:
-                self.path_list_widget.addItem(path)
+            self._add_folder_to_list(path)
+    
+    def _add_folder_to_list(self, path: str):
+        """Add a folder to the path list if not already present."""
+        items = [self.path_list_widget.item(i).text() for i in range(self.path_list_widget.count())]
+        if path not in items:
+            self.path_list_widget.addItem(path)
+    
+    def _on_folders_dropped(self, paths: list):
+        """Handle folders dropped on results area - supports multiple folders."""
+        for path in paths:
+            self._add_folder_to_list(path)
     
     def _start_scanning(self):
         paths = [self.path_list_widget.item(i).text() for i in range(self.path_list_widget.count())]
@@ -2505,7 +2648,11 @@ class CloneWiperApp(QMainWindow):
         self._update_delete_ui()
         # Reset page navigation
         self.current_page = 0
-        self.page_label.setText("1/1")
+        self.page_combo.blockSignals(True)
+        self.page_combo.clear()
+        self.page_combo.addItem("1")
+        self.page_combo.setCurrentIndex(0)
+        self.page_combo.blockSignals(False)
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         # Hide image-specific buttons when starting new scan
@@ -2728,7 +2875,19 @@ class CloneWiperApp(QMainWindow):
         
         # Update pager
         total_pages = max_page + 1 if total > 0 else 1
-        self.page_label.setText(f"{page_index + 1}/{total_pages}")
+        
+        # Update page combo box (show only page number, not "page/total")
+        # Block signals to prevent triggering navigation when updating programmatically
+        self.page_combo.blockSignals(True)
+        self.page_combo.clear()
+        if total_pages > 0:
+            for i in range(1, total_pages + 1):
+                self.page_combo.addItem(str(i))
+        else:
+            self.page_combo.addItem("1")
+        self.page_combo.setCurrentIndex(page_index)
+        self.page_combo.blockSignals(False)
+        
         self.prev_btn.setEnabled(page_index > 0)
         self.next_btn.setEnabled(page_index < max_page)
         
@@ -2928,6 +3087,11 @@ class CloneWiperApp(QMainWindow):
             max_page = (total - 1) // self.groups_per_page
             if self.current_page < max_page:
                 self._render_page(self.current_page + 1)
+    
+    def _on_page_selected(self, index: int):
+        """Handle page selection from combo box."""
+        if index >= 0 and self.file_groups:
+            self._render_page(index)
     
     def _refresh_display(self):
         """Refresh current page, preserving scroll position."""
@@ -3219,9 +3383,15 @@ class CloneWiperApp(QMainWindow):
                         item = self.results_layout.takeAt(0)
                         if item.widget():
                             item.widget().deleteLater()
-                    self.page_label.setText("1/1")
+                    self.page_combo.blockSignals(True)
+                    self.page_combo.clear()
+                    self.page_combo.addItem("1")
+                    self.page_combo.setCurrentIndex(0)
+                    self.page_combo.blockSignals(False)
                     self.prev_btn.setEnabled(False)
                     self.next_btn.setEnabled(False)
+                    self.file_groups = None
+                    self.file_groups_raw = None
             except ImportError:
                 dialog = CustomDialog(self, title="Error", message="send2trash not available", buttons=["OK"])
                 dialog.exec()
