@@ -33,6 +33,13 @@ from dataclasses import dataclass
 from typing import Dict, List, Set, Optional, Callable, Tuple
 import sys
 
+# Try to import psutil for advanced CPU detection (hybrid architecture support)
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
 # Optional dependencies
 try:
     import imagehash
@@ -62,7 +69,7 @@ class FileItem:
     path: str
     size: int
     mtime: float
-    file_type: str  # 'image', 'video', 'audio', 'pdf', 'epub', 'other'
+    file_type: str  # 'image', 'video', 'audio', 'pdf', 'epub'
     metadata: str = ""  # Resolution/duration/bitrate (computed async)
     hash_value: str = ""  # MD5 or pHash
 
@@ -110,6 +117,12 @@ class ScanEngine:
     PDF_EXTENSIONS = {'.pdf'}
     EPUB_EXTENSIONS = {'.epub', '.mobi', '.azw3'}
     
+    # Combined set of all supported extensions
+    SUPPORTED_EXTENSIONS = (
+        IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | AUDIO_EXTENSIONS | 
+        PDF_EXTENSIONS | EPUB_EXTENSIONS
+    )
+    
     def __init__(
         self,
         progress_callback: Optional[Callable[[str], None]] = None,
@@ -132,8 +145,43 @@ class ScanEngine:
         self.scan_cancelled = False
         self.files_scanned = 0
         self.total_files = 0
-        self.max_workers = min(8, os.cpu_count() or 4)
+        
+        # Dynamic CPU detection for hybrid architecture (P-cores and E-cores)
+        cpu_info = self._detect_cpu_architecture()
+        logical_cores = cpu_info['logical_cores']
+        physical_cores = cpu_info['physical_cores']
+        p_cores = cpu_info.get('p_cores', physical_cores)  # Performance cores
+        e_cores = cpu_info.get('e_cores', 0)  # Efficiency cores
+        is_hybrid = cpu_info.get('is_hybrid', False)
+        
+        # Optimize thread pool size based on CPU architecture
+        if is_hybrid and p_cores > 0:
+            # Hybrid CPU (e.g., Intel 12th/13th gen): Use P-cores for CPU-intensive, all cores for I/O-intensive
+            # For I/O-bound tasks (file reading, hash calculation), we can use all cores (P + E)
+            # For CPU-bound tasks, prefer P-cores
+            # i5-13600: 6 P-cores + 8 E-cores = 14 physical, 20 logical
+            # I/O-intensive: Use all logical cores (P + E with hyperthreading)
+            # CPU-intensive: Use P-cores * 2 (hyperthreading)
+            self.max_workers = min(32, max(8, logical_cores))  # Use all logical cores for I/O
+            # Hash calculation is I/O-intensive, use all cores but cap for memory safety
+            self.hash_workers = min(32, max(16, logical_cores))
+            print(f"DEBUG: Hybrid CPU detected - P-cores: {p_cores}, E-cores: {e_cores}, Logical: {logical_cores}")
+            print(f"DEBUG: Using {self.max_workers} workers for general tasks, {self.hash_workers} for hash calculation")
+        else:
+            # Standard CPU: Use 2x logical cores for I/O-intensive tasks
+            cpu_count = logical_cores
+            self.max_workers = min(32, max(8, cpu_count * 2))
+            self.hash_workers = min(32, max(16, cpu_count * 2))
+            print(f"DEBUG: Standard CPU detected - {logical_cores} logical cores")
+            print(f"DEBUG: Using {self.max_workers} workers for general tasks, {self.hash_workers} for hash calculation")
+        
         self.hash_lock = threading.Lock()
+        
+        # Batch cache write queue to reduce lock contention
+        self._cache_write_queue = []
+        self._cache_write_lock = threading.Lock()
+        self._cache_write_batch_size = 50  # Batch size for cache writes
+        self._cache_write_timer = None
         
         # Results
         self.file_groups: Dict[str, List[str]] = defaultdict(list)
@@ -168,6 +216,78 @@ class ScanEngine:
             atexit.register(lambda: self._close_phash_db())
         except Exception:
             pass
+    
+    def _detect_cpu_architecture(self) -> Dict[str, int]:
+        """
+        Detect CPU architecture, including hybrid CPUs (P-cores and E-cores).
+        
+        Returns:
+            Dict with keys: logical_cores, physical_cores, p_cores, e_cores, is_hybrid
+        """
+        logical_cores = os.cpu_count() or 4
+        physical_cores = logical_cores
+        p_cores = logical_cores
+        e_cores = 0
+        is_hybrid = False
+        
+        if PSUTIL_AVAILABLE:
+            try:
+                # Get physical core count
+                physical_cores = psutil.cpu_count(logical=False) or logical_cores
+                
+                # Try to detect hybrid architecture (Intel 12th/13th gen, Apple M-series)
+                # On Windows, we can use CPU model name to detect core types
+                try:
+                    import platform
+                    if platform.system() == 'Windows':
+                        import subprocess
+                        result = subprocess.run(
+                            ['wmic', 'cpu', 'get', 'name'],
+                            capture_output=True,
+                            text=True,
+                            timeout=2
+                        )
+                        if result.returncode == 0:
+                            cpu_name = result.stdout.lower()
+                            # Intel 12th/13th/14th gen hybrid architecture indicators
+                            if any(x in cpu_name for x in ['12th gen', '13th gen', '14th gen', 'intel core i5-13', 'intel core i7-13', 'intel core i9-13', 'intel core i5-14', 'intel core i7-14', 'intel core i9-14']):
+                                is_hybrid = True
+                                # Common configurations:
+                                # i5-13600: 6P + 8E = 14 physical, 20 logical
+                                # i7-13700: 8P + 8E = 16 physical, 24 logical
+                                # i9-13900: 8P + 16E = 24 physical, 32 logical
+                                if 'i5-13' in cpu_name or 'i5-14' in cpu_name:
+                                    p_cores = 6
+                                    e_cores = 8
+                                elif 'i7-13' in cpu_name or 'i7-14' in cpu_name:
+                                    p_cores = 8
+                                    e_cores = 8
+                                elif 'i9-13' in cpu_name or 'i9-14' in cpu_name:
+                                    p_cores = 8
+                                    e_cores = 16
+                                print(f"DEBUG: Detected hybrid CPU by model name - P: {p_cores}, E: {e_cores}, Logical: {logical_cores}")
+                    elif platform.system() == 'Darwin':  # macOS
+                        # Apple Silicon (M1/M2/M3) are hybrid but handled differently
+                        cpu_name = platform.processor().lower()
+                        if 'apple' in cpu_name or 'arm' in cpu_name:
+                            # Apple Silicon typically has performance and efficiency cores
+                            # M1: 4P + 4E, M2: 4P + 4E, M3: 4P + 4E
+                            is_hybrid = True
+                            p_cores = 4
+                            e_cores = 4
+                except Exception as e:
+                    print(f"DEBUG: CPU model detection error: {e}")
+                    
+            except Exception as e:
+                print(f"DEBUG: CPU detection error: {e}")
+        
+        return {
+            'logical_cores': logical_cores,
+            'physical_cores': physical_cores,
+            'p_cores': p_cores,
+            'e_cores': e_cores,
+            'is_hybrid': is_hybrid
+        }
     
     def _get_system_dirs(self) -> set:
         """Get platform-specific system directories to skip during scanning."""
@@ -535,6 +655,11 @@ class ScanEngine:
     def is_epub_file(self, file_path: str) -> bool:
         return os.path.splitext(file_path.lower())[1] in self.EPUB_EXTENSIONS
     
+    def is_supported_file(self, file_path: str) -> bool:
+        """Check if file extension is in the supported list."""
+        ext = os.path.splitext(file_path.lower())[1]
+        return ext in self.SUPPORTED_EXTENSIONS
+    
     def _calculate_single_hash(self, img: Image.Image) -> Optional[str]:
         """
         Calculate single perceptual hash using phash (perceptual hash) algorithm.
@@ -576,6 +701,11 @@ class ScanEngine:
         Calculate combined perceptual hash using multiple algorithms for better accuracy.
         Uses: average_hash, phash (perceptual), dhash (difference), and whash (wavelet).
         
+        Optimizations:
+        - Pre-resize image to smaller size (256x256 max) for faster processing
+        - Convert to RGB once and reuse
+        - Parallel calculation of hash algorithms using ThreadPoolExecutor
+        
         Args:
             img: PIL Image object
             
@@ -586,8 +716,8 @@ class ScanEngine:
             if not IMAGEHASH_AVAILABLE:
                 return None
             
-            # Convert to RGB if needed (required for some hash algorithms)
-            # Use a copy to avoid modifying the original image
+            # Optimization: Convert to RGB once (if needed) and reuse
+            # Note: Image resizing is already done during image loading for better performance
             try:
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
@@ -595,58 +725,46 @@ class ScanEngine:
                 # If conversion fails, try to continue with original mode
                 print(f"DEBUG: Image mode conversion failed, using original mode: {convert_error}")
             
-            # Calculate multiple hash types with individual error handling
-            # This allows partial success if some algorithms fail
-            hash_average = None
-            hash_perceptual = None
-            hash_difference = None
-            hash_wavelet = None
+            # Optimization 3: Parallel calculation of hash algorithms
+            # Use ThreadPoolExecutor to calculate all hashes concurrently
+            hash_results = {}
             
-            # Try each hash algorithm individually
-            try:
-                hash_average = str(imagehash.average_hash(img))
-            except Exception as e:
-                print(f"DEBUG: average_hash failed: {e}")
+            def calc_hash(algorithm_name, hash_func):
+                """Helper function to calculate a single hash with error handling."""
+                try:
+                    return algorithm_name, str(hash_func(img))
+                except Exception as e:
+                    print(f"DEBUG: {algorithm_name} failed: {e}")
+                    return algorithm_name, None
             
-            try:
-                hash_perceptual = str(imagehash.phash(img))  # More accurate than average_hash
-            except Exception as e:
-                print(f"DEBUG: phash failed: {e}")
-            
-            try:
-                hash_difference = str(imagehash.dhash(img))  # Sensitive to brightness changes
-            except Exception as e:
-                print(f"DEBUG: dhash failed: {e}")
-            
-            try:
-                hash_wavelet = str(imagehash.whash(img))     # Wavelet-based hash
-            except Exception as e:
-                print(f"DEBUG: whash failed: {e}")
+            # Calculate all hashes in parallel (up to 4 concurrent operations)
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [
+                    executor.submit(calc_hash, 'average', imagehash.average_hash),
+                    executor.submit(calc_hash, 'perceptual', imagehash.phash),
+                    executor.submit(calc_hash, 'difference', imagehash.dhash),
+                    executor.submit(calc_hash, 'wavelet', imagehash.whash),
+                ]
+                
+                for future in as_completed(futures):
+                    try:
+                        algo_name, hash_value = future.result()
+                        hash_results[algo_name] = hash_value
+                    except Exception as e:
+                        print(f"DEBUG: Hash calculation future error: {e}")
             
             # Combine available hashes (use placeholder for failed ones)
-            hashes = []
-            if hash_average:
-                hashes.append(hash_average)
-            else:
-                hashes.append("")
-            
-            if hash_perceptual:
-                hashes.append(hash_perceptual)
-            else:
-                hashes.append("")
-            
-            if hash_difference:
-                hashes.append(hash_difference)
-            else:
-                hashes.append("")
-            
-            if hash_wavelet:
-                hashes.append(hash_wavelet)
-            else:
-                hashes.append("")
+            hashes = [
+                hash_results.get('average', ''),
+                hash_results.get('perceptual', ''),
+                hash_results.get('difference', ''),
+                hash_results.get('wavelet', ''),
+            ]
             
             # If at least one hash succeeded, return combined hash
             if any(hashes):
+                # Return as string with separator for compatibility
+                # Individual hashes will be compared using hamming distance in grouping phase
                 combined_hash = "_".join(hashes)
                 return combined_hash
             else:
@@ -747,14 +865,37 @@ class ScanEngine:
                             # This allows loading truncated images (common with some JPEG files)
                             try:
                                 img = Image.open(file_path)
-                                # Try to load the image to verify it's readable
-                                # This will work even for truncated images if LOAD_TRUNCATED_IMAGES is True
-                                img.load()
+                                # Optimization: For large images, use thumbnail loading for faster processing
+                                # This is especially beneficial for multi-hash calculation
+                                if self.use_multi_hash:
+                                    # Get image size without fully loading (fast operation)
+                                    w, h = img.size
+                                    max_dimension = 256
+                                    if w > max_dimension or h > max_dimension:
+                                        # For large images: thumbnail is MUCH faster than processing full size
+                                        # LANCZOS provides good quality but is slower. For hash calculation,
+                                        # we can use faster resampling methods (NEAREST or BILINEAR) for better performance
+                                        # However, LANCZOS is still acceptable for the quality/speed tradeoff
+                                        # The thumbnail operation is in-place and memory-efficient
+                                        img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+                                        # Note: thumbnail() is optimized and only loads what's needed for the final size
+                                    else:
+                                        # Small image (≤256x256): no resizing needed, just load normally
+                                        img.load()
+                                else:
+                                    # Single hash mode - load normally (no resizing needed for single hash)
+                                    img.load()
                             except Exception as img_open_error:
                                 # If loading fails, try opening without load() call
                                 # Some truncated images can still be processed
                                 try:
                                     img = Image.open(file_path)
+                                    # Apply thumbnail optimization if multi-hash
+                                    if self.use_multi_hash:
+                                        w, h = img.size
+                                        max_dimension = 256
+                                        if w > max_dimension or h > max_dimension:
+                                            img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
                                 except Exception:
                                     # Image cannot be opened, will fall back to MD5
                                     print(f"DEBUG: Cannot open image file {file_path}: {img_open_error}")
@@ -948,11 +1089,23 @@ class ScanEngine:
                     pass
             
             md5_hash = hashlib.md5()
-            chunk_size = 262144 if file_size > 100 * 1024 * 1024 else 131072
             
-            with open(file_path, "rb") as f:
-                for byte_block in iter(lambda: f.read(chunk_size), b""):
-                    md5_hash.update(byte_block)
+            # Adaptive strategy: preload small files to RAM for speed, chunk large files for memory efficiency
+            # Threshold: 10MB - files smaller than this are preloaded, larger files are chunked
+            PRELOAD_THRESHOLD = 10 * 1024 * 1024  # 10MB
+            
+            if file_size <= PRELOAD_THRESHOLD:
+                # Preload small files to RAM for faster I/O
+                with open(file_path, "rb") as f:
+                    data = f.read()
+                    md5_hash.update(data)
+            else:
+                # Chunk large files to avoid memory issues
+                chunk_size = 262144 if file_size > 100 * 1024 * 1024 else 131072
+                with open(file_path, "rb") as f:
+                    for byte_block in iter(lambda: f.read(chunk_size), b""):
+                        md5_hash.update(byte_block)
+            
             digest = md5_hash.hexdigest()
             
             if digest and self.md5_cache_enabled:
@@ -965,9 +1118,45 @@ class ScanEngine:
             return None
     
     def calculate_partial_hash(self, file_path: str, chunk_size: int = 4096) -> Optional[str]:
-        """Calculate partial MD5 hash (Start + Middle + End)."""
+        """Calculate partial MD5 hash (Start + Middle + End) with caching.
+        
+        The partial hash is cached to avoid recalculating on every scan.
+        Uses a special cache key format: "partial_{hash}" in MD5 cache.
+        """
         try:
-            file_size = os.path.getsize(file_path)
+            st = os.stat(file_path)
+            file_size = int(getattr(st, "st_size", 0) or 0)
+            if file_size <= 0:
+                return None
+            
+            try:
+                mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+            except Exception:
+                mtime_ns = int(getattr(st, "st_mtime", 0.0) * 1e9)
+            
+            # Check cache first (reuse MD5 cache infrastructure with special marker)
+            # We use a virtual path with "partial_" prefix to distinguish from full MD5
+            if self.md5_cache_enabled:
+                try:
+                    with self._phash_stats_lock:
+                        self._md5_cache_lookups += 1
+                except Exception:
+                    pass
+                try:
+                    # Use a special cache key for partial hash
+                    cache_path = f"partial_{os.path.abspath(file_path)}"
+                    cached = self._md5_cache_get(cache_path, file_size, mtime_ns)
+                    if cached:
+                        with self._phash_stats_lock:
+                            self._md5_cache_hits += 1
+                        return cached
+                    else:
+                        with self._phash_stats_lock:
+                            self._md5_cache_misses += 1
+                except Exception:
+                    pass
+            
+            # Calculate partial hash
             with open(file_path, 'rb') as f:
                 data = f.read(chunk_size)
                 if not data:
@@ -977,7 +1166,19 @@ class ScanEngine:
                     data += f.read(chunk_size)
                     f.seek(-chunk_size, 2)
                     data += f.read(chunk_size)
-                return hashlib.md5(data).hexdigest()
+                partial_hash = hashlib.md5(data).hexdigest()
+            
+            # Cache the partial hash result
+            if self.md5_cache_enabled and partial_hash:
+                try:
+                    cache_path = f"partial_{os.path.abspath(file_path)}"
+                    self._md5_cache_put(cache_path, file_size, mtime_ns, partial_hash)
+                    with self._phash_stats_lock:
+                        self._md5_cache_puts += 1
+                except Exception:
+                    pass
+            
+            return partial_hash
         except Exception:
             return None
     
@@ -1026,7 +1227,9 @@ class ScanEngine:
                                 elif entry.is_file(follow_symlinks=False):
                                     if entry.name.startswith('._'):
                                         continue
-                                    if entry.name.lower().endswith('.txt'):
+                                    
+                                    # Only process supported file types (images, videos, audio, PDFs, EPUBs)
+                                    if not self.is_supported_file(entry.name):
                                         continue
                                     
                                     stat_info = entry.stat(follow_symlinks=False)
@@ -1085,12 +1288,27 @@ class ScanEngine:
         except Exception as e:
             print(f"collect_files_by_size error: {e}")
     
-    def perform_partial_hashing(self, file_paths: List[str]) -> Dict[str, List[str]]:
-        """Perform partial hashing for fast pre-filtering."""
+    def perform_partial_hashing(self, file_paths: List[str], phase_num: int = None, total_phases: int = None) -> Dict[str, List[str]]:
+        """Perform partial hashing for fast pre-filtering.
+        
+        Args:
+            file_paths: List of file paths to process
+            phase_num: Phase number for status display (if None, will be determined from use_imagehash)
+            total_phases: Total number of phases for status display (if None, will be determined from use_imagehash)
+        """
         partial_groups = defaultdict(list)
         failed_count = 0
         total = len(file_paths)
         processed = 0
+        
+        # Determine phase info if not provided
+        if phase_num is None or total_phases is None:
+            if self.use_imagehash:
+                phase_num = 2
+                total_phases = 3
+            else:
+                phase_num = 3
+                total_phases = 4
         
         def _partial_key(fp: str) -> Optional[str]:
             try:
@@ -1105,8 +1323,9 @@ class ScanEngine:
             except Exception:
                 return None
         
-        max_workers = max(2, int(self.max_workers * 2))
-        max_inflight = max(32, max_workers * 8)
+        # Partial hashing is I/O-intensive, use more workers
+        max_workers = max(4, int(self.hash_workers * 1.5))  # Use hash_workers as base
+        max_inflight = max(64, max_workers * 8)  # Increase inflight tasks for better parallelism
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             it = iter(file_paths)
@@ -1162,12 +1381,321 @@ class ScanEngine:
                     
                     if total and processed - last_ui >= 2000:
                         last_ui = processed
-                        self.status_callback(f"Pre-filtering (Partial Hash): {processed:,}/{total:,}")
+                        # Calculate phase progress (0.0-1.0) for current phase only
+                        phase_progress = processed / total if total > 0 else 0.0
+                        # Pass phase progress (0.0-1.0) instead of overall progress
+                        self.progress_callback(phase_progress)
+                        self.status_callback(f"{phase_num}/{total_phases} Scanning: Pre-filtering (Partial Hash) {processed:,}/{total:,}")
                     
                     while len(inflight) < max_inflight and submit_one():
                         pass
         
         return partial_groups
+    
+    def _group_by_similarity_multi_hash(self, hash_groups: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        """
+        Group files by multi-algorithm hash similarity using hamming distance.
+        
+        Uses a voting mechanism: requires at least 3 out of 4 algorithms to agree
+        that images are similar (hamming distance <= threshold).
+        
+        This reduces false positives compared to exact match while maintaining
+        good accuracy for true duplicates.
+        
+        Args:
+            hash_groups: Dict mapping hash strings to file lists
+            
+        Returns:
+            Dict mapping group IDs to file lists (duplicate groups)
+        """
+        if not IMAGEHASH_AVAILABLE:
+            # Fallback to exact match if imagehash not available
+            duplicate_groups = {}
+            for hash_val, files in hash_groups.items():
+                if len(files) > 1:
+                    unique_files = list(dict.fromkeys(files))
+                    if len(unique_files) > 1:
+                        duplicate_groups[hash_val] = unique_files
+            return duplicate_groups
+        
+        # Hamming distance threshold for each algorithm (64-bit hashes)
+        # Typical thresholds: 5-10 for similar images, stricter for duplicates
+        # We use 8 as a balance between accuracy and false positive reduction
+        HAMMING_THRESHOLD = 8
+        
+        # Voting mechanism: require at least 3 out of 4 algorithms to agree
+        MIN_AGREEMENT = 3
+        
+        # Parse multi-hash strings and group by similarity
+        hash_to_files = {}  # hash_string -> [files]
+        for hash_val, files in hash_groups.items():
+            if hash_val and isinstance(hash_val, str) and '_' in hash_val:
+                hash_to_files[hash_val] = files
+        
+        if not hash_to_files:
+            return {}
+        
+        # Build similarity groups with optimizations
+        duplicate_groups = {}
+        processed = set()
+        
+        hash_list = list(hash_to_files.items())
+        total_hashes = len(hash_list)
+        
+        # Optimization: Pre-parse all hashes to avoid repeated parsing
+        parsed_hashes = {}  # hash_string -> (avg, phash, dhash, whash) or None
+        for hash_val, files in hash_list:
+            try:
+                parts = hash_val.split('_')
+                if len(parts) == 4:
+                    parsed_hashes[hash_val] = tuple(parts)
+                else:
+                    parsed_hashes[hash_val] = None
+            except Exception:
+                parsed_hashes[hash_val] = None
+        
+        # Optimization: Early exit for exact matches (fast path)
+        # First, handle exact matches (these are definitely duplicates)
+        exact_match_groups = {}
+        for hash_val, files in hash_list:
+            if hash_val not in processed and len(files) > 1:
+                unique_files = list(dict.fromkeys(files))
+                if len(unique_files) > 1:
+                    exact_match_groups[hash_val] = unique_files
+                    processed.add(hash_val)
+        
+        # Two-phase filtering: Phase 1 - Quick filter using average_hash only
+        # This reduces the candidate set before expensive multi-algorithm comparison
+        remaining_hashes = [(h, f) for h, f in hash_list if h not in processed]
+        
+        if len(remaining_hashes) > 100:
+            # Phase 1: Quick filter using average_hash (fastest algorithm)
+            # Build average_hash index for fast lookup
+            avg_hash_index = {}  # avg_hash_value -> [hash_strings]
+            for hash_val, files in remaining_hashes:
+                parsed = parsed_hashes.get(hash_val)
+                if parsed and parsed[0]:  # parsed[0] is average_hash
+                    try:
+                        avg_hash = imagehash.hex_to_hash(parsed[0])
+                        # Create buckets for similar average hashes
+                        # Use hash value as key (simplified, but effective)
+                        avg_key = str(avg_hash)
+                        if avg_key not in avg_hash_index:
+                            avg_hash_index[avg_key] = []
+                        avg_hash_index[avg_key].append((hash_val, files, avg_hash))
+                    except Exception:
+                        pass
+            
+            # Phase 1: Find candidates using average_hash only (fast)
+            candidate_pairs = set()  # (hash1, hash2) pairs that might be similar
+            avg_hash_list = list(avg_hash_index.items())
+            for i, (key1, hashes1) in enumerate(avg_hash_list):
+                for hash1, files1, h_avg1 in hashes1:
+                    # Compare with other average hashes in nearby buckets
+                    for j, (key2, hashes2) in enumerate(avg_hash_list[i:], start=i):
+                        for hash2, files2, h_avg2 in hashes2:
+                            if hash1 == hash2:
+                                continue
+                            try:
+                                if h_avg1 - h_avg2 <= HAMMING_THRESHOLD:
+                                    # Potential match, add to candidates
+                                    if hash1 < hash2:
+                                        candidate_pairs.add((hash1, hash2))
+                                    else:
+                                        candidate_pairs.add((hash2, hash1))
+                            except Exception:
+                                pass
+            
+            # Phase 2: Detailed comparison only for candidate pairs
+            # Use parallel processing for detailed comparison
+            def compare_pair(pair):
+                """Compare a pair of hashes using all algorithms."""
+                hash1, hash2 = pair
+                if hash1 in processed or hash2 in processed:
+                    return None
+                
+                parsed1 = parsed_hashes.get(hash1)
+                parsed2 = parsed_hashes.get(hash2)
+                if not parsed1 or not parsed2:
+                    return None
+                
+                avg1, phash1, dhash1, whash1 = parsed1
+                avg2, phash2, dhash2, whash2 = parsed2
+                
+                try:
+                    # Pre-convert all hashes
+                    h_avg1 = imagehash.hex_to_hash(avg1) if avg1 else None
+                    h_phash1 = imagehash.hex_to_hash(phash1) if phash1 else None
+                    h_dhash1 = imagehash.hex_to_hash(dhash1) if dhash1 else None
+                    h_whash1 = imagehash.hex_to_hash(whash1) if whash1 else None
+                    
+                    h_avg2 = imagehash.hex_to_hash(avg2) if avg2 else None
+                    h_phash2 = imagehash.hex_to_hash(phash2) if phash2 else None
+                    h_dhash2 = imagehash.hex_to_hash(dhash2) if dhash2 else None
+                    h_whash2 = imagehash.hex_to_hash(whash2) if whash2 else None
+                    
+                    agreements = 0
+                    
+                    # Check all algorithms
+                    if h_avg1 and h_avg2 and (h_avg1 - h_avg2) <= HAMMING_THRESHOLD:
+                        agreements += 1
+                    if h_phash1 and h_phash2 and (h_phash1 - h_phash2) <= HAMMING_THRESHOLD:
+                        agreements += 1
+                    if h_dhash1 and h_dhash2 and (h_dhash1 - h_dhash2) <= HAMMING_THRESHOLD:
+                        agreements += 1
+                    if h_whash1 and h_whash2 and (h_whash1 - h_whash2) <= HAMMING_THRESHOLD:
+                        agreements += 1
+                    
+                    if agreements >= MIN_AGREEMENT:
+                        return (hash1, hash2)
+                    return None
+                except Exception:
+                    return None
+            
+            # Parallel comparison of candidate pairs
+            similarity_pairs = []
+            if candidate_pairs:
+                # Limit candidate pairs to avoid excessive processing
+                MAX_CANDIDATE_PAIRS = min(50000, len(candidate_pairs))  # Cap at 50K pairs
+                candidate_list = list(candidate_pairs)[:MAX_CANDIDATE_PAIRS]
+                
+                # Use ThreadPoolExecutor for parallel comparison
+                with ThreadPoolExecutor(max_workers=min(8, self.max_workers)) as executor:
+                    results = executor.map(compare_pair, candidate_list)
+                    for result in results:
+                        if result:
+                            similarity_pairs.append(result)
+            
+            # Build groups from similarity pairs
+            # Use union-find approach for grouping
+            hash_to_group = {}  # hash -> set of hashes in same group
+            for hash1, hash2 in similarity_pairs:
+                if hash1 not in hash_to_group:
+                    hash_to_group[hash1] = {hash1}
+                if hash2 not in hash_to_group:
+                    hash_to_group[hash2] = {hash2}
+                # Merge groups
+                group1 = hash_to_group[hash1]
+                group2 = hash_to_group[hash2]
+                merged = group1 | group2
+                for h in merged:
+                    hash_to_group[h] = merged
+            
+            # Create duplicate groups
+            seen_groups = set()
+            for hash_val, group in hash_to_group.items():
+                group_id = min(group)  # Use minimum hash as group ID
+                if group_id in seen_groups:
+                    continue
+                seen_groups.add(group_id)
+                
+                # Collect all files from this group
+                all_files = []
+                for h in group:
+                    if h in hash_to_files:
+                        all_files.extend(hash_to_files[h])
+                
+                if len(all_files) > 1:
+                    unique_files = list(dict.fromkeys(all_files))
+                    if len(unique_files) > 1:
+                        duplicate_groups[group_id] = unique_files
+                        processed.update(group)
+        
+        else:
+            # For small datasets, use original sequential approach (simpler and faster)
+            # More aggressive comparison limit for small datasets
+            MAX_COMPARISONS = min(500, total_hashes - 1)  # Reduced from 1000 to 500
+            
+            for i, (hash1, files1) in enumerate(remaining_hashes):
+                if hash1 in processed:
+                    continue
+                
+                parsed1 = parsed_hashes.get(hash1)
+                if parsed1 is None:
+                    continue
+                
+                avg1, phash1, dhash1, whash1 = parsed1
+                
+                # Pre-convert hashes once for this hash1
+                try:
+                    h_avg1 = imagehash.hex_to_hash(avg1) if avg1 else None
+                    h_phash1 = imagehash.hex_to_hash(phash1) if phash1 else None
+                    h_dhash1 = imagehash.hex_to_hash(dhash1) if dhash1 else None
+                    h_whash1 = imagehash.hex_to_hash(whash1) if whash1 else None
+                except Exception:
+                    continue
+                
+                # Find similar hashes
+                similar_files = list(files1)
+                
+                comparisons_made = 0
+                for j, (hash2, files2) in enumerate(remaining_hashes[i+1:], start=i+1):
+                    if hash2 in processed or comparisons_made >= MAX_COMPARISONS:
+                        break
+                    
+                    comparisons_made += 1
+                    
+                    parsed2 = parsed_hashes.get(hash2)
+                    if parsed2 is None:
+                        continue
+                    
+                    avg2, phash2, dhash2, whash2 = parsed2
+                    
+                    # Two-phase: Quick check with average_hash first
+                    agreements = 0
+                    if h_avg1 and avg2:
+                        try:
+                            h_avg2 = imagehash.hex_to_hash(avg2)
+                            dist = h_avg1 - h_avg2
+                            if dist <= HAMMING_THRESHOLD:
+                                agreements += 1
+                            elif dist > HAMMING_THRESHOLD * 2:
+                                # Early exit: very different, skip detailed comparison
+                                continue
+                        except Exception:
+                            pass
+                    
+                    # Detailed comparison only if average_hash was close
+                    if agreements > 0 or h_avg1 is None:
+                        if h_phash1 and phash2:
+                            try:
+                                h_phash2 = imagehash.hex_to_hash(phash2)
+                                if h_phash1 - h_phash2 <= HAMMING_THRESHOLD:
+                                    agreements += 1
+                            except Exception:
+                                pass
+                        
+                        if h_dhash1 and dhash2:
+                            try:
+                                h_dhash2 = imagehash.hex_to_hash(dhash2)
+                                if h_dhash1 - h_dhash2 <= HAMMING_THRESHOLD:
+                                    agreements += 1
+                            except Exception:
+                                pass
+                        
+                        if h_whash1 and whash2:
+                            try:
+                                h_whash2 = imagehash.hex_to_hash(whash2)
+                                if h_whash1 - h_whash2 <= HAMMING_THRESHOLD:
+                                    agreements += 1
+                            except Exception:
+                                pass
+                    
+                    if agreements >= MIN_AGREEMENT:
+                        similar_files.extend(files2)
+                        processed.add(hash2)
+                
+                if len(similar_files) > 1:
+                    unique_files = list(dict.fromkeys(similar_files))
+                    if len(unique_files) > 1:
+                        duplicate_groups[hash1] = unique_files
+                
+                processed.add(hash1)
+        
+        # Merge exact match groups with similarity groups
+        duplicate_groups.update(exact_match_groups)
+        
+        return duplicate_groups
     
     def _merge_raw_jpeg_by_timestamp(self, duplicate_groups: Dict[str, List[str]], time_threshold: float = 5.0) -> Dict[str, List[str]]:
         """
@@ -1309,12 +1837,17 @@ class ScanEngine:
             print(f"DEBUG: Engine scan_duplicate_files called with paths={scan_paths}")
             print(f"DEBUG: use_imagehash={self.use_imagehash}")
             
+            # Phase 1: Collect files
+            total_phases = 4 if not self.use_imagehash else 3  # Phase 3 skipped if using imagehash
+            phase_num = 1
+            # Reset progress bar to 0% for Phase 1 (each phase has its own progress bar)
+            self.progress_callback(0.0)
             if self.use_imagehash:
                 print("DEBUG: Calling status_callback: Collecting files (ImageHash enabled)...")
-                self.status_callback("Collecting files (ImageHash enabled)...")
+                self.status_callback(f"{phase_num}/{total_phases} Scanning: Collecting files...")
             else:
                 print("DEBUG: Calling status_callback: Collecting files...")
-                self.status_callback("Collecting files...")
+                self.status_callback(f"{phase_num}/{total_phases} Scanning: Collecting files...")
             
             scan_tasks = list(scan_paths)
             if len(scan_tasks) == 1:
@@ -1329,8 +1862,13 @@ class ScanEngine:
                                         if entry.name.lower() not in self._get_system_dirs():
                                             subdirs.append(entry.path)
                                     elif entry.is_file(follow_symlinks=False):
-                                        if entry.name.startswith('._') or entry.name.lower().endswith('.txt'):
+                                        if entry.name.startswith('._'):
                                             continue
+                                        
+                                        # Only process supported file types (images, videos, audio, PDFs, EPUBs)
+                                        if not self.is_supported_file(entry.name):
+                                            continue
+                                        
                                         st = entry.stat(follow_symlinks=False)
                                         if st.st_size > 0:
                                             size_groups[st.st_size].append(entry.path)
@@ -1365,35 +1903,54 @@ class ScanEngine:
                     futures.append(future)
                 
                 last_status_update = 0
+                last_update_time = time.time()
+                min_update_interval = 0.2  # 200ms minimum between collection status updates
+                
                 for future in as_completed(futures):
                     if self.scan_cancelled:
                         executor.shutdown(wait=False, cancel_futures=True)
                         return
                     try:
                         future.result()
-                        # Update status periodically during collection
+                        # Update status periodically during collection with throttling
+                        current_time = time.time()
                         with total_collected_lock:
                             count = total_collected[0]
-                        if count - last_status_update >= 1000:
-                            self.status_callback(f"Collected {count:,} files...")
+                        
+                        # Update if: (1) 1000+ files since last update, OR (2) 200ms+ since last update
+                        if (count - last_status_update >= 1000) or (current_time - last_update_time >= min_update_interval):
+                            # Estimate total files for progress calculation (use a reasonable estimate)
+                            # For Phase 1, we don't know total yet, so use a conservative estimate
+                            # Each phase has its own progress bar (0-100% per phase)
+                            estimated_total = max(count * 2, 10000)  # Conservative estimate
+                            phase_progress = min(count / estimated_total, 1.0) if estimated_total > 0 else 0.0
+                            # Pass phase progress (0.0-1.0) instead of overall progress
+                            self.progress_callback(phase_progress)
+                            self.status_callback(f"{phase_num}/{total_phases} Scanning: Collected {count:,} files...")
                             last_status_update = count
+                            last_update_time = current_time
                     except Exception as e:
                         print(f"Scan task error: {e}")
                         continue
                 
-                # Final status update
+                # Final status update for Phase 1
                 with total_collected_lock:
                     final_count = total_collected[0]
                 with total_image_files_lock:
                     img_count = total_image_files[0]
+                # Phase 1 complete: set progress to 100% (1.0) for this phase
+                self.progress_callback(1.0)
                 if img_count > 0:
-                    self.status_callback(f"Collected {final_count:,} files ({img_count:,} images)")
+                    self.status_callback(f"{phase_num}/{total_phases} Scanning: Collected {final_count:,} files ({img_count:,} images)")
                 else:
-                    self.status_callback(f"Collected {final_count:,} files")
+                    self.status_callback(f"{phase_num}/{total_phases} Scanning: Collected {final_count:,} files")
             
             # Phase 2: Filter potential duplicates
+            phase_num = 2
             print(f"DEBUG: Phase 2 - Filtering potential duplicates")
-            self.status_callback("Filtering potential duplicates...")
+            # Reset progress bar to 0% for Phase 2 (each phase has its own progress bar)
+            self.progress_callback(0.0)
+            self.status_callback(f"{phase_num}/{total_phases} Scanning: Filtering potential duplicates...")
             potential_duplicates_by_size = []
             
             if self.use_imagehash:
@@ -1416,6 +1973,8 @@ class ScanEngine:
                         potential_duplicates_by_size.extend(files)
             
             print(f"DEBUG: Found {len(potential_duplicates_by_size)} potential duplicate files")
+            # Phase 2 complete: set progress to 100% (1.0) for this phase
+            self.progress_callback(1.0)
             if not potential_duplicates_by_size:
                 self.status_callback("No duplicate files found.")
                 self.results_callback({})
@@ -1436,13 +1995,22 @@ class ScanEngine:
                 files_to_full_hash.extend(image_files)
                 
                 if non_image_files:
-                    partial_groups = self.perform_partial_hashing(non_image_files)
+                    # Phase 2 for imagehash mode (3 phases total)
+                    phase_num = 2
+                    # Reset progress bar to 0% for partial hashing phase
+                    self.progress_callback(0.0)
+                    self.status_callback(f"{phase_num}/{total_phases} Scanning: Pre-filtering (Partial Hash) {len(non_image_files):,} files...")
+                    partial_groups = self.perform_partial_hashing(non_image_files, phase_num=phase_num, total_phases=total_phases)
                     for files in partial_groups.values():
                         if len(files) > 1:
                             files_to_full_hash.extend(files)
             else:
-                self.status_callback("Pre-filtering (Partial Hash)...")
-                partial_groups = self.perform_partial_hashing(potential_duplicates_by_size)
+                # Phase 3 for non-imagehash mode (4 phases total)
+                phase_num = 3
+                # Reset progress bar to 0% for partial hashing phase
+                self.progress_callback(0.0)
+                self.status_callback(f"{phase_num}/{total_phases} Scanning: Pre-filtering (Partial Hash) {len(potential_duplicates_by_size):,} files...")
+                partial_groups = self.perform_partial_hashing(potential_duplicates_by_size, phase_num=phase_num, total_phases=total_phases)
                 for files in partial_groups.values():
                     if len(files) > 1:
                         files_to_full_hash.extend(files)
@@ -1456,14 +2024,35 @@ class ScanEngine:
                 self.results_callback({})
                 return
             
-            # Phase 4: Full hash calculation
+            # Phase 4: Full hash calculation (or Phase 3 if using imagehash)
+            phase_num = 4 if not self.use_imagehash else 3
+            is_3_phase = self.use_imagehash  # True if 3 phases, False if 4 phases
+            # Reset progress bar to 0% for hash calculation phase
+            self.progress_callback(0.0)
             hash_groups = defaultdict(list)
             processed = 0
-            progress_update_interval = max(1, self.total_files // 100)
             
-            # CPU processing
+            # Optimized progress update interval:
+            # - For small batches (< 100 files): update every file (real-time)
+            # - For medium batches (100-1000 files): update every 10 files
+            # - For large batches (> 1000 files): update every 1% or every 50 files, whichever is more frequent
+            # This balances real-time feedback with performance
+            if self.total_files < 100:
+                progress_update_interval = 1  # Every file for small batches
+            elif self.total_files < 1000:
+                progress_update_interval = 10  # Every 10 files for medium batches
+            else:
+                # For large batches, update every 1% or every 50 files (whichever is smaller)
+                progress_update_interval = min(max(1, self.total_files // 100), 50)
+            
+            # Time-based throttling: update at most once per 100ms to avoid UI overload
+            last_update_time = [time.time()]
+            min_update_interval = 0.1  # 100ms minimum between updates
+            
+            # CPU processing - use more workers for I/O-intensive hash calculation
             if files_to_full_hash:
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Use hash_workers (more threads) for I/O-bound hash calculation
+                with ThreadPoolExecutor(max_workers=self.hash_workers) as executor:
                     future_to_file = {
                         executor.submit(self.calculate_file_hash, file_path): file_path
                         for file_path in files_to_full_hash
@@ -1488,18 +2077,37 @@ class ScanEngine:
                         processed += 1
                         self.files_scanned = processed
                         
-                        if processed % progress_update_interval == 0 or processed == self.total_files:
-                            progress_value = processed / self.total_files if self.total_files > 0 else 0.0
-                            self.progress_callback(progress_value)
-                            self.status_callback(f"Hashing: {processed}/{self.total_files}")
+                        # Update progress with throttling
+                        current_time = time.time()
+                        should_update = (
+                            processed % progress_update_interval == 0 or 
+                            processed == self.total_files or
+                            (current_time - last_update_time[0]) >= min_update_interval
+                        )
+                        
+                        if should_update:
+                            # Calculate phase progress (0.0-1.0) for current phase only
+                            phase_progress = processed / self.total_files if self.total_files > 0 else 0.0
+                            # Pass phase progress (0.0-1.0) instead of overall progress
+                            self.progress_callback(phase_progress)
+                            self.status_callback(f"{phase_num}/{total_phases} Scanning: Calculating hash {processed:,}/{self.total_files:,}")
+                            last_update_time[0] = current_time
             
             # Filter duplicate groups
+            # For multi-algorithm hash, use hamming distance comparison instead of exact match
             duplicate_groups = {}
-            for hash_val, files in hash_groups.items():
-                if len(files) > 1:
-                    unique_files = list(dict.fromkeys(files))
-                    if len(unique_files) > 1:
-                        duplicate_groups[hash_val] = unique_files
+            
+            if self.use_multi_hash:
+                # Multi-algorithm hash: Use hamming distance with voting mechanism
+                # This reduces false positives by requiring multiple algorithms to agree
+                duplicate_groups = self._group_by_similarity_multi_hash(hash_groups)
+            else:
+                # Single hash or MD5: Use exact match (original behavior)
+                for hash_val, files in hash_groups.items():
+                    if len(files) > 1:
+                        unique_files = list(dict.fromkeys(files))
+                        if len(unique_files) > 1:
+                            duplicate_groups[hash_val] = unique_files
             
             # Merge RAW/JPEG pairs based on timestamp correlation
             if self.use_imagehash:
@@ -1697,7 +2305,7 @@ class ScanEngine:
                     decisions[fp] = (fp != keep_path)
         
         elif mode == 'best_res':
-            # Keep highest resolution image
+            # Keep highest resolution image (W*H), if multiple images share the highest resolution, keep the one with largest file size
             for hash_val, files in items:
                 if len(files) < 2:
                     continue
@@ -1716,14 +2324,13 @@ class ScanEngine:
                                 w, h = im.size
                         except Exception:
                             w = h = 0
-                        maxd = int(max(w, h))
-                        mind = int(min(w, h))
-                        area = int(maxd * mind)
+                        # Calculate resolution as W * H (area)
+                        resolution = int(w * h)
                         details.append({
                             "path": fp,
-                            "area": area,
-                            "maxd": maxd,
-                            "mind": mind,
+                            "resolution": resolution,
+                            "width": int(w),
+                            "height": int(h),
                             "size": size_bytes,
                             "mtime": mtime,
                         })
@@ -1731,21 +2338,28 @@ class ScanEngine:
                         continue
                 if not details:
                     continue
-                # Sort by: area (desc), maxd (desc), mind (desc), size (desc), mtime (asc), path length (asc), path (asc)
-                # Priority: 1) Highest resolution (area, max dimension, min dimension)
-                #           2) Largest file size (better quality, less compression)
-                #           3) When all other factors are equal, prefer shorter path (consistent with Keep Newest/Oldest)
-                keep = min(
-                    details,
-                    key=lambda d: (-d["area"], -d["maxd"], -d["mind"], -d["size"], d["mtime"], len(d["path"]), d["path"])
+                
+                # Step 1: Find the highest resolution (W*H)
+                max_resolution = max(d["resolution"] for d in details)
+                
+                # Step 2: Filter to only images with the highest resolution
+                highest_res_images = [d for d in details if d["resolution"] == max_resolution]
+                
+                # Step 3: Among images with highest resolution, keep the one with largest file size
+                # (better quality, less compression)
+                # If file sizes are equal, use mtime, path length, and path as tiebreakers
+                keep = max(
+                    highest_res_images,
+                    key=lambda d: (d["size"], -d["mtime"], -len(d["path"]), d["path"])
                 )["path"]
+                
                 if keep not in img_files and img_files:
                     keep = img_files[0]
                 for fp in img_files:
                     decisions[fp] = (fp != keep)
         
         elif mode == 'keep_smallest':
-            # Keep highest resolution image, but smallest file size (save space)
+            # Keep highest resolution image (W*H), if multiple images share the highest resolution, keep the one with smallest file size
             for hash_val, files in items:
                 if len(files) < 2:
                     continue
@@ -1764,14 +2378,13 @@ class ScanEngine:
                                 w, h = im.size
                         except Exception:
                             w = h = 0
-                        maxd = int(max(w, h))
-                        mind = int(min(w, h))
-                        area = int(maxd * mind)
+                        # Calculate resolution as W * H (area)
+                        resolution = int(w * h)
                         details.append({
                             "path": fp,
-                            "area": area,
-                            "maxd": maxd,
-                            "mind": mind,
+                            "resolution": resolution,
+                            "width": int(w),
+                            "height": int(h),
                             "size": size_bytes,
                             "mtime": mtime,
                         })
@@ -1779,14 +2392,20 @@ class ScanEngine:
                         continue
                 if not details:
                     continue
-                # Sort by: area (desc), maxd (desc), mind (desc), size (asc), mtime (asc), path length (asc), path (asc)
-                # Priority: 1) Highest resolution (area, max dimension, min dimension)
-                #           2) Smallest file size (save space while maintaining quality)
-                #           3) When all other factors are equal, prefer shorter path (consistent with Keep Newest/Oldest)
+                
+                # Step 1: Find the highest resolution (W*H)
+                max_resolution = max(d["resolution"] for d in details)
+                
+                # Step 2: Filter to only images with the highest resolution
+                highest_res_images = [d for d in details if d["resolution"] == max_resolution]
+                
+                # Step 3: Among images with highest resolution, keep the one with smallest file size
+                # If file sizes are equal, use mtime, path length, and path as tiebreakers
                 keep = min(
-                    details,
-                    key=lambda d: (-d["area"], -d["maxd"], -d["mind"], d["size"], d["mtime"], len(d["path"]), d["path"])
+                    highest_res_images,
+                    key=lambda d: (d["size"], d["mtime"], len(d["path"]), d["path"])
                 )["path"]
+                
                 if keep not in img_files and img_files:
                     keep = img_files[0]
                 for fp in img_files:

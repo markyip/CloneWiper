@@ -930,6 +930,7 @@ class FileCardDelegate(QStyledItemDelegate):
             
             painter.setPen(QColor(MD3_COLORS['on_surface_variant']))
             font = QFont("Roboto", 10)
+            font.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
             painter.setFont(font)
             painter.drawText(thumb_rect, Qt.AlignmentFlag.AlignCenter, "Loading...")
         
@@ -952,6 +953,7 @@ class FileCardDelegate(QStyledItemDelegate):
         # Filename (Material 3 Title Medium) with scrolling
         painter.setPen(QColor(MD3_COLORS['on_surface']))  # Material 3 on-surface
         font = QFont("Roboto", 14, QFont.Weight.Medium)
+        font.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
         painter.setFont(font)
         name_rect = QRect(text_rect.x(), text_rect.y(), text_rect.width(), 22)
         
@@ -988,6 +990,7 @@ class FileCardDelegate(QStyledItemDelegate):
             meta_rect = QRect(text_rect.x(), text_rect.y() + 28, text_rect.width(), 22)
             painter.setPen(QColor(MD3_COLORS['on_surface_variant']))  # Material 3 on-surface-variant
             font_body = QFont("Roboto", 12)
+            font_body.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
             painter.setFont(font_body)
             painter.drawText(meta_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, meta_text)
         
@@ -997,6 +1000,7 @@ class FileCardDelegate(QStyledItemDelegate):
             dir_rect = QRect(text_rect.x(), text_rect.y() + 52, text_rect.width(), 18)
             painter.setPen(QColor(MD3_COLORS['on_surface_variant']))
             font_label = QFont("Roboto", 11)
+            font_label.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
             painter.setFont(font_label)
             
             # Calculate text width (always calculate, not just when hovering)
@@ -1336,7 +1340,7 @@ class GroupWidget(QFrame):
             title = QLabel(f"Group {group_index + 1}/{total_groups} • {len(files)} files • {size_str}")
         else:
             title = QLabel(f"{len(files)} files • {size_str}")
-        title.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; font-size: 14px; font-weight: 500; border: none;")
+        title.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; font-size: 14px; font-weight: 500; font-family: 'Roboto', 'Segoe UI', sans-serif; border: none;")
         header_layout.addWidget(title)
         
         header_layout.addStretch()
@@ -1854,7 +1858,7 @@ class CloneWiperApp(QMainWindow):
         path_hbox.setSpacing(12)
         
         path_label = QLabel("Scan Folders:")
-        path_label.setStyleSheet(f"color: {MD3_COLORS['on_surface_variant']}; font-size: 13px; font-weight: 500;")
+        path_label.setStyleSheet(f"color: {MD3_COLORS['on_surface_variant']}; font-size: 13px; font-weight: 500; font-family: 'Roboto', 'Segoe UI', sans-serif;")
         path_hbox.addWidget(path_label)
         
         # Path List Widget (With Scrollbar)
@@ -1929,7 +1933,7 @@ class CloneWiperApp(QMainWindow):
         
         # Hash Mode Selection
         hash_mode_label = QLabel("Hash Mode:")
-        hash_mode_label.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; font-size: 13px;")
+        hash_mode_label.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; font-size: 13px; font-family: 'Roboto', 'Segoe UI', sans-serif;")
         control_layout.addWidget(hash_mode_label)
         
         self.hash_mode_combo = QComboBox()
@@ -2015,23 +2019,7 @@ class CloneWiperApp(QMainWindow):
         
         status_layout.addStretch()
         
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setFixedHeight(8) # More prominent
-        self.progress_bar.setMinimumWidth(400)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setStyleSheet(f"""
-            QProgressBar {{
-                background-color: {MD3_COLORS['surface_variant']};
-                border: none;
-                border-radius: 4px;
-            }}
-            QProgressBar::chunk {{
-                background-color: {MD3_COLORS['primary']};
-                border-radius: 4px;
-            }}
-        """)
-        status_layout.addWidget(self.progress_bar)
+        # Progress bar removed from status bar (now in center of results area)
         
         self.main_layout.addWidget(status_bar)
         
@@ -2067,6 +2055,52 @@ class CloneWiperApp(QMainWindow):
         self.results_layout = QVBoxLayout(self.results_container)
         self.results_layout.setContentsMargins(24, 16, 24, 16)
         self.results_layout.setSpacing(16)
+        
+        # Center container for scanning progress (initially hidden)
+        self.center_progress_container = QWidget()
+        self.center_progress_container.setVisible(False)
+        center_layout = QVBoxLayout(self.center_progress_container)
+        center_layout.setContentsMargins(24, 24, 24, 24)
+        center_layout.setSpacing(16)
+        center_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # Center status label for scanning progress
+        self.center_status_label = QLabel("")
+        self.center_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.center_status_label.setStyleSheet(f"""
+            QLabel {{
+                color: {MD3_COLORS['on_surface']};
+                font-size: 16px;
+                font-weight: 500;
+                font-family: 'Roboto', 'Segoe UI', sans-serif;
+                padding: 0px;
+            }}
+        """)
+        center_layout.addWidget(self.center_status_label, 0, Qt.AlignmentFlag.AlignCenter)
+        
+        # Center progress bar (below status label)
+        self.center_progress_bar = QProgressBar()
+        self.center_progress_bar.setFixedHeight(8)
+        self.center_progress_bar.setMinimumWidth(400)
+        self.center_progress_bar.setMaximumWidth(600)
+        self.center_progress_bar.setTextVisible(False)
+        self.center_progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {MD3_COLORS['surface_variant']};
+                border: none;
+                border-radius: 4px;
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {MD3_COLORS['primary']};
+                border-radius: 4px;
+            }}
+        """)
+        center_layout.addWidget(self.center_progress_bar, 0, Qt.AlignmentFlag.AlignCenter)
+        
+        # Add center container to results layout with stretch for vertical centering
+        self.results_layout.addStretch()
+        self.results_layout.addWidget(self.center_progress_container, 0, Qt.AlignmentFlag.AlignCenter)
         self.results_layout.addStretch()
         
         self.scroll_area.setWidget(self.results_container)
@@ -2158,7 +2192,7 @@ class CloneWiperApp(QMainWindow):
         toggle_container.setStyleSheet("background-color: transparent;") # Ensure transparent background for container
         
         toggle_label = QLabel("All Pages")
-        toggle_label.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; font-size: 13px;")
+        toggle_label.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; font-size: 13px; font-family: 'Roboto', 'Segoe UI', sans-serif;")
         toggle_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         
         self.scope_toggle = ToggleSwitch(active_color=MD3_COLORS['primary'], bg_color=MD3_COLORS['surface_variant'])
@@ -2385,11 +2419,13 @@ class CloneWiperApp(QMainWindow):
     def _adjust_path_list_height(self):
         """Dynamically adjust path list height based on items (max 1.5 rows)."""
         count = self.path_list_widget.count()
-        if count <= 1:
-            h = 36
+        if count == 0:
+            h = 36  # Empty: default height
+        elif count == 1:
+            h = 36  # Single folder: keep original height (1 row), no expansion
         else:
-            # 54px provides space for 1 full item and hints at the 2nd (1.5 rows)
-            h = 54 
+            # Multiple folders: expand to 1.5 rows to hint at scrolling
+            h = 54
         self.path_list_widget.setFixedHeight(h)
         self.updateGeometry()
 
@@ -2452,9 +2488,8 @@ class CloneWiperApp(QMainWindow):
         self.scan_btn.clicked.disconnect()
         self.scan_btn.clicked.connect(self._cancel_scanning)
         
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        self.status_label.setText("Starting scan...")
+        # Center progress container will be shown via status callback
+        # Don't update status_label during scanning to avoid duplication with center display
         
         # Get hash mode: 0=MD5, 1=Single Perceptual, 2=Multi-Algorithm
         hash_mode = self.hash_mode_combo.currentIndex()
@@ -2478,10 +2513,24 @@ class CloneWiperApp(QMainWindow):
             self.keep_best_btn.setVisible(False)
         if hasattr(self, 'keep_raw_btn'):
             self.keep_raw_btn.setVisible(False)
-        while self.results_layout.count() > 1:
-            item = self.results_layout.takeAt(0)
-            if item.widget():
+        
+        # Clear existing group widgets (but keep center_progress_container and stretches)
+        items_to_remove = []
+        for i in range(self.results_layout.count()):
+            item = self.results_layout.itemAt(i)
+            if item and item.widget() and item.widget() != self.center_progress_container:
+                items_to_remove.append(i)
+        # Remove in reverse order to maintain indices
+        for i in reversed(items_to_remove):
+            item = self.results_layout.takeAt(i)
+            if item and item.widget():
                 item.widget().deleteLater()
+        
+        # Show center progress container and hide upper left status label
+        self.center_progress_container.setVisible(True)
+        self.center_status_label.setText("Initializing scan...")
+        self.center_progress_bar.setValue(0)
+        self.status_label.setVisible(False)  # Hide upper left status during scanning
         
         # Store scan thread reference for potential cancellation
         self._scan_thread = None
@@ -2536,13 +2585,26 @@ class CloneWiperApp(QMainWindow):
     def _on_progress_slot(self, value: float):
         """Slot for progress updates (runs on main thread)."""
         print(f"DEBUG: _on_progress_slot called with value={value}")
-        self.progress_bar.setValue(int(value * 100))
+        # Update center progress bar
+        if self.scan_btn.text() == "Cancel Scanning":
+            self.center_progress_bar.setValue(int(value * 100))
     
     @Slot(str)
     def _on_status_slot(self, message: str):
         """Slot for status updates (runs on main thread)."""
         print(f"DEBUG: _on_status_slot called with message={message}")
-        self.status_label.setText(message)
+        
+        # Update center status label and progress container if scanning
+        if self.scan_btn.text() == "Cancel Scanning":
+            # During scanning: only update center display, hide upper left status completely
+            self.center_status_label.setText(message)
+            self.center_progress_container.setVisible(True)
+            self.status_label.setVisible(False)  # Keep hidden during scanning
+        else:
+            # Not scanning: update status bar (for non-scanning messages)
+            self.status_label.setText(message)
+            self.status_label.setVisible(True)  # Show when not scanning
+            self.center_progress_container.setVisible(False)
     
     @Slot(dict)
     def _on_results_slot(self, duplicate_groups: Dict[str, List[str]]):
@@ -2557,6 +2619,9 @@ class CloneWiperApp(QMainWindow):
         # Set cancellation flag in engine
         self.engine.scan_cancelled = True
         
+        # Hide center status label
+        self.center_status_label.setVisible(False)
+        
         # Update UI
         self.scan_btn.setText("Start Scanning")
         self.scan_btn.setEnabled(True)
@@ -2564,8 +2629,9 @@ class CloneWiperApp(QMainWindow):
         self.scan_btn.clicked.disconnect()
         self.scan_btn.clicked.connect(self._start_scanning)
         
-        self.progress_bar.setVisible(False)
+        self.center_progress_container.setVisible(False)
         self.status_label.setText("Scan cancelled")
+        self.status_label.setVisible(True)  # Show status label after cancellation
         
         # Clear scan thread reference
         self._scan_thread = None
@@ -2574,6 +2640,9 @@ class CloneWiperApp(QMainWindow):
         """Display scan results."""
         print(f"DEBUG: _display_results called with {len(duplicate_groups)} groups")
         
+        # Hide center status label
+        self.center_status_label.setVisible(False)
+        
         # Restore button to "Start Scanning" state
         self.scan_btn.setText("Start Scanning")
         self.scan_btn.setEnabled(True)
@@ -2581,8 +2650,8 @@ class CloneWiperApp(QMainWindow):
         self.scan_btn.clicked.disconnect()
         self.scan_btn.clicked.connect(self._start_scanning)
         
-        # Hide progress bar
-        self.progress_bar.setVisible(False)
+        # Hide center progress container
+        self.center_progress_container.setVisible(False)
         
         self.file_groups_raw = duplicate_groups
         
@@ -2596,7 +2665,10 @@ class CloneWiperApp(QMainWindow):
         )
         
         print(f"DEBUG: Enabling scan button, hiding progress bar")
-        self.progress_bar.setValue(0)
+        self.center_progress_bar.setValue(0)
+        
+        # Show status label after scan completes
+        self.status_label.setVisible(True)
         
         if not duplicate_groups:
             print(f"DEBUG: No duplicate groups, setting status")
@@ -2623,12 +2695,19 @@ class CloneWiperApp(QMainWindow):
     def _render_page(self, page_index: int):
         """Render a page of groups."""
         print(f"DEBUG: _render_page called with page_index={page_index}, file_groups={len(self.file_groups) if self.file_groups else 0}")
-        # Clear existing
+        # Clear existing group widgets (but keep center_progress_container and stretches)
         self._group_widgets.clear()
-        print(f"DEBUG: Clearing {self.results_layout.count() - 1} existing widgets")
-        while self.results_layout.count() > 1:  # Keep stretch
-            item = self.results_layout.takeAt(0)
-            if item.widget():
+        print(f"DEBUG: Clearing existing group widgets")
+        # Remove all widgets except center_progress_container and stretches
+        items_to_remove = []
+        for i in range(self.results_layout.count()):
+            item = self.results_layout.itemAt(i)
+            if item and item.widget() and item.widget() != self.center_progress_container:
+                items_to_remove.append(i)
+        # Remove in reverse order to maintain indices
+        for i in reversed(items_to_remove):
+            item = self.results_layout.takeAt(i)
+            if item and item.widget():
                 item.widget().deleteLater()
         
         if not self.file_groups:
@@ -3161,7 +3240,7 @@ def main():
     # Material Design 3 global styles
     app.setStyleSheet(f"""
         QWidget {{
-            font-family: 'Roboto', 'Segoe UI', -apple-system, sans-serif;
+            font-family: 'Roboto', 'Segoe UI', sans-serif;
         }}
         QMessageBox {{
             background-color: {MD3_COLORS['bg_subtle']};
