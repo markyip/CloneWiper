@@ -2153,6 +2153,11 @@ class CloneWiperApp(QMainWindow):
         # Center status label for scanning progress
         self.center_status_label = QLabel("")
         self.center_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Enable word wrapping for long status messages
+        self.center_status_label.setWordWrap(True)
+        # Set width constraints to match progress bar and prevent overflow
+        self.center_status_label.setMinimumWidth(400)
+        self.center_status_label.setMaximumWidth(600)
         self.center_status_label.setStyleSheet(f"""
             QLabel {{
                 color: {MD3_COLORS['on_surface']};
@@ -2319,6 +2324,45 @@ class CloneWiperApp(QMainWindow):
                 current_text = self.currentText()
                 painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter, current_text)
         
+        class PageComboBox(CenteredComboBox):
+            """ComboBox for page selection that displays 'current/total' in the button but only page numbers in dropdown."""
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self._total_pages = 1
+            
+            def set_total_pages(self, total: int):
+                """Set the total number of pages for display."""
+                self._total_pages = total
+                self.update()  # Trigger repaint
+            
+            def paintEvent(self, event):
+                # First, let the style draw the background and border
+                opt = QStyleOptionComboBox()
+                self.initStyleOption(opt)
+                painter = QPainter(self)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                
+                # Draw the combo box frame (background and border)
+                self.style().drawComplexControl(QStyle.ComplexControl.CC_ComboBox, opt, painter, self)
+                
+                # Now draw centered text over the background
+                text_rect = self.rect()
+                # Account for padding (16px on each side)
+                text_rect.adjust(16, 0, -16, 0)
+                
+                painter.setPen(QColor(MD3_COLORS['on_surface']))
+                # Match exact font settings: 14px, weight 500 (Medium)
+                font = self.font()
+                font.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
+                font.setPixelSize(14)  # Match page_combo font size
+                font.setWeight(QFont.Weight.Medium)  # 500
+                painter.setFont(font)
+                
+                # Display "current/total" format in the button
+                current_page = self.currentIndex() + 1 if self.currentIndex() >= 0 else 1
+                display_text = f"{current_page}/{self._total_pages}"
+                painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter, display_text)
+        
         self.sort_combo = CenteredComboBox()
         self.sort_combo.setFixedHeight(40)
         self.sort_combo.setStyleSheet(f"""
@@ -2439,7 +2483,7 @@ class CloneWiperApp(QMainWindow):
         footer_layout.addWidget(self.prev_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         
         # Page selector combo box (clickable page indicator)
-        self.page_combo = CenteredComboBox()
+        self.page_combo = PageComboBox()
         self.page_combo.setFixedSize(90, 40)
         self.page_combo.setStyleSheet(f"""
             QComboBox {{
@@ -2649,6 +2693,7 @@ class CloneWiperApp(QMainWindow):
         # Reset page navigation
         self.current_page = 0
         self.page_combo.blockSignals(True)
+        self.page_combo.set_total_pages(1)  # Set total pages for display
         self.page_combo.clear()
         self.page_combo.addItem("1")
         self.page_combo.setCurrentIndex(0)
@@ -2876,13 +2921,15 @@ class CloneWiperApp(QMainWindow):
         # Update pager
         total_pages = max_page + 1 if total > 0 else 1
         
-        # Update page combo box (show only page number, not "page/total")
+        # Update page combo box
+        # Dropdown items show only page numbers, but button displays "current/total"
         # Block signals to prevent triggering navigation when updating programmatically
         self.page_combo.blockSignals(True)
+        self.page_combo.set_total_pages(total_pages)  # Set total pages for display
         self.page_combo.clear()
         if total_pages > 0:
             for i in range(1, total_pages + 1):
-                self.page_combo.addItem(str(i))
+                self.page_combo.addItem(str(i))  # Dropdown items show only page numbers
         else:
             self.page_combo.addItem("1")
         self.page_combo.setCurrentIndex(page_index)
@@ -3384,6 +3431,7 @@ class CloneWiperApp(QMainWindow):
                         if item.widget():
                             item.widget().deleteLater()
                     self.page_combo.blockSignals(True)
+                    self.page_combo.set_total_pages(1)  # Set total pages for display
                     self.page_combo.clear()
                     self.page_combo.addItem("1")
                     self.page_combo.setCurrentIndex(0)
