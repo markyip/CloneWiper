@@ -44,7 +44,7 @@ try:
     )
     from PySide6.QtGui import (
         QPixmap, QPainter, QFont, QColor, QPen, QBrush, QImage, QIcon, QPainterPath,
-        QDragEnterEvent, QDropEvent
+        QDragEnterEvent, QDropEvent, QRegion
     )
     PYSIDE6_AVAILABLE = True
 except ImportError:
@@ -1314,7 +1314,7 @@ class GroupWidget(QFrame):
         # Header
         header = QFrame()
         header.setFixedHeight(48)
-        header.setStyleSheet(f"background-color: {MD3_COLORS['bg_subtle']}; border: none; border-top-left-radius: 12px; border-top-right-radius: 12px;")
+        header.setStyleSheet(f"background-color: {MD3_COLORS['bg_subtle']}; border: none;")
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(16, 4, 16, 4)
         header_layout.setSpacing(12)
@@ -1856,6 +1856,9 @@ class CloneWiperApp(QMainWindow):
         self._resize_start_geom = None
         self.setMouseTracking(True)
         
+        # Rounded corners radius
+        self._corner_radius = 12
+        
         # Connect signals to slots
         self.progress_updated.connect(self._on_progress_slot)
         self.status_updated.connect(self._on_status_slot)
@@ -1910,9 +1913,53 @@ class CloneWiperApp(QMainWindow):
     
     def _setup_ui(self):
         """Setup UI layout with Material Design 3."""
+        # Define CenteredComboBox class early so it can be used throughout _setup_ui
+        class CenteredComboBox(QComboBox):
+            def paintEvent(self, event):
+                # First, let the style draw the background and border
+                opt = QStyleOptionComboBox()
+                self.initStyleOption(opt)
+                painter = QPainter(self)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                
+                # Draw the combo box frame (background and border)
+                self.style().drawComplexControl(QStyle.ComplexControl.CC_ComboBox, opt, painter, self)
+                
+                # Now draw centered text over the background
+                text_rect = self.rect()
+                # Account for padding (16px on each side)
+                text_rect.adjust(16, 0, -16, 0)
+                
+                painter.setPen(QColor(MD3_COLORS['on_surface']))
+                # Match exact font settings from other buttons: 13px, weight 500 (Medium)
+                # Use pixel size instead of point size to match CSS font-size exactly
+                # Get font from the widget's style to ensure consistency
+                font = self.font()
+                font.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
+                font.setPixelSize(13)  # Use pixel size to match CSS exactly
+                font.setWeight(QFont.Weight.Medium)  # 500
+                painter.setFont(font)
+                
+                current_text = self.currentText()
+                painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter, current_text)
+        
+        class CenteredComboDelegate(QStyledItemDelegate):
+            def paint(self, painter, option, index):
+                # Match exact font settings: 13px, weight 500 (Medium)
+                font = QFont("Roboto", 13, QFont.Weight.Medium)
+                font.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
+                painter.setFont(font)
+                option.displayAlignment = Qt.AlignmentFlag.AlignCenter
+                super().paint(painter, option, index)
+        
         central = QWidget()
         self.setCentralWidget(central)
-        central.setStyleSheet(f"background-color: {MD3_COLORS['surface']};")
+        # Set background color only (rounded corners applied to window, not sections)
+        central.setStyleSheet(f"""
+            QWidget {{
+                background-color: {MD3_COLORS['surface']};
+            }}
+        """)
         self.main_layout = QVBoxLayout(central)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
@@ -1966,6 +2013,11 @@ class CloneWiperApp(QMainWindow):
                 border-radius: 6px;
                 margin: 1px 2px;
             }}
+            QListWidget::item:only-child {{
+                /* Vertically center when only one item */
+                padding-top: 8px;
+                padding-bottom: 8px;
+            }}
             QListWidget::item:selected {{
                 background-color: {MD3_COLORS['primary_container']};
                 color: {MD3_COLORS['on_primary_container']};
@@ -2015,12 +2067,8 @@ class CloneWiperApp(QMainWindow):
         # Add stretch to push controls to the right
         control_layout.addStretch()
         
-        # Hash Mode Selection
-        hash_mode_label = QLabel("Hash Mode:")
-        hash_mode_label.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; font-size: 13px; font-family: 'Roboto', 'Segoe UI', sans-serif;")
-        control_layout.addWidget(hash_mode_label)
-        
-        self.hash_mode_combo = QComboBox()
+        # Hash Mode Selection (no label, centered text like other dropdowns)
+        self.hash_mode_combo = CenteredComboBox()
         self.hash_mode_combo.addItems(["MD5 Only", "Single Perceptual Hash", "Multi-Algorithm Perceptual Hash"])
         self.hash_mode_combo.setCurrentIndex(2)  # Default to multi-algorithm
         self.hash_mode_combo.setFixedHeight(32)
@@ -2058,6 +2106,8 @@ class CloneWiperApp(QMainWindow):
                 border-radius: 4px;
             }}
         """)
+        # Use the same centered delegate as sort combo
+        self.hash_mode_combo.setItemDelegate(CenteredComboDelegate(self.hash_mode_combo))
         control_layout.addWidget(self.hash_mode_combo)
         
         # Scan Button (Filled)
@@ -2295,35 +2345,7 @@ class CloneWiperApp(QMainWindow):
         footer_layout.addSpacing(16)
         
         # Sort (No Label) - Custom QComboBox with centered text
-        class CenteredComboBox(QComboBox):
-            def paintEvent(self, event):
-                # First, let the style draw the background and border
-                opt = QStyleOptionComboBox()
-                self.initStyleOption(opt)
-                painter = QPainter(self)
-                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-                
-                # Draw the combo box frame (background and border)
-                self.style().drawComplexControl(QStyle.ComplexControl.CC_ComboBox, opt, painter, self)
-                
-                # Now draw centered text over the background
-                text_rect = self.rect()
-                # Account for padding (16px on each side)
-                text_rect.adjust(16, 0, -16, 0)
-                
-                painter.setPen(QColor(MD3_COLORS['on_surface']))
-                # Match exact font settings from other buttons: 13px, weight 500 (Medium)
-                # Use pixel size instead of point size to match CSS font-size exactly
-                # Get font from the widget's style to ensure consistency
-                font = self.font()
-                font.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
-                font.setPixelSize(13)  # Use pixel size to match CSS exactly
-                font.setWeight(QFont.Weight.Medium)  # 500
-                painter.setFont(font)
-                
-                current_text = self.currentText()
-                painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter, current_text)
-        
+        # Note: CenteredComboBox is already defined at the start of _setup_ui
         class PageComboBox(CenteredComboBox):
             """ComboBox for page selection that displays 'current/total' in the button but only page numbers in dropdown."""
             def __init__(self, parent=None):
@@ -2436,15 +2458,7 @@ class CloneWiperApp(QMainWindow):
         self.sort_combo.setMinimumWidth(min_width)
         
         # Set text alignment to center for dropdown items
-        # Ensure font matches exactly with the displayed text
-        class CenteredComboDelegate(QStyledItemDelegate):
-            def paint(self, painter, option, index):
-                # Match exact font settings: 13px, weight 500 (Medium)
-                font = QFont("Roboto", 13, QFont.Weight.Medium)
-                font.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
-                painter.setFont(font)
-                option.displayAlignment = Qt.AlignmentFlag.AlignCenter
-                super().paint(painter, option, index)
+        # Note: CenteredComboDelegate is already defined at the start of _setup_ui
         self.sort_combo.setItemDelegate(CenteredComboDelegate(self.sort_combo))
         self.sort_combo.currentTextChanged.connect(self._apply_sorting)
         footer_layout.addWidget(self.sort_combo, alignment=Qt.AlignmentFlag.AlignVCenter)
@@ -2601,9 +2615,19 @@ class CloneWiperApp(QMainWindow):
             h = 36  # Empty: default height
         elif count == 1:
             h = 36  # Single folder: keep original height (1 row), no expansion
+            # Vertically center the single item by adjusting item size hint
+            item = self.path_list_widget.item(0)
+            if item:
+                # Set item height to fill available space for vertical centering
+                item.setSizeHint(QSize(item.sizeHint().width(), h - 2))
         else:
             # Multiple folders: expand to 1.5 rows to hint at scrolling
             h = 54
+            # Reset item size hints for multiple items (use default)
+            for i in range(count):
+                item = self.path_list_widget.item(i)
+                if item:
+                    item.setSizeHint(QSize())
         self.path_list_widget.setFixedHeight(h)
         self.updateGeometry()
 
@@ -3260,6 +3284,37 @@ class CloneWiperApp(QMainWindow):
         elif y > h - margin: edge.append('bottom')
         
         return '_'.join(edge) if edge else None
+    
+    def changeEvent(self, event):
+        """Handle window state changes (maximized/restored) to toggle rounded corners."""
+        if event.type() == event.Type.WindowStateChange:
+            if self.isMaximized() or self.isFullScreen():
+                # Remove rounded corners when maximized/fullscreen
+                self.setMask(QRegion())
+            else:
+                # Apply rounded corners when not maximized
+                self._apply_rounded_corners()
+        super().changeEvent(event)
+    
+    def resizeEvent(self, event):
+        """Update rounded corners mask on resize."""
+        super().resizeEvent(event)
+        if not (self.isMaximized() or self.isFullScreen()):
+            self._apply_rounded_corners()
+    
+    def showEvent(self, event):
+        """Apply rounded corners when window is first shown."""
+        super().showEvent(event)
+        if not (self.isMaximized() or self.isFullScreen()):
+            self._apply_rounded_corners()
+    
+    def _apply_rounded_corners(self):
+        """Apply rounded corners mask to the window."""
+        path = QPainterPath()
+        rect = self.rect()
+        path.addRoundedRect(rect, self._corner_radius, self._corner_radius)
+        region = QRegion(path.toFillPolygon().toPolygon())
+        self.setMask(region)
 
     def _update_delete_ui(self):
         """Update the delete and clear selection buttons based on state."""

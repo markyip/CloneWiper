@@ -10,31 +10,60 @@ CloneWiper is a high-performance, modern duplicate file detection tool built wit
 ## ✨ Features
 
 ### Core Functionality
-- **Smart Duplicate Detection**: Fast MD5 and multi-algorithm perceptual hashing for highly accurate duplicate detection
-  - **Multi-Algorithm Perceptual Hashing**: Combines average_hash, phash (perceptual), dhash (difference), and whash (wavelet) for superior accuracy
+- **Smart Duplicate Detection**: Three hash modes for flexible duplicate detection
+  - **MD5 Only**: Fast exact duplicate detection using MD5 checksums (best for identical files)
+  - **Single Perceptual Hash**: Detects visually similar images using average hash algorithm
+  - **Multi-Algorithm Perceptual Hashing** (Default): Combines four algorithms (average_hash, phash, dhash, whash) with voting mechanism for superior accuracy
+    - Uses Hamming distance comparison with voting (requires 3/4 algorithms to agree)
+    - Detects duplicates even when images are resized, compressed, or slightly modified
+    - Optimized with parallel hash calculation and two-phase filtering
   - **Image Support**: Works with common formats (JPEG, PNG, GIF, BMP, TIFF, WebP) and RAW files (CR2, NEF, ARW, etc.)
   - **Video Support**: Perceptual hashing for video files using keyframe extraction
 - **Cross-Platform Support**: Works on Windows (macOS support from source code only)
-- **High Performance**: Asynchronous processing with multi-threaded file scanning
-- **Persistent Caching**: SQLite-backed cache for fast re-scans
+- **High Performance**: 
+  - Asynchronous processing with multi-threaded file scanning
+  - Dynamic CPU optimization for hybrid architectures (P-cores/E-cores detection)
+  - Adaptive I/O strategy (preloads small files, chunks large files)
+  - Batch cache writes to reduce database lock contention
+- **Persistent Caching**: SQLite-backed cache for fast re-scans (hashes are cached and persist across sessions)
 
 ### User Interface
-- **Material Design 3 UI**: Clean, modern dark-themed interface
-- **Custom Title Bar**: Frameless window with custom controls
+- **Material Design 3 UI**: Clean, modern dark-themed interface with rounded corners (when not maximized)
+- **Custom Title Bar**: Frameless window with custom controls and window management
 - **Smart Thumbnails**: 
   - **Images**: Fast previews, including RAW support (`.arw`, `.cr2`, `.nef`, etc.)
   - **Video**: Frame extraction for common video formats
   - **Documents**: High-quality **PDF**, **EPUB**, **MOBI**, and **AZW3** thumbnails using **pypdfium2** and **PyMuPDF**
   - **Music**: Album art extraction and rich metadata display using **mutagen**
 - **Interactive File Cards**: Hover effects, scrolling text for long filenames, and selection management
-- **Pagination**: Efficient handling of large result sets
-- **Quick Actions**: Keep Newest, Keep Oldest, Keep Best, Keep RAW, Delete Selected
+- **Pagination**: Efficient handling of large result sets with clickable page indicator dropdown
+- **Drag & Drop**: Drag and drop folders onto the results area for easy folder selection
+- **Real-Time Progress**: Centered progress indicator with adaptive update intervals
+- **Quick Selection Strategies**:
+  - **Keep Newest**: Keeps the most recently modified file
+  - **Keep Oldest**: Keeps the oldest file by modification time
+  - **Keep Best**: Keeps the highest resolution image; if multiple share the highest resolution, keeps the largest file size
+  - **Keep Smallest**: Keeps the highest resolution image; if multiple share the highest resolution, keeps the smallest file size
+  - **Keep RAW**: Prefers RAW files over JPEG when both exist in the same group
+- **Quick Actions**: Delete Selected, Clear Selection (with scope: Current Page or All Pages)
 
 ### Advanced Features
-- **Multi-Algorithm Perceptual Hashing**: Combines multiple hash algorithms (average, perceptual, difference, wavelet) to detect similar images and videos even if they're slightly modified, resized, or have different compression
+- **Multi-Algorithm Perceptual Hashing**: 
+  - Combines four hash algorithms (average, perceptual, difference, wavelet) with parallel calculation
+  - Uses Hamming distance comparison with voting mechanism (requires 3/4 algorithms to agree)
+  - Two-phase filtering: quick filter with average_hash, then detailed multi-algorithm comparison
+  - Detects similar images and videos even if they're slightly modified, resized, or have different compression
+- **Hybrid CPU Optimization**: Automatically detects and optimizes for hybrid CPU architectures (Intel 12th/13th gen, AMD Ryzen)
+  - Dynamically adjusts worker threads based on P-cores and E-cores
+  - Optimized thread pool sizes for I/O-intensive and CPU-intensive tasks
 - **File Type Grouping**: Organize duplicates by file type
-- **Multiple Sorting Options**: Sort by count, size, name, or date
+- **Multiple Sorting Options**: Sort by count, size, name, or date (ascending/descending)
+- **Scope Control**: Apply actions to current page or all pages
 - **Safe Deletion**: Uses `send2trash` to move files to recycle bin/trash
+- **Persistent Cache**: 
+  - SQLite database stores calculated hashes (p-hash and MD5)
+  - Cache persists across sessions - no need to recalculate hashes on re-scan
+  - Automatic cache management with hit/miss statistics
 
 ## 📋 Prerequisites
 
@@ -93,6 +122,30 @@ pip3 install -r requirements.txt
 # Run directly
 python3 main.py
 ```
+
+### Hash Mode Selection
+
+CloneWiper offers three hash modes for different use cases:
+
+1. **MD5 Only** (Fastest)
+   - Best for: Finding exact duplicate files
+   - Uses: MD5 checksum comparison
+   - Pros: Very fast, low CPU usage
+   - Cons: Only detects identical files (byte-for-byte)
+
+2. **Single Perceptual Hash** (Balanced)
+   - Best for: Finding visually similar images with moderate accuracy
+   - Uses: Average hash algorithm
+   - Pros: Faster than multi-algorithm, detects resized/compressed images
+   - Cons: Less accurate than multi-algorithm mode
+
+3. **Multi-Algorithm Perceptual Hash** (Most Accurate - Default)
+   - Best for: Finding visually similar images with highest accuracy
+   - Uses: Four algorithms (average, perceptual, difference, wavelet) with voting
+   - Pros: Highest accuracy, detects duplicates even with modifications
+   - Cons: Slower than other modes (but optimized with parallel processing)
+
+**Recommendation**: Use Multi-Algorithm Perceptual Hash for most cases, as it provides the best balance of accuracy and performance with caching enabled.
 
 ## 🔨 Building Executables
 
@@ -178,6 +231,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **ImageHash** - Perceptual hashing
 - **PyMuPDF** - PDF/EPUB rendering
 - **pypdfium2** - High-quality PDF rendering
+- **rawpy** - RAW image processing
+- **OpenCV** - Video processing
+- **mutagen** - Audio metadata
+- **psutil** - CPU architecture detection
 - **Material Design 3** - Design guidelines
 
 ## 📧 Contact
