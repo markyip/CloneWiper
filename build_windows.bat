@@ -6,6 +6,11 @@ echo ========================================
 echo CloneWiper Windows Build Script (Optimized)
 echo ========================================
 echo.
+echo Note: For GPU-accelerated ORB support, ensure you have:
+echo   - CUDA toolkit installed
+echo   - CUDA-enabled OpenCV (opencv-contrib-python or custom build)
+echo   - Set use_orb_gpu=True in core/engine.py if GPU is available
+echo.
 
 REM Check if PyInstaller is installed
 python -c "import PyInstaller" 2>nul
@@ -96,11 +101,15 @@ pyinstaller --onefile ^
     --hidden-import=mutagen.oggopus ^
     --hidden-import=fitz ^
     --hidden-import=pypdfium2 ^
+    --hidden-import=cv2 ^
+    --hidden-import=cv2.cuda ^
+    --hidden-import=numpy ^
     --collect-binaries=PySide6 ^
     --collect-data=PySide6 ^
     --collect-data=PIL ^
     --collect-all=fitz ^
     --collect-all=mutagen ^
+    --collect-all=cv2 ^
     --exclude-module=PySide6.scripts.deploy_lib ^
     --exclude-module=PySide6.QtBluetooth ^
     --exclude-module=PySide6.QtDBus ^
@@ -137,7 +146,6 @@ pyinstaller --onefile ^
     --exclude-module=notebook ^
     --exclude-module=IPython ^
     --exclude-module=opencv ^
-    --exclude-module=cv2 ^
     --exclude-module=scipy ^
     --exclude-module=pandas ^
     --exclude-module=sklearn ^

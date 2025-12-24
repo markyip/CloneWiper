@@ -30,19 +30,19 @@ import time
 import threading
 
 try:
-    from PySide6.QtWidgets import (
+    from PySide6.QtWidgets import (  # type: ignore[reportMissingImports]
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QPushButton, QLabel, QLineEdit, QCheckBox, QComboBox, QScrollArea,
         QFrame, QListView, QStyledItemDelegate, QStyleOptionViewItem,
         QSizePolicy, QMessageBox, QFileDialog, QProgressBar, QGridLayout, QScrollBar,
         QListWidget, QDialogButtonBox, QDialog, QStyleOptionComboBox, QStyle
     )
-    from PySide6.QtCore import (
+    from PySide6.QtCore import (  # type: ignore[reportMissingImports]
         Qt, QSize, QThread, QThreadPool, QRunnable, Signal, QObject, QModelIndex,
         QAbstractListModel, QRect, QPoint, QTimer, QMutex, QWaitCondition, Slot, QSettings,
         QVariantAnimation, QEasingCurve, QPropertyAnimation, QEvent
     )
-    from PySide6.QtGui import (
+    from PySide6.QtGui import (  # type: ignore[reportMissingImports]
         QPixmap, QPainter, QFont, QColor, QPen, QBrush, QImage, QIcon, QPainterPath,
         QDragEnterEvent, QDropEvent, QRegion
     )
@@ -455,7 +455,7 @@ class ThumbnailWorker(QRunnable):
                     # PDF PRIMARY: pypdfium2 (High Fidelity)
                     if ext == '.pdf':
                         try:
-                            import pypdfium2 as pdfium
+                            import pypdfium2 as pdfium  # type: ignore[reportMissingImports]
                             from PIL import Image
                             import platform
                             
@@ -497,7 +497,7 @@ class ThumbnailWorker(QRunnable):
 
                     # DOCUMENT FALLBACK/PRIMARY: PyMuPDF (fitz)
                     try:
-                        import fitz  # PyMuPDF
+                        import fitz  # type: ignore[reportMissingImports] # PyMuPDF
                         from PIL import Image
                         import platform
                         
@@ -641,12 +641,12 @@ class ThumbnailWorker(QRunnable):
             elif ext in {'.mp3', '.flac', '.m4a', '.aac', '.ogg', '.wma', '.opus', '.alac', '.ape', '.aiff'}:
                 try:
                     try:
-                        import mutagen
-                        from mutagen.mp3 import MP3
-                        from mutagen.flac import FLAC
-                        from mutagen.mp4 import MP4
-                        from mutagen.oggvorbis import OggVorbis
-                        from mutagen.oggopus import OggOpus
+                        import mutagen  # type: ignore[reportMissingImports]
+                        from mutagen.mp3 import MP3  # type: ignore[reportMissingImports]
+                        from mutagen.flac import FLAC  # type: ignore[reportMissingImports]
+                        from mutagen.mp4 import MP4  # type: ignore[reportMissingImports]
+                        from mutagen.oggvorbis import OggVorbis  # type: ignore[reportMissingImports]
+                        from mutagen.oggopus import OggOpus  # type: ignore[reportMissingImports]
                     except ImportError:
                         # No thumbnail, but we can still emit some basic info if we want
                         # For now, just exit if mutagen isn't there
@@ -1799,7 +1799,7 @@ class DragDropResultsWidget(QWidget):
             painter.setPen(QColor(MD3_COLORS['primary']))
             font = QFont("Roboto", 16, QFont.Weight.Medium)
             painter.setFont(font)
-            text = "Drop folder here to add to scan list"
+            text = "Drop folder(s) here to add to scan list"
             text_rect = painter.fontMetrics().boundingRect(text)
             text_x = (self.width() - text_rect.width()) // 2
             text_y = self.height() // 2
@@ -1995,7 +1995,7 @@ class CloneWiperApp(QMainWindow):
         # Path List Widget (With Scrollbar)
         self.path_list_widget = QListWidget()
         self.path_list_widget.setMinimumWidth(300)
-        self.path_list_widget.setFixedHeight(36) # Default height
+        self.path_list_widget.setFixedHeight(22) # Default height (20px item + 2px container)
         self.path_list_widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.path_list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.path_list_widget.setStyleSheet(f"""
@@ -2006,21 +2006,28 @@ class CloneWiperApp(QMainWindow):
                 color: {MD3_COLORS['on_surface']};
                 font-size: 12px;
                 outline: none;
-                padding: 1px;
+                padding: 0px;
             }}
             QListWidget::item {{
-                padding: 4px 8px;
+                padding: 0px 8px;
                 border-radius: 6px;
-                margin: 1px 2px;
+                margin: 0px 2px 0px 2px;
+                min-height: 20px;
+                height: 20px;
             }}
             QListWidget::item:only-child {{
                 /* Vertically center when only one item */
-                padding-top: 8px;
-                padding-bottom: 8px;
+                min-height: 20px;
+                height: 20px;
+                padding-top: 0px;
+                padding-bottom: 0px;
             }}
             QListWidget::item:selected {{
                 background-color: {MD3_COLORS['primary_container']};
                 color: {MD3_COLORS['on_primary_container']};
+                padding: 0px 8px;
+                min-height: 20px;
+                height: 20px;
             }}
             QScrollBar:vertical {{
                 background-color: transparent;
@@ -2069,7 +2076,13 @@ class CloneWiperApp(QMainWindow):
         
         # Hash Mode Selection (no label, centered text like other dropdowns)
         self.hash_mode_combo = CenteredComboBox()
-        self.hash_mode_combo.addItems(["MD5 Only", "Single Perceptual Hash", "Multi-Algorithm Perceptual Hash"])
+        self.hash_mode_combo.addItems([
+            "MD5 Only", 
+            "Single Perceptual Hash", 
+            "Multi-Algorithm Perceptual Hash",
+            "Single P-Hash + ORB",
+            "Multi-Algo P-Hash + ORB"
+        ])
         self.hash_mode_combo.setCurrentIndex(2)  # Default to multi-algorithm
         self.hash_mode_combo.setFixedHeight(32)
         self.hash_mode_combo.setStyleSheet(f"""
@@ -2112,14 +2125,14 @@ class CloneWiperApp(QMainWindow):
         
         # Scan Button (Filled)
         self.scan_btn = QPushButton("Start Scanning")
-        self.scan_btn.setFixedSize(160, 40)
+        self.scan_btn.setFixedSize(140, 32)
         self.scan_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {MD3_COLORS['primary']};
                 color: {MD3_COLORS['on_primary']};
-                font-size: 13px;
+                font-size: 12px;
                 font-weight: 600;
-                border-radius: 20px;
+                border-radius: 16px;
                 letter-spacing: 0.5px;
             }}
             QPushButton:hover {{ background-color: {MD3_COLORS['primary_container']}; }}
@@ -2142,7 +2155,7 @@ class CloneWiperApp(QMainWindow):
         status_layout.setContentsMargins(24, 0, 24, 0)
         status_layout.setSpacing(16)
         
-        self.status_label = QLabel("Ready")
+        self.status_label = QLabel("")  # Will be updated during scanning/results
         self.status_label.setStyleSheet(f"""
             color: {MD3_COLORS['on_surface_variant']};
             font-size: 14px;
@@ -2150,6 +2163,8 @@ class CloneWiperApp(QMainWindow):
             padding: 0px;
         """)
         status_layout.addWidget(self.status_label)
+        # Hide status label initially (will show during scanning/results)
+        self.status_label.setVisible(False)
         
         status_layout.addStretch()
         
@@ -2192,38 +2207,40 @@ class CloneWiperApp(QMainWindow):
         self.results_layout.setContentsMargins(24, 16, 24, 16)
         self.results_layout.setSpacing(16)
         
-        # Center container for scanning progress (initially hidden)
+        # Center container for scanning progress and initial instruction
         self.center_progress_container = QWidget()
-        self.center_progress_container.setVisible(False)
         center_layout = QVBoxLayout(self.center_progress_container)
         center_layout.setContentsMargins(24, 24, 24, 24)
         center_layout.setSpacing(16)
         center_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
-        # Center status label for scanning progress
-        self.center_status_label = QLabel("")
-        self.center_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Center status label for scanning progress and initial instruction
+        self.center_status_label = QLabel()
+        self.center_status_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         # Enable word wrapping for long status messages
         self.center_status_label.setWordWrap(True)
+        # Enable HTML formatting
+        self.center_status_label.setTextFormat(Qt.TextFormat.RichText)
         # Set width constraints to match progress bar and prevent overflow
-        self.center_status_label.setMinimumWidth(400)
-        self.center_status_label.setMaximumWidth(600)
+        self.center_status_label.setMinimumWidth(600)
+        self.center_status_label.setMaximumWidth(800)
         self.center_status_label.setStyleSheet(f"""
             QLabel {{
                 color: {MD3_COLORS['on_surface']};
-                font-size: 16px;
-                font-weight: 500;
                 font-family: 'Roboto', 'Segoe UI', sans-serif;
                 padding: 0px;
             }}
         """)
         center_layout.addWidget(self.center_status_label, 0, Qt.AlignmentFlag.AlignCenter)
         
-        # Center progress bar (below status label)
+        # Set initial instruction text
+        self.center_status_label.setText(self._get_instruction_text())
+        
+        # Center progress bar (below status label, initially hidden)
         self.center_progress_bar = QProgressBar()
         self.center_progress_bar.setFixedHeight(8)
-        self.center_progress_bar.setMinimumWidth(400)
-        self.center_progress_bar.setMaximumWidth(600)
+        self.center_progress_bar.setMinimumWidth(600)
+        self.center_progress_bar.setMaximumWidth(800)
         self.center_progress_bar.setTextVisible(False)
         self.center_progress_bar.setStyleSheet(f"""
             QProgressBar {{
@@ -2238,6 +2255,9 @@ class CloneWiperApp(QMainWindow):
             }}
         """)
         center_layout.addWidget(self.center_progress_bar, 0, Qt.AlignmentFlag.AlignCenter)
+        # Initially show the instruction (center_progress_container visible, progress bar hidden)
+        self.center_progress_container.setVisible(True)
+        self.center_progress_bar.setVisible(False)
         
         # Add center container to results layout with stretch for vertical centering
         self.results_layout.addStretch()
@@ -2608,26 +2628,44 @@ class CloneWiperApp(QMainWindow):
         footer_layout.addWidget(self.clear_select_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         self.main_layout.addWidget(footer)
     
+    def _get_instruction_text(self) -> str:
+        """Get the initial instruction text with hash mode descriptions."""
+        return (
+            "<div style='text-align: left; line-height: 1.6;'>"
+            "<p style='font-size: 16px; font-weight: 500; margin-bottom: 12px;'>"
+            "Use \"+ Add Folder\" or Drag & drop folder here"
+            "</p>"
+            "<p style='font-size: 13px; font-weight: 400; color: #CAC4D0; margin-top: 16px;'>"
+            "<b>Hash Modes:</b><br>"
+            "• <b>MD5 Only</b> - Fast exact duplicates (byte-for-byte identical files)<br>"
+            "• <b>Single Perceptual Hash</b> - Balanced speed/accuracy for similar images<br>"
+            "• <b>Multi-Algorithm Perceptual Hash</b> - Most accurate (detects resized/compressed duplicates)<br>"
+            "• <b>Single P-Hash + ORB</b> - Single hash with ORB verification (faster, accurate)<br>"
+            "• <b>Multi-Algo P-Hash + ORB</b> - Multi-algorithm with ORB verification (most accurate)"
+            "</p>"
+            "</div>"
+        )
+    
     def _adjust_path_list_height(self):
         """Dynamically adjust path list height based on items (max 1.5 rows)."""
         count = self.path_list_widget.count()
         if count == 0:
-            h = 36  # Empty: default height
+            h = 22  # Empty: default height (20px item + 2px container)
         elif count == 1:
-            h = 36  # Single folder: keep original height (1 row), no expansion
-            # Vertically center the single item by adjusting item size hint
+            h = 22  # Single folder: 20px item + 2px container
+            # Set item height to 20px
             item = self.path_list_widget.item(0)
             if item:
-                # Set item height to fill available space for vertical centering
-                item.setSizeHint(QSize(item.sizeHint().width(), h - 2))
+                item.setSizeHint(QSize(-1, 20))
         else:
-            # Multiple folders: expand to 1.5 rows to hint at scrolling
-            h = 54
-            # Reset item size hints for multiple items (use default)
+            # Multiple folders: 20px per item + 0px margin between items
+            # Show 1.5 rows: 20px + 0px + 10px (half item) = 30px
+            h = 30
+            # Set all items to 20px height
             for i in range(count):
                 item = self.path_list_widget.item(i)
                 if item:
-                    item.setSizeHint(QSize())
+                    item.setSizeHint(QSize(-1, 20))
         self.path_list_widget.setFixedHeight(h)
         self.updateGeometry()
 
@@ -2642,7 +2680,7 @@ class CloneWiperApp(QMainWindow):
             QListWidget.keyPressEvent(self.path_list_widget, event)
 
     def _show_path_context_menu(self, position):
-        from PySide6.QtWidgets import QMenu
+        from PySide6.QtWidgets import QMenu  # type: ignore[reportMissingImports]
         menu = QMenu()
         remove_action = menu.addAction("Remove Folder")
         action = menu.exec(self.path_list_widget.mapToGlobal(position))
@@ -2669,7 +2707,10 @@ class CloneWiperApp(QMainWindow):
         """Add a folder to the path list if not already present."""
         items = [self.path_list_widget.item(i).text() for i in range(self.path_list_widget.count())]
         if path not in items:
-            self.path_list_widget.addItem(path)
+            item = self.path_list_widget.addItem(path)
+            # Set item height to 20px (text 19px + 1px minimal spacing)
+            if item:
+                item.setSizeHint(QSize(-1, 20))
     
     def _on_folders_dropped(self, paths: list):
         """Handle folders dropped on results area - supports multiple folders."""
@@ -2702,10 +2743,11 @@ class CloneWiperApp(QMainWindow):
         # Center progress container will be shown via status callback
         # Don't update status_label during scanning to avoid duplication with center display
         
-        # Get hash mode: 0=MD5, 1=Single Perceptual, 2=Multi-Algorithm
+        # Get hash mode: 0=MD5, 1=Single Perceptual, 2=Multi-Algorithm, 3=Single+ORB, 4=Multi+ORB
         hash_mode = self.hash_mode_combo.currentIndex()
-        use_imagehash = hash_mode > 0  # True for single or multi-algorithm
-        use_multi_hash = hash_mode == 2  # True only for multi-algorithm
+        use_imagehash = hash_mode > 0 and hash_mode < 5  # True for perceptual hash modes
+        use_multi_hash = hash_mode == 2 or hash_mode == 4  # True for multi-algorithm modes
+        use_orb_verification = hash_mode == 3 or hash_mode == 4  # True for ORB modes
         
         # Clear previous results
         self.file_groups = {}
@@ -2731,6 +2773,8 @@ class CloneWiperApp(QMainWindow):
             self.keep_raw_btn.setVisible(False)
         
         # Clear existing group widgets (but keep center_progress_container and stretches)
+        # Reset status label to initial instruction when clearing results
+        self.status_label.setText("Use \"+ Add Folder\" or Drag & drop folder here")
         items_to_remove = []
         for i in range(self.results_layout.count()):
             item = self.results_layout.itemAt(i)
@@ -2742,9 +2786,10 @@ class CloneWiperApp(QMainWindow):
             if item and item.widget():
                 item.widget().deleteLater()
         
-        # Show center progress container and hide upper left status label
+        # Show center progress container with progress bar and hide upper left status label
         self.center_progress_container.setVisible(True)
         self.center_status_label.setText("Initializing scan...")
+        self.center_progress_bar.setVisible(True)  # Show progress bar during scanning
         self.center_progress_bar.setValue(0)
         self.status_label.setVisible(False)  # Hide upper left status during scanning
         
@@ -2765,7 +2810,7 @@ class CloneWiperApp(QMainWindow):
                 self.engine.status_callback("Scan thread started...")
                 self.engine.progress_callback(0.01)
                 
-                self.engine.scan_duplicate_files(valid_paths, use_imagehash, use_multi_hash)
+                self.engine.scan_duplicate_files(valid_paths, use_imagehash, use_multi_hash, use_orb_verification)
                 print("DEBUG: Scan completed")
             except Exception as e:
                 import traceback
@@ -2781,26 +2826,22 @@ class CloneWiperApp(QMainWindow):
     
     def _on_progress(self, value: float):
         """Progress callback from engine (thread-safe via Signal)."""
-        print(f"DEBUG: _on_progress called with value={value}")
         # Emit signal for thread-safe UI update
         self.progress_updated.emit(value)
     
     def _on_status(self, message: str):
         """Status callback from engine (thread-safe via Signal)."""
-        print(f"DEBUG: _on_status called with message={message}")
         # Emit signal for thread-safe UI update
         self.status_updated.emit(str(message))
     
     def _on_results(self, duplicate_groups: Dict[str, List[str]]):
         """Results callback from engine (thread-safe via Signal)."""
-        print(f"DEBUG: _on_results called with {len(duplicate_groups)} groups")
         # Emit signal for thread-safe UI update
         self.results_ready.emit(duplicate_groups)
     
     @Slot(float)
     def _on_progress_slot(self, value: float):
         """Slot for progress updates (runs on main thread)."""
-        print(f"DEBUG: _on_progress_slot called with value={value}")
         # Update center progress bar
         if self.scan_btn.text() == "Cancel Scanning":
             self.center_progress_bar.setValue(int(value * 100))
@@ -2808,24 +2849,24 @@ class CloneWiperApp(QMainWindow):
     @Slot(str)
     def _on_status_slot(self, message: str):
         """Slot for status updates (runs on main thread)."""
-        print(f"DEBUG: _on_status_slot called with message={message}")
         
         # Update center status label and progress container if scanning
         if self.scan_btn.text() == "Cancel Scanning":
             # During scanning: only update center display, hide upper left status completely
             self.center_status_label.setText(message)
             self.center_progress_container.setVisible(True)
+            self.center_progress_bar.setVisible(True)  # Show progress bar during scanning
             self.status_label.setVisible(False)  # Keep hidden during scanning
         else:
             # Not scanning: update status bar (for non-scanning messages)
             self.status_label.setText(message)
             self.status_label.setVisible(True)  # Show when not scanning
             self.center_progress_container.setVisible(False)
+            self.center_progress_bar.setVisible(False)  # Hide progress bar when not scanning
     
     @Slot(dict)
     def _on_results_slot(self, duplicate_groups: Dict[str, List[str]]):
         """Slot for results updates (runs on main thread)."""
-        print(f"DEBUG: _on_results_slot called with {len(duplicate_groups)} groups")
         self._display_results(duplicate_groups)
     
     
@@ -2835,8 +2876,10 @@ class CloneWiperApp(QMainWindow):
         # Set cancellation flag in engine
         self.engine.scan_cancelled = True
         
-        # Hide center status label
-        self.center_status_label.setVisible(False)
+        # Show instruction again after cancellation
+        self.center_progress_container.setVisible(True)
+        self.center_status_label.setText(self._get_instruction_text())
+        self.center_progress_bar.setVisible(False)  # Hide progress bar
         
         # Update UI
         self.scan_btn.setText("Start Scanning")
@@ -2845,9 +2888,7 @@ class CloneWiperApp(QMainWindow):
         self.scan_btn.clicked.disconnect()
         self.scan_btn.clicked.connect(self._start_scanning)
         
-        self.center_progress_container.setVisible(False)
-        self.status_label.setText("Scan cancelled")
-        self.status_label.setVisible(True)  # Show status label after cancellation
+        self.status_label.setVisible(False)  # Keep status label hidden
         
         # Clear scan thread reference
         self._scan_thread = None
@@ -2856,8 +2897,9 @@ class CloneWiperApp(QMainWindow):
         """Display scan results."""
         print(f"DEBUG: _display_results called with {len(duplicate_groups)} groups")
         
-        # Hide center status label
-        self.center_status_label.setVisible(False)
+        # Hide center progress container and show results
+        self.center_progress_container.setVisible(False)
+        self.center_progress_bar.setVisible(False)  # Hide progress bar
         
         # Restore button to "Start Scanning" state
         self.scan_btn.setText("Start Scanning")
@@ -2865,9 +2907,6 @@ class CloneWiperApp(QMainWindow):
         # Reconnect button to start scanning
         self.scan_btn.clicked.disconnect()
         self.scan_btn.clicked.connect(self._start_scanning)
-        
-        # Hide center progress container
-        self.center_progress_container.setVisible(False)
         
         self.file_groups_raw = duplicate_groups
         

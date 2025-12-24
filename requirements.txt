@@ -9,5 +9,31 @@ mutagen>=1.47.0       # For music album art and metadata
 
 # Optional Dependencies (Recommended for full feature support)
 # Install these for additional features:
-# opencv-python>=4.8.0  # For video thumbnails
+# opencv-python>=4.8.0  # For video thumbnails (standard version, no CUDA)
+# opencv-contrib-python>=4.8.0  # For additional features including video thumbnails
 # pypdfium2>=0.20.0     # For high-quality PDF rendering (preferred over PyMuPDF for PDF)
+
+# GPU Acceleration for ORB (Optional, requires CUDA-enabled OpenCV)
+# Note: Standard opencv-python does NOT include CUDA support
+# 
+# For GPU-accelerated ORB with CUDA 12.6, you have these options:
+# 
+# Option 1: Pre-built CUDA wheels (Recommended if available)
+#   For CUDA 12.6, try:
+#   pip install opencv-cu126  # If available for your Python version
+#   Or check: https://github.com/cudawarped/opencv-python-cuda-wheels
+# 
+# Option 2: Build from source (Most reliable, but complex)
+#   See GPU_ACCELERATION_SETUP.md for detailed instructions
+#   Requires: CUDA Toolkit 12.6, cuDNN, CMake, Visual Studio
+# 
+# Option 3: Use standard opencv-python (CPU only, default)
+#   pip install opencv-python>=4.8.0
+#   This is the default and works well with CPU optimization
+# 
+# Compatibility:
+# - OpenCV 4.11.0+ supports CUDA 12.6
+# - Your system: CUDA 12.6, RTX 4070, Python 3.12.3
+# - Current OpenCV: 4.11.0 (standard build, no CUDA)
+# 
+# After installing CUDA-enabled OpenCV, CloneWiper will auto-detect and enable GPU acceleration

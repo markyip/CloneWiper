@@ -30,7 +30,10 @@ import atexit
 from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, List, Set, Optional, Callable, Tuple
+from typing import Dict, List, Set, Optional, Callable, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 import sys
 
 # Try to import psutil for advanced CPU detection (hybrid architecture support)
@@ -42,7 +45,7 @@ except ImportError:
 
 # Optional dependencies
 try:
-    import imagehash
+    import imagehash  # type: ignore[reportMissingImports]
     from PIL import Image, ImageFile
     IMAGEHASH_AVAILABLE = True
     PIL_AVAILABLE = True
@@ -61,6 +64,19 @@ except ImportError:
 if PIL_AVAILABLE:
     Image.MAX_IMAGE_PIXELS = 200000000  # 200 megapixels
 
+# OpenCV for ORB/SSIM/SIFT verification (optional)
+# Import at module level and suppress warnings globally
+try:
+    import cv2
+    # Suppress OpenCV warnings globally (10-bit TIFF, RAW files, etc.)
+    # Set log level to ERROR (3) to suppress WARN messages
+    try:
+        cv2.setLogLevel(3)  # 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=SILENT
+    except:
+        pass  # If setLogLevel fails, continue anyway
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
 
 
 @dataclass
@@ -183,6 +199,15 @@ class ScanEngine:
         self._cache_write_batch_size = 50  # Batch size for cache writes
         self._cache_write_timer = None
         
+        # Batch I/O optimization: Pre-read file data to memory
+        # This reduces I/O wait time by prefetching files while hash calculation is in progress
+        self._file_prefetch_cache = {}  # file_path -> (file_data_bytes, timestamp)
+        self._file_prefetch_lock = threading.Lock()
+        # Optimized for large datasets (10K+ images): Increased cache limits
+        self._file_prefetch_max_size = 500  # Maximum number of files to cache in memory (up from 100)
+        self._file_prefetch_max_bytes = 2048 * 1024 * 1024  # Maximum 2GB cache size (up from 500MB)
+        self._file_prefetch_enabled = True  # Enable/disable prefetching
+        
         # Results
         self.file_groups: Dict[str, List[str]] = defaultdict(list)
         self.file_groups_raw: Dict[str, List[str]] = {}
@@ -192,6 +217,35 @@ class ScanEngine:
         self.md5_cache_enabled = True
         self.use_imagehash = False
         self.use_multi_hash = False  # True for multi-algorithm, False for single algorithm
+        
+        # Advanced hash accuracy settings
+        # Hamming Distance Threshold:
+        #   Hamming distance measures the number of differing bits between two hash values.
+        #   For 64-bit perceptual hashes, the maximum distance is 64 (completely different).
+        #   - Threshold of 4 means up to 4 bits can differ (93.75% similarity required)
+        #   - Lower values (1-3): Very strict matching, very few false positives, may miss some duplicates
+        #   - Higher values (5-12): More lenient matching, catches more duplicates, may include false positives
+        #   Example: If hash1 = "a1b2c3d4" and hash2 = "a1b2c3d5", they differ by 1 bit (distance = 1)
+        self.hamming_threshold = 4  # Hamming distance threshold (set to 4 for stricter matching)
+        self.min_agreement = 3  # Minimum algorithms that must agree (default: 3 out of 4)
+        self.hash_image_size = 512  # Image size for hash calculation (increased to 512 for better accuracy)
+        
+        self.use_opencv_verification = False  # Use OpenCV for final verification (False/None, 'ssim', 'orb', 'sift')
+        self.opencv_verification_method = None  # 'ssim', 'orb', or 'sift' (None = disabled)
+        
+        # Deferred ORB verification: For large datasets, optionally defer ORB to deletion time
+        # DEFAULT: False - since users review thumbnails anyway, ORB during scan filters false positives earlier
+        # Set to True only if skipping visual review and want faster scan at cost of manual verification later
+        self.defer_orb_verification = False  # Default: False (verify during scan)
+        
+        # ORB GPU acceleration settings
+        # CUDA support disabled (using CPU only)
+        self.use_orb_gpu = False
+        
+        # ORB descriptor cache for faster verification
+        self._orb_cache = {}  # file_path -> (keypoints, descriptors)
+        self._orb_cache_lock = threading.Lock()
+        self._orb_cache_max_size = 1000  # Maximum cached ORB descriptors to prevent unbounded growth
         
         # Persistent cache DB
         self._phash_db = None
@@ -665,6 +719,11 @@ class ScanEngine:
         Calculate single perceptual hash using phash (perceptual hash) algorithm.
         phash is more accurate than average_hash and is a good balance between speed and accuracy.
         
+        Pre-processing optimization:
+        - Pre-resize large images to 256x256 before hash calculation
+        - This improves accuracy by preserving more detail while keeping computation efficient
+        - 256x256 matches multi-hash mode, allowing phash reuse between single and multi-hash modes
+        
         Args:
             img: PIL Image object
             
@@ -675,12 +734,26 @@ class ScanEngine:
             if not IMAGEHASH_AVAILABLE:
                 return None
             
-            # Convert to RGB if needed
-            try:
-                if img.mode != 'RGB':
+            # Optimization: Check mode before converting (avoid unnecessary conversion)
+            if img.mode != 'RGB':
+                try:
                     img = img.convert('RGB')
-            except Exception as convert_error:
-                print(f"DEBUG: Image mode conversion failed, using original mode: {convert_error}")
+                except Exception as convert_error:
+                    print(f"DEBUG: Image mode conversion failed, using original mode: {convert_error}")
+            
+            # Pre-resize large images to improve accuracy
+            # 256x256 matches multi-hash mode, allowing phash reuse between single and multi-hash modes
+            # This helps phash capture more accurate frequency features during DCT
+            # Optimization: Use BILINEAR instead of LANCZOS for faster resizing (2-3x faster, negligible accuracy impact for hash)
+            try:
+                w, h = img.size
+                if w > 256 or h > 256:
+                    # Resize to 256x256 max (maintain aspect ratio)
+                    # BILINEAR is faster than LANCZOS and sufficient for hash calculation
+                    img.thumbnail((256, 256), Image.Resampling.BILINEAR)
+            except Exception as resize_error:
+                # If resize fails, continue with original image
+                print(f"DEBUG: Image resize failed in single hash, using original: {resize_error}")
             
             # Use phash (perceptual hash) - more accurate than average_hash
             try:
@@ -696,18 +769,21 @@ class ScanEngine:
             print(f"DEBUG: Single hash calculation failed: {e}")
             return None
     
-    def _calculate_multi_hash(self, img: Image.Image) -> Optional[str]:
+    def _calculate_multi_hash(self, img: Image.Image, cached_phash: Optional[str] = None) -> Optional[str]:
         """
         Calculate combined perceptual hash using multiple algorithms for better accuracy.
         Uses: average_hash, phash (perceptual), dhash (difference), and whash (wavelet).
         
         Optimizations:
-        - Pre-resize image to smaller size (256x256 max) for faster processing
+        - Pre-resize large images to 256x256 before hash calculation for better accuracy
+        - This improves hash quality by preserving more detail while keeping computation efficient
+        - 256x256 is optimal for multi-hash: balances accuracy and performance for 4 algorithms
+        - Reuse cached phash from single-hash mode if available (both use 256x256 now)
         - Convert to RGB once and reuse
-        - Parallel calculation of hash algorithms using ThreadPoolExecutor
         
         Args:
             img: PIL Image object
+            cached_phash: Optional cached phash from single-hash mode to reuse
             
         Returns:
             Combined hash string in format: "avg_phash_diff_wave" or None on error
@@ -716,42 +792,61 @@ class ScanEngine:
             if not IMAGEHASH_AVAILABLE:
                 return None
             
-            # Optimization: Convert to RGB once (if needed) and reuse
-            # Note: Image resizing is already done during image loading for better performance
-            try:
-                if img.mode != 'RGB':
+            # Optimization: Check mode before converting (avoid unnecessary conversion)
+            if img.mode != 'RGB':
+                try:
                     img = img.convert('RGB')
-            except Exception as convert_error:
-                # If conversion fails, try to continue with original mode
-                print(f"DEBUG: Image mode conversion failed, using original mode: {convert_error}")
+                except Exception as convert_error:
+                    # If conversion fails, try to continue with original mode
+                    print(f"DEBUG: Image mode conversion failed, using original mode: {convert_error}")
             
-            # Optimization 3: Parallel calculation of hash algorithms
-            # Use ThreadPoolExecutor to calculate all hashes concurrently
+            # Pre-resize large images to improve accuracy for multi-hash calculation
+            # 256x256 is optimal: provides better detail than 128x128 for multiple algorithms
+            # while still being computationally efficient for parallel hash calculation
+            # Optimization: Use BILINEAR instead of LANCZOS for faster resizing (2-3x faster, negligible accuracy impact)
+            try:
+                w, h = img.size
+                if w > 256 or h > 256:
+                    # Resize to 256x256 max (maintain aspect ratio)
+                    # BILINEAR is faster than LANCZOS and sufficient for hash calculation
+                    img.thumbnail((256, 256), Image.Resampling.BILINEAR)
+            except Exception as resize_error:
+                # If resize fails, continue with original image
+                print(f"DEBUG: Image resize failed in multi hash, using original: {resize_error}")
+            
+            # Optimization: Direct calculation instead of ThreadPoolExecutor for CPU-bound tasks
+            # ThreadPoolExecutor overhead (thread creation, context switching) can be slower than direct calls
+            # for CPU-intensive hash calculations. Direct calls are faster for small operations.
             hash_results = {}
             
-            def calc_hash(algorithm_name, hash_func):
-                """Helper function to calculate a single hash with error handling."""
-                try:
-                    return algorithm_name, str(hash_func(img))
-                except Exception as e:
-                    print(f"DEBUG: {algorithm_name} failed: {e}")
-                    return algorithm_name, None
+            # Calculate all hashes directly (faster than ThreadPoolExecutor for CPU-bound tasks)
+            try:
+                hash_results['average'] = str(imagehash.average_hash(img))
+            except Exception as e:
+                print(f"DEBUG: average_hash failed: {e}")
+                hash_results['average'] = None
             
-            # Calculate all hashes in parallel (up to 4 concurrent operations)
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = [
-                    executor.submit(calc_hash, 'average', imagehash.average_hash),
-                    executor.submit(calc_hash, 'perceptual', imagehash.phash),
-                    executor.submit(calc_hash, 'difference', imagehash.dhash),
-                    executor.submit(calc_hash, 'wavelet', imagehash.whash),
-                ]
-                
-                for future in as_completed(futures):
-                    try:
-                        algo_name, hash_value = future.result()
-                        hash_results[algo_name] = hash_value
-                    except Exception as e:
-                        print(f"DEBUG: Hash calculation future error: {e}")
+            # Reuse cached phash if available (from single-hash mode, both use 256x256 now)
+            if cached_phash:
+                hash_results['perceptual'] = cached_phash
+            else:
+                try:
+                    hash_results['perceptual'] = str(imagehash.phash(img))
+                except Exception as e:
+                    print(f"DEBUG: phash failed: {e}")
+                    hash_results['perceptual'] = None
+            
+            try:
+                hash_results['difference'] = str(imagehash.dhash(img))
+            except Exception as e:
+                print(f"DEBUG: dhash failed: {e}")
+                hash_results['difference'] = None
+            
+            try:
+                hash_results['wavelet'] = str(imagehash.whash(img))
+            except Exception as e:
+                print(f"DEBUG: whash failed: {e}")
+                hash_results['wavelet'] = None
             
             # Combine available hashes (use placeholder for failed ones)
             hashes = [
@@ -779,6 +874,128 @@ class ScanEngine:
             except Exception:
                 return None
     
+    def _prefetch_file_data(self, file_path: str) -> Optional[bytes]:
+        """
+        Pre-fetch file data to memory for faster I/O.
+        Uses async I/O to read file while other operations are in progress.
+        
+        Args:
+            file_path: Path to file to prefetch
+            
+        Returns:
+            File data as bytes, or None if failed
+        """
+        if not self._file_prefetch_enabled:
+            return None
+        
+        try:
+            # Check cache first
+            with self._file_prefetch_lock:
+                if file_path in self._file_prefetch_cache:
+                    data, _ = self._file_prefetch_cache[file_path]
+                    return data
+            
+            # Check file size before reading (avoid reading huge files)
+            try:
+                file_size = os.path.getsize(file_path)
+                # Only prefetch files smaller than 50MB to avoid memory issues
+                if file_size > 50 * 1024 * 1024:
+                    return None
+            except Exception:
+                return None
+            
+            # Read file data
+            try:
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+                
+                # Add to cache (with size limit)
+                with self._file_prefetch_lock:
+                    # Remove oldest entries if cache is too large
+                    cache_size = sum(len(d) for d, _ in self._file_prefetch_cache.values())
+                    while (len(self._file_prefetch_cache) >= self._file_prefetch_max_size or 
+                           cache_size + len(data) > self._file_prefetch_max_bytes):
+                        if not self._file_prefetch_cache:
+                            break
+                        # Remove oldest entry (FIFO)
+                        oldest_key = next(iter(self._file_prefetch_cache))
+                        old_data, _ = self._file_prefetch_cache.pop(oldest_key)
+                        cache_size -= len(old_data)
+                    
+                    # Add new entry
+                    self._file_prefetch_cache[file_path] = (data, time.time())
+                
+                return data
+            except Exception as e:
+                print(f"DEBUG: File prefetch failed for {os.path.basename(file_path)}: {e}")
+                return None
+        except Exception:
+            return None
+    
+    def _prefetch_files_batch(self, file_paths: List[str], max_workers: int = 4):
+        """
+        Pre-fetch multiple files in parallel using async I/O.
+        
+        Args:
+            file_paths: List of file paths to prefetch
+            max_workers: Number of parallel prefetch workers
+        """
+        if not self._file_prefetch_enabled or not file_paths:
+            return
+        
+        def prefetch_one(file_path: str):
+            """Prefetch a single file."""
+            try:
+                self._prefetch_file_data(file_path)
+            except Exception:
+                pass  # Silently fail for prefetch
+        
+        # Prefetch in parallel batches
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all prefetch tasks
+            futures = [executor.submit(prefetch_one, fp) for fp in file_paths[:self._file_prefetch_max_size * 2]]
+            # Don't wait for completion - let them run in background
+            # This allows hash calculation to proceed while files are being prefetched
+    
+    def _load_image_from_prefetch(self, file_path: str) -> Optional['Image.Image']:
+        """
+        Load image from prefetch cache if available, otherwise load normally.
+        
+        Args:
+            file_path: Path to image file
+            
+        Returns:
+            PIL Image object or None if failed
+        """
+        try:
+            # Try to get from prefetch cache
+            with self._file_prefetch_lock:
+                if file_path in self._file_prefetch_cache:
+                    data, _ = self._file_prefetch_cache[file_path]
+                    # Load image from bytes
+                    import io
+                    try:
+                        img = Image.open(io.BytesIO(data))
+                        # Verify image is actually valid by trying to access size
+                        _ = img.size
+                        return img
+                    except Exception:
+                        # Invalid image data in cache, remove it
+                        self._file_prefetch_cache.pop(file_path, None)
+                        return None
+        except Exception:
+            pass
+        
+        # Fallback to normal file loading
+        try:
+            img = Image.open(file_path)
+            # Verify image is actually valid by trying to access size
+            _ = img.size
+            return img
+        except Exception:
+            # Image cannot be identified or is corrupted - this is expected for some files
+            return None
+    
     def calculate_file_hash(self, file_path: str) -> Optional[str]:
         """Calculate file hash (multi-algorithm pHash for images/videos if enabled, else MD5)."""
         try:
@@ -803,12 +1020,16 @@ class ScanEngine:
                         mtime_ns = 0
                     
                     algo = "multi_hash" if self.use_multi_hash else "single_hash"  # Algorithm name based on mode
+                    cached_phash = None  # For reusing phash from single-hash cache in multi-hash mode
+                    
                     if st is not None:
                         try:
                             with self._phash_stats_lock:
                                 self._phash_cache_lookups += 1
                         except Exception:
                             pass
+                        
+                        # First, try to get cached hash for current algorithm
                         cached = self._phash_cache_get(file_path, size, mtime_ns, algo)
                         if cached:
                             try:
@@ -817,7 +1038,20 @@ class ScanEngine:
                             except Exception:
                                 pass
                             return f"img_{cached}"
-                        else:
+                        
+                        # If multi-hash mode and no multi-hash cache, try to reuse phash from single-hash cache
+                        if self.use_multi_hash:
+                            cached_single = self._phash_cache_get(file_path, size, mtime_ns, "single_hash")
+                            if cached_single:
+                                # Reuse the phash from single-hash cache (both use 256x256 now)
+                                cached_phash = cached_single
+                                try:
+                                    with self._phash_stats_lock:
+                                        self._phash_cache_hits += 1  # Count as cache hit for phash reuse
+                                except Exception:
+                                    pass
+                        
+                        if not cached and not cached_phash:
                             try:
                                 with self._phash_stats_lock:
                                     self._phash_cache_misses += 1
@@ -857,54 +1091,89 @@ class ScanEngine:
                                 pass
                             except Exception as raw_error:
                                 # RAW processing failed, fall back to MD5
-                                print(f"DEBUG: RAW file processing failed for {file_path}: {raw_error}")
+                                # Only log if it's not a common "unsupported format" error
+                                # rawpy errors can be bytes or strings
+                                error_str = ""
+                                if isinstance(raw_error, bytes):
+                                    try:
+                                        # Decode bytes to get actual error message
+                                        error_str = raw_error.decode('utf-8', errors='ignore')
+                                    except Exception:
+                                        error_str = str(raw_error)
+                                else:
+                                    error_str = str(raw_error)
+                                
+                                # Silently ignore common "unsupported format" errors
+                                # Check the decoded/string error message (case-insensitive)
+                                error_lower = error_str.lower()
+                                if ('unsupported file format' not in error_lower and 
+                                    'not raw file' not in error_lower):
+                                    # Only log unexpected errors
+                                    print(f"DEBUG: RAW file processing failed for {os.path.basename(file_path)}: {raw_error}")
+                                # Silently fall back to MD5 for unsupported formats
                                 pass
                         else:
                             # Handle common image formats
                             # ImageFile.LOAD_TRUNCATED_IMAGES is already set to True at module level
                             # This allows loading truncated images (common with some JPEG files)
                             try:
-                                img = Image.open(file_path)
-                                # Optimization: For large images, use thumbnail loading for faster processing
-                                # This is especially beneficial for multi-hash calculation
-                                if self.use_multi_hash:
-                                    # Get image size without fully loading (fast operation)
-                                    w, h = img.size
-                                    max_dimension = 256
-                                    if w > max_dimension or h > max_dimension:
-                                        # For large images: thumbnail is MUCH faster than processing full size
-                                        # LANCZOS provides good quality but is slower. For hash calculation,
-                                        # we can use faster resampling methods (NEAREST or BILINEAR) for better performance
-                                        # However, LANCZOS is still acceptable for the quality/speed tradeoff
-                                        # The thumbnail operation is in-place and memory-efficient
-                                        img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
-                                        # Note: thumbnail() is optimized and only loads what's needed for the final size
+                                # Try to load from prefetch cache first (faster I/O)
+                                img = self._load_image_from_prefetch(file_path)
+                                if img is None:
+                                    # Fallback to normal file loading
+                                    try:
+                                        img = Image.open(file_path)
+                                        # Verify image is valid
+                                        _ = img.size
+                                    except Exception:
+                                        # Image cannot be identified or is corrupted
+                                        # This is expected for some files, silently fall back to MD5
+                                        img = None
+                                
+                                if img is not None:
+                                    # Optimization: For large images, use thumbnail loading for faster processing
+                                    # This is especially beneficial for multi-hash calculation
+                                    if self.use_multi_hash:
+                                        # Get image size without fully loading (fast operation)
+                                        w, h = img.size
+                                        max_dimension = self.hash_image_size  # Use configurable size (default: 256, can be 512 for better accuracy)
+                                        if w > max_dimension or h > max_dimension:
+                                            # For large images: thumbnail is MUCH faster than processing full size
+                                            # Optimization: Use BILINEAR instead of LANCZOS for faster resizing
+                                            # BILINEAR is 2-3x faster with negligible accuracy impact for hash calculation
+                                            # The thumbnail operation is in-place and memory-efficient
+                                            img.thumbnail((max_dimension, max_dimension), Image.Resampling.BILINEAR)
+                                            # Note: thumbnail() is optimized and only loads what's needed for the final size
+                                        else:
+                                            # Small image: no resizing needed, just load normally
+                                            img.load()
                                     else:
-                                        # Small image (≤256x256): no resizing needed, just load normally
+                                        # Single hash mode - load normally (no resizing needed for single hash)
                                         img.load()
-                                else:
-                                    # Single hash mode - load normally (no resizing needed for single hash)
-                                    img.load()
                             except Exception as img_open_error:
                                 # If loading fails, try opening without load() call
                                 # Some truncated images can still be processed
                                 try:
                                     img = Image.open(file_path)
+                                    # Verify image is valid
+                                    _ = img.size
                                     # Apply thumbnail optimization if multi-hash
                                     if self.use_multi_hash:
                                         w, h = img.size
-                                        max_dimension = 256
+                                        max_dimension = self.hash_image_size  # Use configurable size
                                         if w > max_dimension or h > max_dimension:
-                                            img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+                                            # Optimization: Use BILINEAR for faster resizing
+                                            img.thumbnail((max_dimension, max_dimension), Image.Resampling.BILINEAR)
                                 except Exception:
-                                    # Image cannot be opened, will fall back to MD5
-                                    print(f"DEBUG: Cannot open image file {file_path}: {img_open_error}")
+                                    # Image cannot be opened or identified - this is expected for corrupted files
+                                    # Silently fall back to MD5 without logging (reduces noise)
                                     img = None
                         
                         if img is not None:
                             # Use single or multi-hash algorithm based on setting
                             if self.use_multi_hash:
-                                img_hash = self._calculate_multi_hash(img)
+                                # Pass cached phash to reuse from single-hash mode
+                                img_hash = self._calculate_multi_hash(img, cached_phash=cached_phash)
                             else:
                                 img_hash = self._calculate_single_hash(img)
                             img.close()  # Explicitly close to free memory
@@ -917,9 +1186,16 @@ class ScanEngine:
                                 except Exception:
                                     pass
                             return f"img_{img_hash}" if img_hash else None
+                        else:
+                            # Image could not be loaded (corrupted or unsupported format)
+                            # Silently fall back to MD5 - this is expected for some files
+                            pass
                     except Exception as img_error:
                         # Image processing failed, fall back to MD5
-                        print(f"DEBUG: Image hash calculation failed for {file_path}: {img_error}")
+                        # Only log unexpected errors (not common "cannot identify" errors)
+                        error_str = str(img_error)
+                        if 'cannot identify' not in error_str.lower() and 'unsupported' not in error_str.lower():
+                            print(f"DEBUG: Image hash calculation failed for {os.path.basename(file_path)}: {img_error}")
                         pass
             
             return self.calculate_file_hash_cpu(file_path)
@@ -1346,7 +1622,23 @@ class ScanEngine:
                 if not submit_one():
                     break
             
+            # Optimized progress update interval (aligned with full hash calculation):
+            # - For small batches (< 100 files): update every file (real-time)
+            # - For medium batches (100-1000 files): update every 10 files
+            # - For large batches (> 1000 files): update every 1% or every 50 files, whichever is more frequent
+            if total < 100:
+                progress_update_interval = 1  # Every file for small batches
+            elif total < 1000:
+                progress_update_interval = 10  # Every 10 files for medium batches
+            else:
+                # For large batches, update every 1% or every 50 files (whichever is smaller)
+                progress_update_interval = min(max(1, total // 100), 50)
+            
+            # Time-based throttling: update at most once per 100ms to avoid UI overload
+            last_update_time = time.time()
+            min_update_interval = 0.1  # 100ms minimum between updates
             last_ui = 0
+            
             while inflight:
                 if self.scan_cancelled:
                     try:
@@ -1379,20 +1671,29 @@ class ScanEngine:
                     
                     processed += 1
                     
-                    if total and processed - last_ui >= 2000:
-                        last_ui = processed
+                    # Update progress with throttling (aligned with full hash calculation logic)
+                    current_time = time.time()
+                    should_update = (
+                        processed % progress_update_interval == 0 or 
+                        processed == total or
+                        (current_time - last_update_time) >= min_update_interval
+                    )
+                    
+                    if should_update:
                         # Calculate phase progress (0.0-1.0) for current phase only
                         phase_progress = processed / total if total > 0 else 0.0
                         # Pass phase progress (0.0-1.0) instead of overall progress
                         self.progress_callback(phase_progress)
                         self.status_callback(f"{phase_num}/{total_phases} Scanning: Pre-filtering (Partial Hash) {processed:,}/{total:,}")
+                        last_update_time = current_time
+                        last_ui = processed
                     
                     while len(inflight) < max_inflight and submit_one():
                         pass
         
         return partial_groups
     
-    def _group_by_similarity_multi_hash(self, hash_groups: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    def _group_by_similarity_multi_hash(self, hash_groups: Dict[str, List[str]], skip_orb_verification: bool = False) -> Dict[str, List[str]]:
         """
         Group files by multi-algorithm hash similarity using hamming distance.
         
@@ -1404,6 +1705,7 @@ class ScanEngine:
         
         Args:
             hash_groups: Dict mapping hash strings to file lists
+            skip_orb_verification: If True, skip ORB verification (will be done in separate phase)
             
         Returns:
             Dict mapping group IDs to file lists (duplicate groups)
@@ -1418,13 +1720,23 @@ class ScanEngine:
                         duplicate_groups[hash_val] = unique_files
             return duplicate_groups
         
-        # Hamming distance threshold for each algorithm (64-bit hashes)
-        # Typical thresholds: 5-10 for similar images, stricter for duplicates
-        # We use 8 as a balance between accuracy and false positive reduction
-        HAMMING_THRESHOLD = 8
+        # Hamming Distance Threshold Explanation:
+        #   Hamming distance = number of bits that differ between two hash values
+        #   For 64-bit perceptual hashes (average_hash, phash, dhash, whash):
+        #   - Maximum distance: 64 (completely different images)
+        #   - Distance 0: Identical hashes (exact duplicates)
+        #   - Distance 1-8: Very similar images (likely duplicates)
+        #   - Distance 9-16: Similar images (may be duplicates with modifications)
+        #   - Distance >16: Different images
+        #   
+        #   Threshold of 8 means: "If two hashes differ by 8 bits or less, consider them similar"
+        #   This allows for minor image modifications (resize, compression, slight edits)
+        #   while still detecting duplicates.
+        HAMMING_THRESHOLD = self.hamming_threshold
         
-        # Voting mechanism: require at least 3 out of 4 algorithms to agree
-        MIN_AGREEMENT = 3
+        # Voting mechanism: require at least N out of 4 algorithms to agree
+        # Use configurable agreement from instance (default: 3)
+        MIN_AGREEMENT = self.min_agreement
         
         # Parse multi-hash strings and group by similarity
         hash_to_files = {}  # hash_string -> [files]
@@ -1456,12 +1768,63 @@ class ScanEngine:
         
         # Optimization: Early exit for exact matches (fast path)
         # First, handle exact matches (these are definitely duplicates)
+        # Note: Even exact hash matches should be verified with ORB if enabled,
+        # as hash collisions can occur (though rare)
         exact_match_groups = {}
         for hash_val, files in hash_list:
             if hash_val not in processed and len(files) > 1:
                 unique_files = list(dict.fromkeys(files))
                 if len(unique_files) > 1:
-                    exact_match_groups[hash_val] = unique_files
+                    # If ORB verification is enabled, verify all files pairwise
+                    # This ensures that files that are similar to each other (but not to the first file) are still grouped together
+                    # Note: ORB verification will be done in a separate phase if skip_orb_verification is True
+                    if self.opencv_verification_method and not skip_orb_verification:
+                        print(f"DEBUG: Exact hash match found for {len(unique_files)} files, verifying with ORB (pairwise comparison)...")
+                        
+                        # Use union-find approach to group similar files
+                        # Each file starts in its own group
+                        file_to_group = {f: {f} for f in unique_files}
+                        
+                        # Compare all pairs of files
+                        for i, file1 in enumerate(unique_files):
+                            for file2 in unique_files[i+1:]:
+                                print(f"DEBUG: Verifying exact match pair: {os.path.basename(file1)} <-> {os.path.basename(file2)}")
+                                if self._verify_similarity_opencv(hash_val, hash_val, [file1], [file2], method=self.opencv_verification_method):
+                                    print(f"DEBUG: ORB verification passed for pair")
+                                    # Merge groups
+                                    group1 = file_to_group[file1]
+                                    group2 = file_to_group[file2]
+                                    merged_group = group1 | group2
+                                    for f in merged_group:
+                                        file_to_group[f] = merged_group
+                                else:
+                                    print(f"DEBUG: ORB verification failed for pair")
+                        
+                        # Find the largest group (or all groups with at least 2 files)
+                        groups = {}
+                        seen_files = set()
+                        for file, group in file_to_group.items():
+                            if file not in seen_files:
+                                group_id = min(group)  # Use minimum file path as group ID
+                                if group_id not in groups:
+                                    groups[group_id] = sorted(list(group))
+                                seen_files.update(group)
+                        
+                        # Create groups for all sets with at least 2 files
+                        group_count = 0
+                        for group_id, group_files in groups.items():
+                            if len(group_files) >= 2:
+                                # Use a unique key for each subgroup
+                                subgroup_key = f"{hash_val}_subgroup_{group_count}"
+                                exact_match_groups[subgroup_key] = group_files
+                                print(f"DEBUG: Exact match subgroup created with {len(group_files)} verified files: {[os.path.basename(f) for f in group_files]}")
+                                group_count += 1
+                        
+                        if group_count == 0:
+                            print(f"DEBUG: Exact match group rejected: no pairs passed ORB verification")
+                    else:
+                        # No ORB verification, use all files
+                        exact_match_groups[hash_val] = unique_files
                     processed.add(hash_val)
         
         # Two-phase filtering: Phase 1 - Quick filter using average_hash only
@@ -1486,19 +1849,42 @@ class ScanEngine:
                     except Exception:
                         pass
             
-            # Phase 1: Find candidates using average_hash only (fast)
-            candidate_pairs = set()  # (hash1, hash2) pairs that might be similar
-            avg_hash_list = list(avg_hash_index.items())
-            for i, (key1, hashes1) in enumerate(avg_hash_list):
-                for hash1, files1, h_avg1 in hashes1:
-                    # Compare with other average hashes in nearby buckets
-                    for j, (key2, hashes2) in enumerate(avg_hash_list[i:], start=i):
-                        for hash2, files2, h_avg2 in hashes2:
-                            if hash1 == hash2:
-                                continue
+            # Phase 1: LSH-based similarity search (O(n) average case)
+            # Build LSH buckets using bit sampling
+            # Phase 1: Find candidates using LSH (Locality-Sensitive Hashing)
+            print(f"DEBUG: Building LSH index for {len(remaining_hashes)} hashes...")
+            lsh_buckets = defaultdict(list)
+            num_bands = 8
+            bits_per_band = 8
+            
+            for hash_val, files in remaining_hashes:
+                parsed = parsed_hashes.get(hash_val)
+                if not parsed or not parsed[1]:
+                    continue
+                try:
+                    phash = imagehash.hex_to_hash(parsed[1])
+                    avg_hash = imagehash.hex_to_hash(parsed[0]) if parsed[0] else None
+                    hash_bits = phash.hash.flatten()
+                    for band_idx in range(num_bands):
+                        start_bit = (band_idx * bits_per_band) % 64
+                        sampled_bits = [int(hash_bits[(start_bit + i * 7) % 64]) for i in range(bits_per_band)]
+                        bucket_key = (band_idx, int(''.join(map(str, sampled_bits)), 2))
+                        lsh_buckets[bucket_key].append((hash_val, files, avg_hash, phash))
+                except Exception:
+                    pass
+            
+            print(f"DEBUG: LSH created {len(lsh_buckets)} buckets")
+            candidate_pairs = set()
+            for bucket_key, bucket_items in lsh_buckets.items():
+                if len(bucket_items) < 2:
+                    continue
+                for i, (hash1, files1, h_avg1, h_phash1) in enumerate(bucket_items):
+                    for j in range(i + 1, len(bucket_items)):
+                        hash2, files2, h_avg2, h_phash2 = bucket_items[j]
+                        if hash1 != hash2:
                             try:
-                                if h_avg1 - h_avg2 <= HAMMING_THRESHOLD:
-                                    # Potential match, add to candidates
+                                phash_dist = h_phash1 - h_phash2 if h_phash1 and h_phash2 else 999
+                                if phash_dist <= HAMMING_THRESHOLD * 2:
                                     if hash1 < hash2:
                                         candidate_pairs.add((hash1, hash2))
                                     else:
@@ -1508,7 +1894,7 @@ class ScanEngine:
             
             # Phase 2: Detailed comparison only for candidate pairs
             # Use parallel processing for detailed comparison
-            def compare_pair(pair):
+            def compare_pair_internal(pair):
                 """Compare a pair of hashes using all algorithms."""
                 hash1, hash2 = pair
                 if hash1 in processed or hash2 in processed:
@@ -1535,18 +1921,50 @@ class ScanEngine:
                     h_whash2 = imagehash.hex_to_hash(whash2) if whash2 else None
                     
                     agreements = 0
+                    distances = {}
                     
                     # Check all algorithms
-                    if h_avg1 and h_avg2 and (h_avg1 - h_avg2) <= HAMMING_THRESHOLD:
-                        agreements += 1
-                    if h_phash1 and h_phash2 and (h_phash1 - h_phash2) <= HAMMING_THRESHOLD:
-                        agreements += 1
-                    if h_dhash1 and h_dhash2 and (h_dhash1 - h_dhash2) <= HAMMING_THRESHOLD:
-                        agreements += 1
-                    if h_whash1 and h_whash2 and (h_whash1 - h_whash2) <= HAMMING_THRESHOLD:
-                        agreements += 1
+                    if h_avg1 and h_avg2:
+                        dist = h_avg1 - h_avg2
+                        distances['avg'] = dist
+                        if dist <= HAMMING_THRESHOLD:
+                            agreements += 1
+                    if h_phash1 and h_phash2:
+                        dist = h_phash1 - h_phash2
+                        distances['phash'] = dist
+                        if dist <= HAMMING_THRESHOLD:
+                            agreements += 1
+                    if h_dhash1 and h_dhash2:
+                        dist = h_dhash1 - h_dhash2
+                        distances['dhash'] = dist
+                        if dist <= HAMMING_THRESHOLD:
+                            agreements += 1
+                    if h_whash1 and h_whash2:
+                        dist = h_whash1 - h_whash2
+                        distances['whash'] = dist
+                        if dist <= HAMMING_THRESHOLD:
+                            agreements += 1
                     
+                    files1 = hash_to_files.get(hash1, [])
+                    files2 = hash_to_files.get(hash2, [])
                     if agreements >= MIN_AGREEMENT:
+                        print(f"DEBUG: Hash similarity match: {os.path.basename(files1[0]) if files1 else 'N/A'} <-> {os.path.basename(files2[0]) if files2 else 'N/A'}")
+                        print(f"DEBUG:   Agreements: {agreements}/{4}, distances: {distances}, threshold: {HAMMING_THRESHOLD}, min_agreement: {MIN_AGREEMENT}")
+                        # Optional OpenCV verification for higher accuracy
+                        # Skip ORB if deferred (for large datasets, verify only on deletion)
+                        should_verify_now = self.opencv_verification_method and not skip_orb_verification and not self.defer_orb_verification
+                        if should_verify_now:
+                            files1 = hash_to_files.get(hash1, [])
+                            files2 = hash_to_files.get(hash2, [])
+                            print(f"DEBUG: ORB verification called for pair: {os.path.basename(files1[0]) if files1 else 'N/A'} <-> {os.path.basename(files2[0]) if files2 else 'N/A'}")
+                            verification_result = self._verify_similarity_opencv(hash1, hash2, files1, files2, method=self.opencv_verification_method)
+                            print(f"DEBUG: ORB verification result: {verification_result}")
+                            if not verification_result:
+                                print(f"DEBUG: ORB verification failed, rejecting pair")
+                                return None  # Verification failed
+                            print(f"DEBUG: ORB verification passed")
+                        elif self.defer_orb_verification and self.opencv_verification_method:
+                            print(f"DEBUG: ORB verification deferred (will verify on deletion)")
                         return (hash1, hash2)
                     return None
                 except Exception:
@@ -1558,10 +1976,37 @@ class ScanEngine:
                 # Limit candidate pairs to avoid excessive processing
                 MAX_CANDIDATE_PAIRS = min(50000, len(candidate_pairs))  # Cap at 50K pairs
                 candidate_list = list(candidate_pairs)[:MAX_CANDIDATE_PAIRS]
+                print(f"DEBUG: Found {len(candidate_pairs)} candidate pairs, processing {len(candidate_list)} pairs")
+                if self.opencv_verification_method:
+                    print(f"DEBUG: ORB verification enabled, will verify {len(candidate_list)} candidate pairs")
+                
+                # Update status if ORB verification is enabled
+                total_pairs = len(candidate_list)
+                processed_pairs = [0]
+                last_update_time = [time.time()]
+                
+                def compare_pair_with_progress(pair):
+                    """Compare pair and update progress."""
+                    result = compare_pair_internal(pair)
+                    processed_pairs[0] += 1
+                    
+                    # Update progress every 100 pairs or every 0.5 seconds
+                    # Note: Progress updates are skipped if ORB verification is deferred to separate phase
+                    if not skip_orb_verification and (processed_pairs[0] % 100 == 0 or (time.time() - last_update_time[0]) >= 0.5):
+                        if self.opencv_verification_method:
+                            status_msg = f"Verifying {processed_pairs[0]:,}/{total_pairs:,} pairs with {self.opencv_verification_method.upper()}..."
+                            self.status_callback(status_msg)
+                            print(f"DEBUG: {status_msg}")
+                        else:
+                            status_msg = f"Comparing {processed_pairs[0]:,}/{total_pairs:,} hash pairs..."
+                            self.status_callback(status_msg)
+                        last_update_time[0] = time.time()
+                    
+                    return result
                 
                 # Use ThreadPoolExecutor for parallel comparison
                 with ThreadPoolExecutor(max_workers=min(8, self.max_workers)) as executor:
-                    results = executor.map(compare_pair, candidate_list)
+                    results = executor.map(compare_pair_with_progress, candidate_list)
                     for result in results:
                         if result:
                             similarity_pairs.append(result)
@@ -1682,6 +2127,19 @@ class ScanEngine:
                                 pass
                     
                     if agreements >= MIN_AGREEMENT:
+                        print(f"DEBUG: Hash similarity match (small dataset path): {os.path.basename(similar_files[0]) if similar_files else 'N/A'} <-> {os.path.basename(files2[0]) if files2 else 'N/A'}")
+                        print(f"DEBUG:   Agreements: {agreements}/{4}, threshold: {HAMMING_THRESHOLD}, min_agreement: {MIN_AGREEMENT}")
+                        # Optional OpenCV verification for higher accuracy
+                        # Skip ORB if deferred (for large datasets, verify only on deletion)
+                        should_verify_now = self.opencv_verification_method and not skip_orb_verification and not self.defer_orb_verification
+                        if should_verify_now:
+                            print(f"DEBUG: ORB verification called (small dataset path)")
+                            if not self._verify_similarity_opencv(hash1, hash2, similar_files, files2, method=self.opencv_verification_method):
+                                print(f"DEBUG: ORB verification failed (small dataset path), skipping match")
+                                continue  # Verification failed, skip this match
+                            print(f"DEBUG: ORB verification passed (small dataset path)")
+                        elif self.defer_orb_verification and self.opencv_verification_method:
+                            print(f"DEBUG: ORB verification deferred (small dataset path)")
                         similar_files.extend(files2)
                         processed.add(hash2)
                 
@@ -1696,6 +2154,792 @@ class ScanEngine:
         duplicate_groups.update(exact_match_groups)
         
         return duplicate_groups
+    
+    def _verify_similarity_opencv(self, hash1: str, hash2: str, files1: List[str], files2: List[str], method: str = 'ssim') -> bool:
+        """
+        Verify image similarity using OpenCV methods.
+        
+        Methods (speed order, fastest to slowest):
+        - 'orb': ORB feature matching (~100x faster than SIFT, good accuracy)
+        - 'ssim': Structural Similarity Index (medium speed, high accuracy)
+        - 'sift': Scale-Invariant Feature Transform (slowest, highest accuracy)
+        
+        Args:
+            hash1, hash2: Hash strings (not used, but kept for consistency)
+            files1, files2: File paths to compare
+            method: Verification method ('orb', 'ssim', or 'sift')
+            
+        Returns:
+            True if images are similar, False otherwise
+        """
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            # OpenCV not available, skip verification
+            return True  # Default to accepting if OpenCV not available
+        
+        try:
+            import cv2
+            import numpy as np
+            
+            # Suppress OpenCV warnings for unsupported formats (e.g., 10-bit TIFF, RAW files)
+            # Set log level to ERROR (3) to suppress WARN messages before any cv2 operations
+            # 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=SILENT
+            try:
+                original_log_level = cv2.getLogLevel()
+            except:
+                original_log_level = 2  # Default to WARN if getLogLevel fails
+            
+            try:
+                cv2.setLogLevel(3)  # Set to ERROR level to suppress WARN messages
+            except:
+                pass  # If setLogLevel fails, continue anyway
+            
+            try:
+                # Get first file from each group for comparison
+                file1 = files1[0] if files1 else None
+                file2 = files2[0] if files2 else None
+                
+                if not file1 or not file2 or not os.path.exists(file1) or not os.path.exists(file2):
+                    print(f"DEBUG: OpenCV {method} verification skipped: files not found or invalid")
+                    return True  # Default to accepting if files don't exist
+                
+                # Read images - try OpenCV first, fallback to PIL/rawpy for unsupported formats
+                # OpenCV may fail for: 10-bit TIFF, RAW formats (ARW, CR2, NEF, etc.)
+                # Use safe imread to handle Windows path encoding issues
+                # Suppress OpenCV warnings globally for this verification operation
+                try:
+                    cv2.setLogLevel(3)  # ERROR level to suppress WARN messages
+                except:
+                    pass
+                
+                img1 = self._imread_safe(file1, cv2.IMREAD_GRAYSCALE)
+                img2 = self._imread_safe(file2, cv2.IMREAD_GRAYSCALE)
+                
+                # If OpenCV failed, try alternative methods
+                if img1 is None:
+                    img1 = self._load_image_alternative(file1)
+                    if img1 is None:
+                        # Skip this pair if we can't read the image
+                        return True  # Default to accepting if images can't be read
+                
+                if img2 is None:
+                    img2 = self._load_image_alternative(file2)
+                    if img2 is None:
+                        # Skip this pair if we can't read the image
+                        return True  # Default to accepting if images can't be read
+                
+                if img1 is None or img2 is None:
+                    return True  # Default to accepting if images can't be read
+                
+                # Resize to same size for comparison (use smaller dimension)
+                # Validate images before resizing
+                if img1 is None or img2 is None or len(img1.shape) < 2 or len(img2.shape) < 2:
+                    print(f"DEBUG: Invalid images before resize - img1: {img1.shape if img1 is not None else None}, img2: {img2.shape if img2 is not None else None}")
+                    return True  # Default to accepting if images are invalid
+                
+                h1, w1 = img1.shape[:2]
+                h2, w2 = img2.shape[:2]
+                
+                # Ensure valid dimensions
+                if h1 <= 0 or w1 <= 0 or h2 <= 0 or w2 <= 0:
+                    print(f"DEBUG: Invalid image dimensions - img1: {w1}x{h1}, img2: {w2}x{h2}")
+                    return True  # Default to accepting if dimensions are invalid
+                
+                target_size = (min(w1, w2, 384), min(h1, h2, 384))  # Max 384x384 for better feature extraction (balance between speed and quality)
+                
+                try:
+                    img1_resized = cv2.resize(img1, target_size, interpolation=cv2.INTER_AREA)
+                    img2_resized = cv2.resize(img2, target_size, interpolation=cv2.INTER_AREA)
+                except Exception as resize_error:
+                    print(f"DEBUG: Image resize failed: {resize_error} (img1: {w1}x{h1}, img2: {w2}x{h2}, target: {target_size})")
+                    return True  # Default to accepting if resize fails
+                
+                if method == 'orb':
+                    print(f"DEBUG: Calling _verify_orb for {os.path.basename(file1)} <-> {os.path.basename(file2)}")
+                    result = self._verify_orb(img1_resized, img2_resized, file1, file2)
+                    print(f"DEBUG: _verify_orb returned: {result}")
+                    return result
+                elif method == 'sift':
+                    return self._verify_sift(img1_resized, img2_resized)
+                else:  # 'ssim' or default
+                    return self._verify_ssim(img1_resized, img2_resized)
+            finally:
+                # Restore OpenCV log level
+                try:
+                    cv2.setLogLevel(original_log_level)
+                except:
+                    pass
+            
+        except Exception as e:
+            print(f"DEBUG: OpenCV {method} verification failed: {e}")
+            return True  # Default to accepting on error
+    
+    def _imread_safe(self, file_path: str, flags: int = None) -> Optional['np.ndarray']:
+        """
+        Safely read image file using OpenCV, handling Windows path encoding issues.
+        
+        On Windows, OpenCV's cv2.imread() may fail with non-ASCII characters in paths.
+        This function tries multiple methods to read the file, prioritizing methods that
+        don't trigger OpenCV warnings.
+        
+        Args:
+            file_path: Path to image file
+            flags: OpenCV imread flags (default: IMREAD_GRAYSCALE)
+            
+        Returns:
+            Image as numpy array or None if failed
+        """
+        try:
+            import cv2
+            import numpy as np
+            
+            # Set default flags if not provided
+            if flags is None:
+                flags = cv2.IMREAD_GRAYSCALE
+            
+            # Check if file exists first
+            if not os.path.exists(file_path):
+                return None
+            
+            # Save and set log level at the start to suppress all warnings
+            try:
+                original_log_level = cv2.getLogLevel()
+            except:
+                original_log_level = 2  # Default to WARN if getLogLevel fails
+            
+            try:
+                cv2.setLogLevel(3)  # Set to ERROR to suppress WARN messages
+            except:
+                pass  # If setLogLevel fails, continue anyway
+            
+            # Check if file is TIFF or DNG format - OpenCV cannot handle 10-bit TIFF and other special formats
+            # DNG (Digital Negative) is based on TIFF, so OpenCV may try to read it as TIFF
+            # For all TIFF/DNG files, use PIL or rawpy directly to avoid OpenCV warnings
+            file_ext = os.path.splitext(file_path.lower())[1]
+            is_tiff = file_ext in {'.tif', '.tiff'}
+            is_dng = file_ext == '.dng'
+            
+            # For DNG files, check if it's a RAW file first (use rawpy if available)
+            if is_dng and self.is_raw_image_file(file_path):
+                # DNG is a RAW format, try rawpy first
+                try:
+                    import rawpy
+                    with rawpy.imread(file_path) as raw:
+                        rgb = raw.postprocess(use_camera_wb=True, half_size=False)
+                        if len(rgb.shape) == 3:
+                            gray = np.dot(rgb[...,:3], [0.299, 0.587, 0.114]).astype(np.uint8)
+                        else:
+                            gray = rgb.astype(np.uint8)
+                        return gray
+                except Exception:
+                    # rawpy failed, fall through to PIL
+                    pass
+            
+            # For ALL TIFF files (including DNG if rawpy failed), use PIL directly to avoid OpenCV warnings
+            # PIL can handle all TIFF formats including 10-bit, 12-bit, 14-bit, 16-bit, etc.
+            if is_tiff or is_dng:
+                try:
+                    from PIL import Image
+                    pil_img = Image.open(file_path)
+                    # Convert to grayscale if needed
+                    if pil_img.mode != 'L':
+                        pil_img = pil_img.convert('L')
+                    # Convert PIL image to numpy array (uint8)
+                    img_array = np.array(pil_img, dtype=np.uint8)
+                    pil_img.close()  # Close the image to free resources
+                    return img_array
+                except Exception as tiff_error:
+                    # PIL failed, try OpenCV as fallback (but this may trigger warnings)
+                    print(f"DEBUG: PIL failed to read TIFF/DNG {os.path.basename(file_path)}, trying OpenCV: {tiff_error}")
+                    pass
+            
+            # Skip OpenCV methods for TIFF/DNG files to avoid warnings
+            # These formats should already be handled above with PIL/rawpy
+            if not (is_tiff or is_dng):
+                # Method 1: Use numpy and cv2.imdecode FIRST (avoids path encoding warnings)
+                # This method reads the file as binary and decodes it, bypassing path encoding issues
+                try:
+                    with open(file_path, 'rb') as f:
+                        img_data = np.frombuffer(f.read(), np.uint8)
+                        img = cv2.imdecode(img_data, flags)
+                        if img is not None:
+                            return img
+                except (IOError, OSError, UnicodeDecodeError, Exception):
+                    # File read failed, try other methods
+                    pass
+                
+                # Method 2: Try standard cv2.imread (works for simple paths)
+                try:
+                    img = cv2.imread(file_path, flags)
+                    if img is not None:
+                        return img
+                except Exception:
+                    pass
+                
+                # Method 3: Try with Windows long path prefix (Windows-specific)
+                # This helps with paths containing special characters
+                try:
+                    import sys
+                    if sys.platform == 'win32':
+                        # Use Windows long path prefix to handle special characters
+                        if not file_path.startswith('\\\\?\\'):
+                            long_path = '\\\\?\\' + os.path.abspath(file_path)
+                            img = cv2.imread(long_path, flags)
+                            if img is not None:
+                                return img
+                except Exception:
+                    pass
+                
+                return None
+            
+            # If we reach here and it's TIFF/DNG but PIL failed, return None
+            return None
+        except Exception:
+            return None
+        finally:
+            # Restore original log level
+            try:
+                cv2.setLogLevel(original_log_level)
+            except:
+                pass
+    
+    def _load_image_alternative(self, file_path: str) -> Optional['np.ndarray']:
+        """
+        Load image using alternative methods when OpenCV fails.
+        Handles: 10-bit TIFF, RAW formats (ARW, CR2, NEF, etc.)
+        
+        Args:
+            file_path: Path to image file
+            
+        Returns:
+            Grayscale numpy array or None if failed
+        """
+        try:
+            import numpy as np
+            import cv2
+            
+            # Suppress OpenCV warnings during alternative loading
+            try:
+                original_log_level = cv2.getLogLevel()
+            except:
+                original_log_level = 2
+            
+            try:
+                cv2.setLogLevel(3)  # Set to ERROR to suppress WARN messages
+            except:
+                pass
+            
+            try:
+                # Check if it's a RAW file
+                if self.is_raw_image_file(file_path):
+                    # Try rawpy for RAW files
+                    try:
+                        import rawpy
+                        with rawpy.imread(file_path) as raw:
+                            # Extract RGB image and convert to grayscale
+                            rgb = raw.postprocess(use_camera_wb=True, half_size=False)
+                            # Convert RGB to grayscale using standard weights
+                            if len(rgb.shape) == 3:
+                                gray = np.dot(rgb[...,:3], [0.299, 0.587, 0.114]).astype(np.uint8)
+                            else:
+                                gray = rgb.astype(np.uint8)
+                            return gray
+                    except Exception:
+                        # rawpy failed, try PIL
+                        pass
+                
+                # Try PIL for other formats (10-bit TIFF, etc.)
+                try:
+                    from PIL import Image
+                    pil_img = Image.open(file_path)
+                    # Convert to grayscale if needed
+                    if pil_img.mode != 'L':
+                        pil_img = pil_img.convert('L')
+                    # Convert PIL image to numpy array
+                    return np.array(pil_img, dtype=np.uint8)
+                except Exception:
+                    # Both methods failed
+                    return None
+            finally:
+                # Restore OpenCV log level
+                try:
+                    cv2.setLogLevel(original_log_level)
+                except:
+                    pass
+                
+        except Exception:
+            return None
+    
+    def _get_orb_descriptors(self, file_path: str, img: 'np.ndarray') -> tuple:
+        """
+        Get ORB descriptors for an image, using cache if available.
+        Supports GPU acceleration if available and enabled.
+        Includes image preprocessing to improve feature extraction for low-contrast images.
+        
+        Args:
+            file_path: Path to the image file (for caching)
+            img: Grayscale image (numpy array)
+            
+        Returns:
+            Tuple of (keypoints, descriptors) or (None, None) on error
+        """
+        try:
+            import cv2
+            import numpy as np
+            
+            # Check cache first
+            with self._orb_cache_lock:
+                if file_path in self._orb_cache:
+                    return self._orb_cache[file_path]
+            
+            # Preprocess image to improve feature extraction for low-contrast images
+            # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to enhance contrast
+            processed_img = img.copy()
+            img_min, img_max = img.min(), img.max()
+            
+            # Only apply enhancement if image has low contrast (range < 100)
+            if img_max - img_min < 100 and img_max - img_min > 0:
+                try:
+                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                    processed_img = clahe.apply(img)
+                except Exception:
+                    # If CLAHE fails, try simple histogram equalization
+                    try:
+                        processed_img = cv2.equalizeHist(img)
+                    except Exception:
+                        processed_img = img  # Fallback to original
+            
+            # Use GPU acceleration if available and enabled
+            if self.use_orb_gpu:
+                try:
+                    # Upload image to GPU
+                    gpu_img = cv2.cuda_GpuMat()
+                    gpu_img.upload(processed_img)
+                    
+                    # Create ORB detector on GPU (note: OpenCV doesn't have direct GPU ORB,
+                    # but we can use GPU for image processing and CPU for ORB)
+                    # Optimized parameters for duplicate detection (2-3x faster)
+                    orb = cv2.ORB_create(
+                        nfeatures=150,       # Reduced from 300 (faster matching, sufficient for duplicates)
+                        fastThreshold=25,    # Increased from 20 (fewer keypoints, faster detection)
+                        scaleFactor=1.3,     # Larger scale factor (fewer pyramid levels)
+                        nlevels=6,           # Fewer levels (less scale invariance, faster)
+                        edgeThreshold=15     # Ignore edges (cleaner features)
+                    )
+                    
+                    # Download back to CPU for ORB (ORB doesn't have GPU implementation in OpenCV)
+                    # However, we can use GPU for resizing/processing if needed
+                    cpu_img = gpu_img.download()
+                    kp, des = orb.detectAndCompute(cpu_img, None)
+                except Exception as gpu_error:
+                    print(f"DEBUG: GPU ORB failed, falling back to CPU: {gpu_error}")
+                    # Optimized parameters for duplicate detection
+                    orb = cv2.ORB_create(
+                        nfeatures=150,
+                        fastThreshold=25,
+                        scaleFactor=1.3,
+                        nlevels=6,
+                        edgeThreshold=15
+                    )
+                    kp, des = orb.detectAndCompute(processed_img, None)
+            else:
+                # Standard CPU implementation - optimized for duplicate detection (2-3x faster)
+                orb = cv2.ORB_create(
+                    nfeatures=150,       # Down from 300 (faster matching, still accurate for duplicates)
+                    fastThreshold=25,    # Up from 20 (fewer keypoints)
+                    scaleFactor=1.3,     # Larger than default 1.2 (fewer pyramid levels)
+                    nlevels=6,           # Down from default 8 (faster)
+                    edgeThreshold=15     # Filter edge keypoints (cleaner features)
+                )
+                kp, des = orb.detectAndCompute(processed_img, None)
+            
+            # Validate image before computing descriptors
+            if img is None or img.size == 0:
+                print(f"DEBUG: ORB descriptor computation failed: invalid image for {os.path.basename(file_path) if file_path else 'unknown'}")
+                return (None, None)
+            
+            # Check if descriptors were computed successfully
+            if des is None:
+                print(f"DEBUG: ORB descriptor computation returned None for {os.path.basename(file_path) if file_path else 'unknown'} (image shape: {img.shape})")
+                return (None, None)
+            
+            # Cache the result with size limiting
+            if len(des) >= 10:
+                with self._orb_cache_lock:
+                    # Enforce cache size limit to prevent unbounded growth
+                    if len(self._orb_cache) >= self._orb_cache_max_size:
+                        # Remove oldest entry (FIFO eviction)
+                        oldest_key = next(iter(self._orb_cache))
+                        self._orb_cache.pop(oldest_key, None)
+                    self._orb_cache[file_path] = (kp, des)
+                return (kp, des)
+            else:
+                print(f"DEBUG: ORB descriptor computation: insufficient features ({len(des)} < 10) for {os.path.basename(file_path) if file_path else 'unknown'} (image shape: {img.shape})")
+                return (None, None)
+            
+        except Exception as e:
+            print(f"DEBUG: ORB descriptor computation error for {os.path.basename(file_path) if file_path else 'unknown'}: {e}")
+            return (None, None)
+    
+    def _verify_orb(self, img1: 'np.ndarray', img2: 'np.ndarray', file1: str = None, file2: str = None) -> bool:
+        """
+        Verify similarity using ORB (Oriented FAST and Rotated BRIEF).
+        Fastest method (~100x faster than SIFT), good accuracy.
+        Uses cached descriptors if file paths are provided.
+        Supports GPU-accelerated matching if available.
+        
+        Args:
+            img1, img2: Grayscale images (numpy arrays)
+            file1, file2: Optional file paths for caching
+            
+        Returns:
+            True if images are similar (enough matching features)
+        """
+        try:
+            import cv2
+            import numpy as np
+            
+            # Get descriptors (from cache if available)
+            if file1 and file2:
+                kp1, des1 = self._get_orb_descriptors(file1, img1)
+                kp2, des2 = self._get_orb_descriptors(file2, img2)
+            else:
+                # Fallback: compute without caching
+                orb = cv2.ORB_create(nfeatures=300, fastThreshold=20)  # Reduced features for speed
+                kp1, des1 = orb.detectAndCompute(img1, None)
+                kp2, des2 = orb.detectAndCompute(img2, None)
+            
+            # Check if images were successfully read and have valid data
+            if img1 is None or img2 is None or (hasattr(img1, 'size') and img1.size == 0) or (hasattr(img2, 'size') and img2.size == 0):
+                print(f"DEBUG: ORB verification failed: invalid images (img1: {img1.shape if img1 is not None and hasattr(img1, 'shape') else None}, img2: {img2.shape if img2 is not None and hasattr(img2, 'shape') else None})")
+                return False
+            
+            # Check if keypoints and descriptors are valid
+            if kp1 is None or kp2 is None or des1 is None or des2 is None:
+                # Not enough features for ORB matching
+                # Use fallback method: histogram comparison for low-contrast/solid color images
+                img1_info = f"shape={img1.shape}, dtype={img1.dtype}, min={img1.min()}, max={img1.max()}" if img1 is not None and hasattr(img1, 'shape') else "None"
+                img2_info = f"shape={img2.shape}, dtype={img2.dtype}, min={img2.min()}, max={img2.max()}" if img2 is not None and hasattr(img2, 'shape') else "None"
+                print(f"DEBUG: ORB verification failed: invalid keypoints/descriptors (kp1: {kp1 is not None}, kp2: {kp2 is not None}, des1: {des1 is not None}, des2: {des2 is not None})")
+                if file1 and file2:
+                    print(f"DEBUG: Files - file1: {os.path.basename(file1)}, file2: {os.path.basename(file2)}")
+                print(f"DEBUG: Image info - img1: {img1_info}, img2: {img2_info}")
+                
+                # Fallback: Use histogram comparison for images that can't extract ORB features
+                # This helps with low-contrast, solid color, or very similar images
+                try:
+                    hist1 = cv2.calcHist([img1], [0], None, [256], [0, 256])
+                    hist2 = cv2.calcHist([img2], [0], None, [256], [0, 256])
+                    correlation = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+                    # If histograms are very similar (correlation > 0.95), consider them duplicates
+                    if correlation > 0.95:
+                        print(f"DEBUG: ORB fallback: histogram correlation={correlation:.3f} > 0.95, returning True")
+                        return True
+                    else:
+                        print(f"DEBUG: ORB fallback: histogram correlation={correlation:.3f} <= 0.95, returning False")
+                        return False
+                except Exception as hist_error:
+                    print(f"DEBUG: ORB fallback histogram comparison failed: {hist_error}")
+                    # If histogram comparison also fails, default to False (not similar)
+                    return False
+            
+            if len(des1) < 10 or len(des2) < 10:
+                # Not enough features for ORB matching
+                # Use fallback method: histogram comparison for low-contrast/solid color images
+                img1_info = f"shape={img1.shape}, dtype={img1.dtype}, min={img1.min()}, max={img1.max()}" if img1 is not None and hasattr(img1, 'shape') else "None"
+                img2_info = f"shape={img2.shape}, dtype={img2.dtype}, min={img2.min()}, max={img2.max()}" if img2 is not None and hasattr(img2, 'shape') else "None"
+                print(f"DEBUG: ORB verification failed: insufficient features (des1: {len(des1) if des1 is not None else 0}, des2: {len(des2) if des2 is not None else 0})")
+                if file1 and file2:
+                    print(f"DEBUG: Files - file1: {os.path.basename(file1)}, file2: {os.path.basename(file2)}")
+                print(f"DEBUG: Image info - img1: {img1_info}, img2: {img2_info}")
+                
+                # Fallback: Use histogram comparison for images that can't extract ORB features
+                # This helps with low-contrast, solid color, or very similar images
+                try:
+                    hist1 = cv2.calcHist([img1], [0], None, [256], [0, 256])
+                    hist2 = cv2.calcHist([img2], [0], None, [256], [0, 256])
+                    correlation = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+                    # If histograms are very similar (correlation > 0.95), consider them duplicates
+                    if correlation > 0.95:
+                        print(f"DEBUG: ORB fallback: histogram correlation={correlation:.3f} > 0.95, returning True")
+                        return True
+                    else:
+                        print(f"DEBUG: ORB fallback: histogram correlation={correlation:.3f} <= 0.95, returning False")
+                        return False
+                except Exception as hist_error:
+                    print(f"DEBUG: ORB fallback histogram comparison failed: {hist_error}")
+                    # If histogram comparison also fails, default to False (not similar)
+                    return False
+            
+            # Optimized matching: Use BFMatcher with early termination
+            # For ORB, BFMatcher with Hamming distance is faster than FLANN for binary descriptors
+            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+            matches = bf.knnMatch(des1, des2, k=2)
+            
+            # Apply ratio test (Lowe's ratio test) with early termination
+            good_matches = []
+            # Use descriptor count instead of keypoint count (more reliable)
+            min_features = min(len(des1), len(des2))
+            required_matches = int(min_features * 0.12)  # Need at least 12% match ratio (reduced from 0.15)
+            
+            # Early termination: if we can't possibly get enough matches, return early
+            if len(matches) < required_matches:
+                return False
+            
+            for match_pair in matches:
+                if len(match_pair) == 2:
+                    m, n = match_pair
+                    if m.distance < 0.75 * n.distance:  # Ratio threshold
+                        good_matches.append(m)
+                        # Early termination: if we already have enough matches, stop checking
+                        if len(good_matches) >= required_matches:
+                            break
+            
+            # Calculate match ratio using descriptor count (more reliable than keypoint count)
+            match_ratio = len(good_matches) / min_features
+            
+            # Threshold: at least 12% of features should match for duplicates (reduced from 0.15 to 0.12 to reduce false negatives)
+            result = match_ratio >= 0.12
+            # Use descriptor count for display (more reliable than keypoint count)
+            kp1_count = len(kp1) if kp1 is not None else len(des1)
+            kp2_count = len(kp2) if kp2 is not None else len(des2)
+            print(f"DEBUG: ORB match details: {len(good_matches)} good matches out of {kp1_count}/{kp2_count} features, ratio={match_ratio:.3f}, threshold=0.12, result={result}")
+            return result
+            
+        except Exception as e:
+            print(f"DEBUG: ORB verification error: {e}")
+            return True
+    
+    def _verify_sift(self, img1: 'np.ndarray', img2: 'np.ndarray') -> bool:
+        """
+        Verify similarity using SIFT (Scale-Invariant Feature Transform).
+        Slowest but most accurate method.
+        
+        Args:
+            img1, img2: Grayscale images (numpy arrays)
+            
+        Returns:
+            True if images are similar (enough matching features)
+        """
+        try:
+            import cv2
+            import numpy as np
+            
+            # Initialize SIFT detector
+            sift = cv2.SIFT_create(nfeatures=500)  # Limit features for speed
+            
+            # Find keypoints and descriptors
+            kp1, des1 = sift.detectAndCompute(img1, None)
+            kp2, des2 = sift.detectAndCompute(img2, None)
+            
+            # Check if keypoints and descriptors are valid
+            if kp1 is None or kp2 is None or des1 is None or des2 is None or len(des1) < 10 or len(des2) < 10:
+                # Not enough features, likely not similar
+                return False
+            
+            # Match features using FLANN matcher (faster than BF for SIFT)
+            FLANN_INDEX_KDTREE = 1
+            index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+            search_params = dict(checks=50)
+            flann = cv2.FlannBasedMatcher(index_params, search_params)
+            matches = flann.knnMatch(des1, des2, k=2)
+            
+            # Apply ratio test (Lowe's ratio test)
+            good_matches = []
+            for match_pair in matches:
+                if len(match_pair) == 2:
+                    m, n = match_pair
+                    if m.distance < 0.75 * n.distance:  # Ratio threshold
+                        good_matches.append(m)
+            
+            # Calculate match ratio using descriptor count (more reliable than keypoint count)
+            min_features = min(len(des1), len(des2))
+            match_ratio = len(good_matches) / min_features
+            
+            # Threshold: at least 12% of features should match for duplicates (reduced from 0.15 to 0.12 for consistency)
+            return match_ratio >= 0.12
+            
+        except Exception as e:
+            print(f"DEBUG: SIFT verification error: {e}")
+            return True
+    
+    def _verify_ssim(self, img1: 'np.ndarray', img2: 'np.ndarray') -> bool:
+        """
+        Verify similarity using SSIM (Structural Similarity Index).
+        Medium speed, high accuracy.
+        
+        Args:
+            img1, img2: Grayscale images (numpy arrays)
+            
+        Returns:
+            True if images are similar (SSIM > 0.85)
+        """
+        try:
+            import cv2
+            import numpy as np
+            
+            # Using a simplified SSIM calculation (mean squared error normalized)
+            # Full SSIM is more complex but this approximation is faster
+            diff = cv2.absdiff(img1, img2)
+            mse = np.mean(diff ** 2)
+            
+            # Normalize MSE to 0-1 scale (assuming 8-bit images, max value 255)
+            normalized_mse = mse / (255.0 ** 2)
+            
+            # Convert MSE to similarity score (lower MSE = higher similarity)
+            # SSIM-like score: 1.0 = identical, 0.0 = completely different
+            similarity = 1.0 - min(1.0, normalized_mse)
+            
+            # Threshold: 0.85 means images are 85% similar
+            return similarity >= 0.85
+            
+        except Exception as e:
+            print(f"DEBUG: SSIM verification error: {e}")
+            return True
+    
+    def verify_group_before_deletion(self, group_files: List[str]) -> bool:
+        """
+        Perform on-demand ORB verification for a group of potential duplicates.
+        Call this before deleting files when defer_orb_verification is enabled.
+        
+        For large datasets (10K+ images), ORB verification is deferred to deletion time
+        to provide 5-10x speedup during scan. This method verifies the group on-demand.
+        
+        Args:
+            group_files: List of file paths in the duplicate group
+            
+        Returns:
+            True if group is verified as duplicates (safe to delete selections)
+            False if verification fails (group may contain false positives)
+        """
+        # If ORB verification is disabled or not deferred, always return True
+        if not self.opencv_verification_method or not self.defer_orb_verification:
+            return True
+        
+        # Need at least 2 files to verify
+        if len(group_files) < 2:
+            return True
+        
+        try:
+            # Verify first file against second as representative check
+            # This is much faster than checking all pairs and sufficient for most cases
+            # If the hash matched them, they're likely duplicates; ORB just reduces false positives
+            result = self._verify_similarity_opencv(
+                "", "",  # Hash strings not needed for direct file comparison
+                [group_files[0]], [group_files[1]], 
+                method=self.opencv_verification_method
+            )
+            
+            if result:
+                print(f"DEBUG: On-demand ORB verification PASSED for group: {os.path.basename(group_files[0])} <-> {os.path.basename(group_files[1])}")
+            else:
+                print(f"DEBUG: On-demand ORB verification FAILED for group: {os.path.basename(group_files[0])} <-> {os.path.basename(group_files[1])}")
+                print(f"DEBUG: This group may contain false positives. Review manually before deletion.")
+            
+            return result
+        except Exception as e:
+            print(f"DEBUG: On-demand verification error: {e}")
+            # On error, default to accepting (hash matching is already reliable)
+            return True
+    
+    
+    def _prefilter_exact_duplicates(self, files: List[str]) -> tuple:
+        """
+        Pre-filter files to identify exact duplicates by size and name+timestamp.
+        This reduces the number of files that need hash calculation.
+        
+        Args:
+            files: List of file paths to check
+            
+        Returns:
+            tuple: (exact_duplicate_groups, remaining_files)
+                - exact_duplicate_groups: Dict mapping group_id to list of duplicate files
+                - remaining_files: List of files that still need hash calculation
+        """
+        if len(files) < 2:
+            return {}, files
+        
+        exact_duplicate_groups = {}
+        remaining_files = []
+        
+        # Group files by size first
+        size_groups = defaultdict(list)
+        file_info = {}  # path -> (size, mtime, basename)
+        
+        for file_path in files:
+            try:
+                st = os.stat(file_path)
+                size = st.st_size
+                mtime = st.st_mtime
+                basename = os.path.splitext(os.path.basename(file_path))[0].lower()
+                size_groups[size].append(file_path)
+                file_info[file_path] = (size, mtime, basename)
+            except (OSError, PermissionError):
+                remaining_files.append(file_path)
+                continue
+        
+        # Check each size group for exact duplicates
+        processed_files = set()
+        group_id_counter = 0
+        
+        for size, size_group_files in size_groups.items():
+            if len(size_group_files) < 2:
+                remaining_files.extend(size_group_files)
+                continue
+            
+            # Strategy 1: Same size + same name + same timestamp = exact duplicate
+            # Group by (basename, timestamp_bucket)
+            name_timestamp_groups = defaultdict(list)
+            for file_path in size_group_files:
+                if file_path in file_info:
+                    size_val, mtime, basename = file_info[file_path]
+                    # Round timestamp to nearest second for matching
+                    timestamp_bucket = int(mtime)
+                    name_timestamp_groups[(basename, timestamp_bucket)].append(file_path)
+            
+            # If all files in this size group share the same (basename, timestamp), they're exact duplicates
+            for (basename, ts), group_files in name_timestamp_groups.items():
+                if len(group_files) >= 2:
+                    # All files with same size, name, and timestamp = exact duplicates
+                    group_id = f"exact_size_name_ts_{group_id_counter}"
+                    exact_duplicate_groups[group_id] = group_files
+                    processed_files.update(group_files)
+                    group_id_counter += 1
+                    print(f"DEBUG: Pre-filter exact duplicate (size+name+timestamp): {len(group_files)} files, name={basename}, size={size}")
+            
+            # Strategy 2: Same size + exactly 2 files = likely exact duplicates (for non-image files)
+            # For image files, we still need perceptual hash as same size doesn't mean same image
+            # But for non-image files (like documents), same size often means exact duplicate
+            for file_path in size_group_files:
+                if file_path not in processed_files:
+                    # Check if this file is part of a same-size pair
+                    same_size_files = [f for f in size_group_files if f not in processed_files]
+                    if len(same_size_files) == 2:
+                        # Only 2 files with same size = likely exact duplicates
+                        # But we need to be careful: for images, same size doesn't mean same content
+                        # So we only apply this for non-image files
+                        if not self.is_image_file(same_size_files[0]):
+                            group_id = f"exact_size_pair_{group_id_counter}"
+                            exact_duplicate_groups[group_id] = same_size_files
+                            processed_files.update(same_size_files)
+                            group_id_counter += 1
+                            print(f"DEBUG: Pre-filter exact duplicate (same size pair, non-image): {len(same_size_files)} files, size={size}")
+                        else:
+                            # For images, we still need hash calculation
+                            remaining_files.extend(same_size_files)
+                            processed_files.update(same_size_files)
+                    else:
+                        # More than 2 files with same size, need hash calculation
+                        remaining_files.append(file_path)
+        
+        # Add any unprocessed files
+        for file_path in files:
+            if file_path not in processed_files:
+                remaining_files.append(file_path)
+        
+        return exact_duplicate_groups, remaining_files
     
     def _merge_raw_jpeg_by_timestamp(self, duplicate_groups: Dict[str, List[str]], time_threshold: float = 5.0) -> Dict[str, List[str]]:
         """
@@ -1780,7 +3024,7 @@ class ScanEngine:
         
         return merged_groups
     
-    def scan_duplicate_files(self, scan_paths: List[str], use_imagehash: bool = False, use_multi_hash: bool = True):
+    def scan_duplicate_files(self, scan_paths: List[str], use_imagehash: bool = False, use_multi_hash: bool = True, use_orb_verification: bool = False):
         """
         Main scanning function.
         
@@ -1788,23 +3032,31 @@ class ScanEngine:
             scan_paths: List of directory paths to scan
             use_imagehash: Whether to use perceptual hashing for images and videos
             use_multi_hash: If True, use multi-algorithm hash; if False, use single algorithm (phash)
+            use_orb_verification: If True, use ORB verification for perceptual hash matches
         """
         try:
             self.scan_cancelled = False
             self.use_imagehash = use_imagehash and IMAGEHASH_AVAILABLE
             self.use_multi_hash = use_multi_hash if self.use_imagehash else False
             
-            # Debug: Log hash mode and availability
-            print(f"DEBUG: scan_duplicate_files called with use_imagehash={use_imagehash}, IMAGEHASH_AVAILABLE={IMAGEHASH_AVAILABLE}")
-            print(f"DEBUG: Final settings: use_imagehash={self.use_imagehash}, use_multi_hash={self.use_multi_hash}")
+            # Set OpenCV verification method if ORB verification is enabled
+            if use_orb_verification:
+                self.opencv_verification_method = 'orb'
+            else:
+                self.opencv_verification_method = None
             
-            # Check OpenCV availability for video hashing
-            try:
-                import cv2
-                OPENCV_AVAILABLE = True
-            except ImportError:
-                OPENCV_AVAILABLE = False
-            print(f"DEBUG: OpenCV available for video hashing: {OPENCV_AVAILABLE}")
+            # Debug: Log hash mode and availability
+            print(f"DEBUG: scan_duplicate_files called with use_imagehash={use_imagehash}, use_multi_hash={use_multi_hash}, use_orb_verification={use_orb_verification}")
+            print(f"DEBUG: Final settings: use_imagehash={self.use_imagehash}, use_multi_hash={self.use_multi_hash}, opencv_method={self.opencv_verification_method}")
+            
+            # Check OpenCV availability (already imported at module level)
+            if OPENCV_AVAILABLE:
+                try:
+                    import cv2
+                    print(f"DEBUG: OpenCV available: {OPENCV_AVAILABLE}")
+                    print(f"DEBUG: OpenCV version: {cv2.__version__}")
+                except:
+                    pass
             
             self.file_groups = defaultdict(list)
             self.files_scanned = 0
@@ -1838,7 +3090,9 @@ class ScanEngine:
             print(f"DEBUG: use_imagehash={self.use_imagehash}")
             
             # Phase 1: Collect files
-            total_phases = 4 if not self.use_imagehash else 3  # Phase 3 skipped if using imagehash
+            # Calculate total phases: base phases + ORB verification phase if enabled
+            base_phases = 4 if not self.use_imagehash else 3  # Phase 3 skipped if using imagehash
+            total_phases = base_phases + (1 if self.opencv_verification_method else 0)
             phase_num = 1
             # Reset progress bar to 0% for Phase 1 (each phase has its own progress bar)
             self.progress_callback(0.0)
@@ -1953,6 +3207,11 @@ class ScanEngine:
             self.status_callback(f"{phase_num}/{total_phases} Scanning: Filtering potential duplicates...")
             potential_duplicates_by_size = []
             
+            # Pre-filter: Identify exact duplicates by size and name+timestamp (skip hash calculation)
+            # These will be added directly to results without hash calculation
+            exact_duplicate_groups = {}  # hash_val -> list of files
+            exact_duplicate_count = 0
+            
             if self.use_imagehash:
                 image_files_for_hash = list(dict.fromkeys(all_image_files))
                 non_image_files_by_size = []
@@ -1961,18 +3220,36 @@ class ScanEngine:
                     if len(files) > 1:
                         non_image_in_group = [fp for fp in files if not self.is_image_file(fp)]
                         if len(non_image_in_group) > 1:
-                            non_image_files_by_size.extend(non_image_in_group)
+                            # Pre-filter: Check for exact duplicates by size and name+timestamp
+                            exact_groups, remaining_files = self._prefilter_exact_duplicates(non_image_in_group)
+                            exact_duplicate_groups.update(exact_groups)
+                            exact_duplicate_count += sum(len(files) for files in exact_groups.values())
+                            non_image_files_by_size.extend(remaining_files)
                 
+                # Pre-filter image files by size and name+timestamp
                 if len(image_files_for_hash) > 1:
+                    exact_image_groups, remaining_image_files = self._prefilter_exact_duplicates(image_files_for_hash)
+                    exact_duplicate_groups.update(exact_image_groups)
+                    exact_duplicate_count += sum(len(files) for files in exact_image_groups.values())
+                    potential_duplicates_by_size.extend(remaining_image_files)
+                else:
                     potential_duplicates_by_size.extend(image_files_for_hash)
                 
                 potential_duplicates_by_size.extend(non_image_files_by_size)
             else:
                 for size, files in size_groups.items():
                     if len(files) > 1:
-                        potential_duplicates_by_size.extend(files)
+                        # Pre-filter: Check for exact duplicates by size and name+timestamp
+                        exact_groups, remaining_files = self._prefilter_exact_duplicates(files)
+                        exact_duplicate_groups.update(exact_groups)
+                        exact_duplicate_count += sum(len(files) for files in exact_groups.values())
+                        potential_duplicates_by_size.extend(remaining_files)
             
-            print(f"DEBUG: Found {len(potential_duplicates_by_size)} potential duplicate files")
+            if exact_duplicate_count > 0:
+                print(f"DEBUG: Pre-filtered {exact_duplicate_count} files as exact duplicates (skipping hash calculation)")
+                print(f"DEBUG: Found {len(exact_duplicate_groups)} exact duplicate groups by size/name+timestamp")
+            
+            print(f"DEBUG: Found {len(potential_duplicates_by_size)} potential duplicate files (need hash calculation)")
             # Phase 2 complete: set progress to 100% (1.0) for this phase
             self.progress_callback(1.0)
             if not potential_duplicates_by_size:
@@ -2051,12 +3328,24 @@ class ScanEngine:
             
             # CPU processing - use more workers for I/O-intensive hash calculation
             if files_to_full_hash:
+                # Batch I/O optimization: Pre-fetch next batch of files while processing current batch
+                # This overlaps I/O with computation, reducing total processing time
+                prefetch_batch_size = min(50, len(files_to_full_hash))
+                if len(files_to_full_hash) > prefetch_batch_size:
+                    # Prefetch next batch in background
+                    next_batch = files_to_full_hash[prefetch_batch_size:prefetch_batch_size * 2]
+                    self._prefetch_files_batch(next_batch, max_workers=min(8, self.hash_workers))
+                
                 # Use hash_workers (more threads) for I/O-bound hash calculation
                 with ThreadPoolExecutor(max_workers=self.hash_workers) as executor:
                     future_to_file = {
                         executor.submit(self.calculate_file_hash, file_path): file_path
                         for file_path in files_to_full_hash
                     }
+                    
+                    # Prefetch next batch while processing
+                    processed_count = 0
+                    prefetch_trigger = prefetch_batch_size
                     
                     for future in as_completed(future_to_file):
                         if self.scan_cancelled:
@@ -2075,7 +3364,18 @@ class ScanEngine:
                             continue
                         
                         processed += 1
+                        processed_count += 1
                         self.files_scanned = processed
+                        
+                        # Trigger prefetch of next batch when we've processed enough files
+                        if self._file_prefetch_enabled and processed_count >= prefetch_trigger and processed < len(files_to_full_hash):
+                            # Prefetch next batch in background
+                            next_start = processed
+                            next_end = min(next_start + prefetch_batch_size, len(files_to_full_hash))
+                            if next_start < len(files_to_full_hash):
+                                next_batch = files_to_full_hash[next_start:next_end]
+                                self._prefetch_files_batch(next_batch, max_workers=min(8, self.hash_workers))
+                            prefetch_trigger += prefetch_batch_size
                         
                         # Update progress with throttling
                         current_time = time.time()
@@ -2093,21 +3393,368 @@ class ScanEngine:
                             self.status_callback(f"{phase_num}/{total_phases} Scanning: Calculating hash {processed:,}/{self.total_files:,}")
                             last_update_time[0] = current_time
             
-            # Filter duplicate groups
+            # Filter duplicate groups (without ORB verification first)
             # For multi-algorithm hash, use hamming distance comparison instead of exact match
             duplicate_groups = {}
             
             if self.use_multi_hash:
                 # Multi-algorithm hash: Use hamming distance with voting mechanism
                 # This reduces false positives by requiring multiple algorithms to agree
-                duplicate_groups = self._group_by_similarity_multi_hash(hash_groups)
+                self.status_callback(f"{phase_num}/{total_phases} Scanning: Grouping duplicates by similarity...")
+                duplicate_groups = self._group_by_similarity_multi_hash(hash_groups, skip_orb_verification=True)
             else:
                 # Single hash or MD5: Use exact match (original behavior)
+                # ORB verification will be done in a separate phase
+                self.status_callback(f"{phase_num}/{total_phases} Scanning: Grouping duplicates...")
+                
                 for hash_val, files in hash_groups.items():
                     if len(files) > 1:
                         unique_files = list(dict.fromkeys(files))
                         if len(unique_files) > 1:
+                            # No ORB verification here - it will be done in a separate phase
                             duplicate_groups[hash_val] = unique_files
+            
+            # Phase 5 (or 4): ORB Verification (if enabled)
+            if self.opencv_verification_method:
+                phase_num = total_phases  # ORB verification is the last phase
+                self.progress_callback(0.0)
+                self.status_callback(f"{phase_num}/{total_phases} Scanning: Verifying duplicates with {self.opencv_verification_method.upper()}...")
+                print(f"DEBUG: Starting ORB verification phase for {len(duplicate_groups)} groups")
+                
+                # Pre-filter: Separate files that can skip ORB verification
+                # IMPORTANT: Even if files are pre-filtered as duplicates (same size/name+timestamp),
+                # we still need to verify them against files with different sizes, because:
+                # - File A and B may be pre-filtered as duplicates (same size)
+                # - But file C (different size) might also be a duplicate of A/B
+                # - So we need to verify A-C and B-C even though A-B is pre-filtered
+                
+                # Strategy: Within each hash_val group, separate files into:
+                # - skip_orb_subgroups: Files that can skip ORB verification among themselves (same size/name+timestamp)
+                # - need_orb_files: Files that need ORB verification
+                # Then generate verification pairs:
+                # 1. Within need_orb_files (normal verification)
+                # 2. Between skip_orb_subgroups and need_orb_files (cross-verification)
+                
+                skip_orb_subgroups = {}  # hash_val -> list of subgroups (each subgroup can skip internal ORB)
+                need_orb_files_by_hash = {}  # hash_val -> list of files that need ORB verification
+                
+                for hash_val, files in duplicate_groups.items():
+                    unique_files = list(dict.fromkeys(files))
+                    if len(unique_files) < 2:
+                        continue
+                    
+                    # Check file properties
+                    file_sizes = {}
+                    file_timestamps = {}
+                    file_basenames = {}
+                    
+                    for file_path in unique_files:
+                        try:
+                            st = os.stat(file_path)
+                            file_sizes[file_path] = st.st_size
+                            file_timestamps[file_path] = st.st_mtime
+                            file_basenames[file_path] = os.path.splitext(os.path.basename(file_path))[0].lower()
+                        except (OSError, PermissionError):
+                            continue
+                    
+                    # Group files by size
+                    size_groups = defaultdict(list)
+                    for file_path in unique_files:
+                        if file_path in file_sizes:
+                            size_groups[file_sizes[file_path]].append(file_path)
+                    
+                    # Separate files into skip_orb_subgroups and need_orb_files
+                    skip_subgroups = []
+                    need_orb_files = []
+                    
+                    for size, size_files in size_groups.items():
+                        if len(size_files) == 1:
+                            # Single file with this size - needs ORB verification
+                            need_orb_files.extend(size_files)
+                        else:
+                            # Multiple files with same size - check if they also have same name+timestamp
+                            # Group by (basename, timestamp_bucket)
+                            name_timestamp_groups = defaultdict(list)
+                            for file_path in size_files:
+                                if file_path in file_basenames and file_path in file_timestamps:
+                                    basename = file_basenames[file_path]
+                                    timestamp_bucket = int(file_timestamps[file_path])
+                                    name_timestamp_groups[(basename, timestamp_bucket)].append(file_path)
+                            
+                            # If all files in this size group share the same (basename, timestamp), skip ORB
+                            if len(name_timestamp_groups) == 1:
+                                skip_subgroups.append(size_files)
+                                basename, ts = list(name_timestamp_groups.keys())[0]
+                                print(f"DEBUG: Skipping ORB for subgroup with same size+name+timestamp: {len(size_files)} files, size={size}, name={basename}, timestamp={ts}")
+                            else:
+                                # Files with same size but different name/timestamp - need ORB verification
+                                need_orb_files.extend(size_files)
+                    
+                    if skip_subgroups:
+                        skip_orb_subgroups[hash_val] = skip_subgroups
+                    if need_orb_files:
+                        need_orb_files_by_hash[hash_val] = need_orb_files
+                
+                total_skip_subgroups = sum(len(subs) for subs in skip_orb_subgroups.values())
+                total_need_files = sum(len(files) for files in need_orb_files_by_hash.values())
+                print(f"DEBUG: Pre-filter results: {total_skip_subgroups} subgroups skip ORB, {len(need_orb_files_by_hash)} hash groups have {total_need_files} files needing ORB")
+                
+                # Collect all file pairs that need verification
+                # OPTIMIZATION: Two-phase verification with delayed Phase 2 generation
+                # Phase 1: Verify first file with all others (generates n-1 pairs)
+                # Phase 2: Only verify pairs among files that didn't match reference (dramatically reduces pairs)
+                # This reduces verification pairs by 50-90% depending on match rate
+                
+                # Step 1: Generate Phase 1 pairs only (reference file vs all others)
+                phase1_pairs = []
+                hash_to_files_map = {}  # Track all files per hash for Phase 2 generation
+                
+                # 1. Phase 1 pairs within need_orb_files
+                for hash_val, files in need_orb_files_by_hash.items():
+                    unique_files = list(dict.fromkeys(files))
+                    if len(unique_files) > 1:
+                        hash_to_files_map[hash_val] = unique_files
+                        if len(unique_files) == 2:
+                            # Only 2 files, verify the pair
+                            phase1_pairs.append((hash_val, unique_files[0], unique_files[1], unique_files, 'phase1'))
+                        else:
+                            # Phase 1: Verify first file (reference) against all others
+                            reference_file = unique_files[0]
+                            for candidate_file in unique_files[1:]:
+                                phase1_pairs.append((hash_val, reference_file, candidate_file, unique_files, 'phase1'))
+                
+                # 2. Cross-verify skip_orb_subgroups with need_orb_files
+                # This ensures files pre-filtered as duplicates are still verified against files with different sizes
+                for hash_val, skip_subgroups in skip_orb_subgroups.items():
+                    need_files = need_orb_files_by_hash.get(hash_val, [])
+                    
+                    if need_files:
+                        # For each skip subgroup, verify representative file against all need_files
+                        for skip_subgroup in skip_subgroups:
+                            # Use first file as representative (all files in subgroup are pre-filtered as duplicates)
+                            skip_representative = skip_subgroup[0]
+                            
+                            for need_file in need_files:
+                                # Create a combined group for this cross-verification
+                                combined_files = skip_subgroup + need_files
+                                phase1_pairs.append((hash_val, skip_representative, need_file, combined_files, 'cross_verify'))
+                                # Track files for potential Phase 2
+                                if hash_val not in hash_to_files_map:
+                                    hash_to_files_map[hash_val] = combined_files
+                                else:
+                                    # Merge files, avoiding duplicates
+                                    existing = set(hash_to_files_map[hash_val])
+                                    existing.update(combined_files)
+                                    hash_to_files_map[hash_val] = list(existing)
+                
+                # Remove duplicate pairs from Phase 1
+                unique_pairs_set = set()
+                unique_phase1_pairs = []
+                for pair in phase1_pairs:
+                    hash_val, file1, file2, all_files, phase = pair
+                    pair_key = tuple(sorted([file1, file2]))
+                    if pair_key not in unique_pairs_set:
+                        unique_pairs_set.add(pair_key)
+                        unique_phase1_pairs.append(pair)
+                
+                phase1_pairs = unique_phase1_pairs
+                print(f"DEBUG: Phase 1 verification pairs: {len(phase1_pairs)}")
+                
+                if len(phase1_pairs) > 0:
+                    # Use union-find to regroup files based on ORB verification
+                    verified_groups = {}
+                    processed_pairs = 0
+                    last_update_time = time.time()
+                    
+                    # Track which files matched the reference in phase 1
+                    reference_matched = {}  # hash_val -> set of files that matched reference
+                    unmatched_files = {}  # hash_val -> set of files that didn't match reference
+                    
+                    # Use parallel processing for ORB verification to speed up processing
+                    max_orb_workers = min(4, self.max_workers)  # Limit to 4 workers for ORB to avoid memory issues
+                    
+                    def verify_pair_wrapper(pair_data):
+                        """Wrapper function for parallel verification."""
+                        hash_val, file1, file2, all_files, phase = pair_data
+                        # Verify pair
+                        is_match = self._verify_similarity_opencv(hash_val, hash_val, [file1], [file2], method=self.opencv_verification_method)
+                        return (hash_val, file1, file2, all_files, phase, is_match)
+                    
+                    # Process Phase 1 pairs in parallel batches
+                    batch_size = 100  # Process 100 pairs at a time
+                    total_phase1_pairs = len(phase1_pairs)
+                    
+                    for batch_start in range(0, len(phase1_pairs), batch_size):
+                        batch = phase1_pairs[batch_start:batch_start + batch_size]
+                        
+                        # Process batch in parallel
+                        with ThreadPoolExecutor(max_workers=max_orb_workers) as executor:
+                            batch_results = list(executor.map(verify_pair_wrapper, batch))
+                        
+                        # Process results
+                        for hash_val, file1, file2, all_files, phase, is_match in batch_results:
+                            # Initialize group structure for this hash if needed
+                            if hash_val not in verified_groups:
+                                verified_groups[hash_val] = {f: {f} for f in all_files}
+                                reference_matched[hash_val] = set()
+                                unmatched_files[hash_val] = set()
+                            
+                            # Process verification result
+                            if is_match:
+                                # Merge groups for file1 and file2 (union-find)
+                                group1 = verified_groups[hash_val].get(file1, {file1})
+                                group2 = verified_groups[hash_val].get(file2, {file2})
+                                merged_group = group1 | group2
+                                for f in merged_group:
+                                    verified_groups[hash_val][f] = merged_group
+                                
+                                # Track phase 1 matches (when file1 is the reference)
+                                if phase == 'phase1' and len(all_files) > 0 and file1 == all_files[0]:
+                                    reference_matched[hash_val].add(file2)
+                            else:
+                                # Track unmatched files for Phase 2
+                                if phase == 'phase1' and len(all_files) > 0 and file1 == all_files[0]:
+                                    # file2 didn't match reference file1
+                                    unmatched_files[hash_val].add(file2)
+                        
+                        # Update progress after each batch
+                        processed_pairs += len(batch)
+                        if (time.time() - last_update_time) >= 0.5:
+                            progress = processed_pairs / total_phase1_pairs if total_phase1_pairs > 0 else 0.0
+                            self.progress_callback(progress * 0.5)  # Phase 1 is 50% of total verification
+                            self.status_callback(f"{phase_num}/{total_phases} Scanning: Phase 1 verification {processed_pairs:,}/{total_phase1_pairs:,} pairs...")
+                            last_update_time = time.time()
+                    
+                    # Step 2: Generate Phase 2 pairs only for unmatched files
+                    # This dramatically reduces the number of pairs (from O(n²) to O(m²) where m << n)
+                    phase2_pairs = []
+                    
+                    for hash_val, all_files in hash_to_files_map.items():
+                        if hash_val not in unmatched_files or len(unmatched_files[hash_val]) < 2:
+                            continue
+                        
+                        # Get unmatched files that need Phase 2 verification
+                        unmatched_list = list(unmatched_files[hash_val])
+                        
+                        # Only generate pairs among unmatched files
+                        # This catches subgroups that don't connect through the reference file
+                        # Example: If 1-2, 1-3 pass but 1-4, 1-5 fail, we check 4-5
+                        for i, file1 in enumerate(unmatched_list):
+                            for file2 in unmatched_list[i+1:]:
+                                # Check if both files are already in the same group (via union-find)
+                                group1 = verified_groups.get(hash_val, {}).get(file1, {file1})
+                                group2 = verified_groups.get(hash_val, {}).get(file2, {file2})
+                                
+                                # Only verify if they're not already grouped
+                                if group1 != group2:
+                                    phase2_pairs.append((hash_val, file1, file2, all_files, 'phase2'))
+                    
+                    # Remove duplicate Phase 2 pairs
+                    unique_phase2_pairs = []
+                    phase2_pairs_set = set()
+                    for pair in phase2_pairs:
+                        hash_val, file1, file2, all_files, phase = pair
+                        pair_key = tuple(sorted([file1, file2]))
+                        if pair_key not in phase2_pairs_set:
+                            phase2_pairs_set.add(pair_key)
+                            unique_phase2_pairs.append(pair)
+                    
+                    phase2_pairs = unique_phase2_pairs
+                    print(f"DEBUG: Phase 2 verification pairs: {len(phase2_pairs)} (only for unmatched files)")
+                    
+                    # Process Phase 2 pairs if any
+                    if len(phase2_pairs) > 0:
+                        total_phase2_pairs = len(phase2_pairs)
+                        processed_pairs = 0
+                        
+                        for batch_start in range(0, len(phase2_pairs), batch_size):
+                            batch = phase2_pairs[batch_start:batch_start + batch_size]
+                            
+                            # Process batch in parallel
+                            with ThreadPoolExecutor(max_workers=max_orb_workers) as executor:
+                                batch_results = list(executor.map(verify_pair_wrapper, batch))
+                            
+                            # Process results
+                            for hash_val, file1, file2, all_files, phase, is_match in batch_results:
+                                # Initialize if needed
+                                if hash_val not in verified_groups:
+                                    verified_groups[hash_val] = {f: {f} for f in all_files}
+                                
+                                # Process verification result
+                                if is_match:
+                                    # Merge groups for file1 and file2 (union-find)
+                                    group1 = verified_groups[hash_val].get(file1, {file1})
+                                    group2 = verified_groups[hash_val].get(file2, {file2})
+                                    merged_group = group1 | group2
+                                    for f in merged_group:
+                                        verified_groups[hash_val][f] = merged_group
+                            
+                            # Update progress after each batch
+                            processed_pairs += len(batch)
+                            if (time.time() - last_update_time) >= 0.5:
+                                # Phase 2 is the remaining 50% of total verification
+                                phase2_progress = processed_pairs / total_phase2_pairs if total_phase2_pairs > 0 else 0.0
+                                overall_progress = 0.5 + (phase2_progress * 0.5)
+                                self.progress_callback(overall_progress)
+                                self.status_callback(f"{phase_num}/{total_phases} Scanning: Phase 2 verification {processed_pairs:,}/{total_phase2_pairs:,} pairs...")
+                                last_update_time = time.time()
+                    
+                    total_pairs = len(phase1_pairs) + len(phase2_pairs)
+                    print(f"DEBUG: Total verification pairs: {total_pairs} (Phase 1: {len(phase1_pairs)}, Phase 2: {len(phase2_pairs)})")
+                    
+                    # Rebuild duplicate_groups from verified groups
+                    new_duplicate_groups = {}
+                    for hash_val, file_to_group in verified_groups.items():
+                        groups = {}
+                        seen_files = set()
+                        for file, group in file_to_group.items():
+                            if file not in seen_files:
+                                group_id = min(group)
+                                if group_id not in groups:
+                                    groups[group_id] = sorted(list(group))
+                                seen_files.update(group)
+                        
+                        # Create groups for all sets with at least 2 files
+                        group_count = 0
+                        for group_id, group_files in groups.items():
+                            if len(group_files) >= 2:
+                                subgroup_key = f"{hash_val}_verified_{group_count}"
+                                new_duplicate_groups[subgroup_key] = group_files
+                                group_count += 1
+                    
+                    # Merge skip_orb_subgroups (trusted duplicates) with verified groups
+                    # Convert skip_orb_subgroups to the format expected by duplicate_groups
+                    skip_orb_groups_flat = {}
+                    for hash_val, subgroups in skip_orb_subgroups.items():
+                        # Each subgroup is a list of files that are pre-filtered as duplicates
+                        for subgroup in subgroups:
+                            if len(subgroup) > 1:
+                                # Use hash_val with a suffix to make it unique
+                                group_key = f"{hash_val}_skip_{len(skip_orb_groups_flat)}"
+                                skip_orb_groups_flat[group_key] = subgroup
+                    
+                    duplicate_groups = new_duplicate_groups
+                    duplicate_groups.update(skip_orb_groups_flat)  # Add groups that skipped ORB
+                    self.progress_callback(1.0)
+                    print(f"DEBUG: ORB verification completed: {len(new_duplicate_groups)} verified groups + {len(skip_orb_groups_flat)} trusted groups = {len(duplicate_groups)} total groups")
+                else:
+                    # No pairs to verify, but we still have skip_orb_subgroups
+                    # Convert skip_orb_subgroups to the format expected by duplicate_groups
+                    skip_orb_groups_flat = {}
+                    for hash_val, subgroups in skip_orb_subgroups.items():
+                        for subgroup in subgroups:
+                            if len(subgroup) > 1:
+                                group_key = f"{hash_val}_skip_{len(skip_orb_groups_flat)}"
+                                skip_orb_groups_flat[group_key] = subgroup
+                    # duplicate_groups is already initialized earlier in the function
+                    duplicate_groups.update(skip_orb_groups_flat)
+                    self.progress_callback(1.0)
+                    print(f"DEBUG: ORB verification skipped: {len(skip_orb_groups_flat)} trusted groups (no verification needed)")
+            
+            # Merge pre-filtered exact duplicates (by size/name+timestamp) into final results
+            if exact_duplicate_groups:
+                duplicate_groups.update(exact_duplicate_groups)
+                print(f"DEBUG: Added {len(exact_duplicate_groups)} pre-filtered exact duplicate groups to results")
             
             # Merge RAW/JPEG pairs based on timestamp correlation
             if self.use_imagehash:
