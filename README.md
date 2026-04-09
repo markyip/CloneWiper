@@ -22,10 +22,13 @@ CloneWiper is a high-performance, modern duplicate file detection tool built wit
 - **Cross-Platform Support**: Works on Windows (macOS support from source code only)
 - **High Performance**: 
   - Asynchronous processing with multi-threaded file scanning
+  - **Fast Scanning**: Uses `os.scandir` for efficient file system enumeration (up to 20x faster than traditional scanning)
   - Dynamic CPU optimization for hybrid architectures (P-cores/E-cores detection)
   - Adaptive I/O strategy (preloads small files, chunks large files)
   - Batch cache writes to reduce database lock contention
-- **Persistent Caching**: SQLite-backed cache for fast re-scans (hashes are cached and persist across sessions)
+- **Persistent Caching**: 
+  - **Hash Cache**: SQLite-backed cache (p-hash and MD5) for fast re-scans
+  - **Thumbnail Cache**: Local SQLite database stores generated thumbnails for instant scrolling on subsequent runs
 
 ### User Interface
 - **Material Design 3 UI**: Clean, modern dark-themed interface with rounded corners (when not maximized)
@@ -61,8 +64,9 @@ CloneWiper is a high-performance, modern duplicate file detection tool built wit
 - **Scope Control**: Apply actions to current page or all pages
 - **Safe Deletion**: Uses `send2trash` to move files to recycle bin/trash
 - **Persistent Cache**: 
-  - SQLite database stores calculated hashes (p-hash and MD5)
-  - Cache persists across sessions - no need to recalculate hashes on re-scan
+  - **Hash Cache**: Stores calculated hashes (p-hash and MD5)
+  - **Thumbnail Cache**: Offloads thumbnail generation to a local database (`thumbnails.db`), significantly speeding up gallery load times.
+  - Cache persists across sessions - no need to recalculate hashes or regenerate thumbnails on re-scan
   - Automatic cache management with hit/miss statistics
 
 ## 📋 Prerequisites

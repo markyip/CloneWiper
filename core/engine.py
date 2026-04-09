@@ -22,19 +22,22 @@ Version: 2.0
 """
 import os
 import stat
+import logging
 import threading
 import hashlib
 import sqlite3
 import time
 import atexit
 from collections import defaultdict, OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from typing import Dict, List, Set, Optional, Callable, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     import numpy as np
 import sys
+
+logger = logging.getLogger(__name__)
 
 # Try to import psutil for advanced CPU detection (hybrid architecture support)
 try:
@@ -181,17 +184,15 @@ class ScanEngine:
             self.max_workers = min(32, max(8, logical_cores))  # Use all logical cores for I/O
             # Hash calculation is I/O-intensive, use all cores but cap for memory safety
             self.hash_workers = min(32, max(16, logical_cores))
-            print(f"DEBUG: Hybrid CPU detected - P-cores: {p_cores}, E-cores: {e_cores}, Logical: {logical_cores}")
-            print(f"DEBUG: Using {self.max_workers} workers for general tasks, {self.hash_workers} for hash calculation")
+            logger.debug(f"DEBUG: Hybrid CPU detected - P-cores: {p_cores}, E-cores: {e_cores}, Logical: {logical_cores}")
+            logger.debug(f"DEBUG: Using {self.max_workers} workers for general tasks, {self.hash_workers} for hash calculation")
         else:
             # Standard CPU: Use 2x logical cores for I/O-intensive tasks
             cpu_count = logical_cores
             self.max_workers = min(32, max(8, cpu_count * 2))
             self.hash_workers = min(32, max(16, cpu_count * 2))
-            print(f"DEBUG: Standard CPU detected - {logical_cores} logical cores")
-            print(f"DEBUG: Using {self.max_workers} workers for general tasks, {self.hash_workers} for hash calculation")
-        
-        self.hash_lock = threading.Lock()
+            logger.debug(f"DEBUG: Standard CPU detected - {logical_cores} logical cores")
+            logger.debug(f"DEBUG: Using {self.max_workers} workers for general tasks, {self.hash_workers} for hash calculation")
         
         # Batch cache write queue to reduce lock contention
         self._cache_write_queue = []
@@ -206,7 +207,7 @@ class ScanEngine:
         # Optimized for large datasets (10K+ images): Increased cache limits
         self._file_prefetch_max_size = 500  # Maximum number of files to cache in memory (up from 100)
         self._file_prefetch_max_bytes = 2048 * 1024 * 1024  # Maximum 2GB cache size (up from 500MB)
-        self._file_prefetch_enabled = True  # Enable/disable prefetching
+        self._file_prefetch_enabled = False  # Off: no background prefetch threads / extra I/O
         
         # Results
         self.file_groups: Dict[str, List[str]] = defaultdict(list)
@@ -252,7 +253,7 @@ class ScanEngine:
         self._phash_db_lock = threading.Lock()
         self._phash_db_path = self._get_default_phash_db_path()
         # Debug: Always log the database path being used
-        print(f"DEBUG: Cache database path: {self._phash_db_path}")
+        logger.debug(f"DEBUG: Cache database path: {self._phash_db_path}")
         self._cache_db_ro_local = None
         
         # Cache stats
@@ -319,7 +320,7 @@ class ScanEngine:
                                 elif 'i9-13' in cpu_name or 'i9-14' in cpu_name:
                                     p_cores = 8
                                     e_cores = 16
-                                print(f"DEBUG: Detected hybrid CPU by model name - P: {p_cores}, E: {e_cores}, Logical: {logical_cores}")
+                                logger.debug(f"DEBUG: Detected hybrid CPU by model name - P: {p_cores}, E: {e_cores}, Logical: {logical_cores}")
                     elif platform.system() == 'Darwin':  # macOS
                         # Apple Silicon (M1/M2/M3) are hybrid but handled differently
                         cpu_name = platform.processor().lower()
@@ -330,10 +331,10 @@ class ScanEngine:
                             p_cores = 4
                             e_cores = 4
                 except Exception as e:
-                    print(f"DEBUG: CPU model detection error: {e}")
+                    logger.debug(f"DEBUG: CPU model detection error: {e}")
                     
             except Exception as e:
-                print(f"DEBUG: CPU detection error: {e}")
+                logger.debug(f"DEBUG: CPU detection error: {e}")
         
         return {
             'logical_cores': logical_cores,
@@ -379,18 +380,18 @@ class ScanEngine:
                     db_path = os.path.join(cache_dir, "phash_cache.sqlite3")
                     # Debug: Log the database path being used
                     if hasattr(self, '_debug_mode') and self._debug_mode:
-                        print(f"DEBUG: Using cache DB path: {db_path}")
+                        logger.debug(f"DEBUG: Using cache DB path: {db_path}")
                     return db_path
             elif system == "Darwin":  # macOS
                 cache_dir = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "CloneWiper")
                 os.makedirs(cache_dir, exist_ok=True)
                 db_path = os.path.join(cache_dir, "phash_cache.sqlite3")
                 if hasattr(self, '_debug_mode') and self._debug_mode:
-                    print(f"DEBUG: Using cache DB path: {db_path}")
+                    logger.debug(f"DEBUG: Using cache DB path: {db_path}")
                 return db_path
         except Exception as e:
             # Log error but continue to fallback
-            print(f"DEBUG: Failed to use platform cache directory: {e}")
+            logger.debug(f"DEBUG: Failed to use platform cache directory: {e}")
         
         # Fallback: Use user's home directory (works for both EXE and main.py)
         try:
@@ -399,15 +400,15 @@ class ScanEngine:
                 cache_dir = os.path.join(home, ".CloneWiper")
                 os.makedirs(cache_dir, exist_ok=True)
                 db_path = os.path.join(cache_dir, "phash_cache.sqlite3")
-                print(f"DEBUG: Using fallback cache DB path: {db_path}")
+                logger.debug(f"DEBUG: Using fallback cache DB path: {db_path}")
                 return db_path
         except Exception as e:
-            print(f"DEBUG: Fallback to home directory failed: {e}")
+            logger.debug(f"DEBUG: Fallback to home directory failed: {e}")
         
         # Last resort: current directory (not recommended, but ensures it works)
         try:
             db_path = os.path.abspath("phash_cache.sqlite3")
-            print(f"DEBUG: Using last resort cache DB path: {db_path}")
+            logger.debug(f"DEBUG: Using last resort cache DB path: {db_path}")
             return db_path
         except Exception:
             return "phash_cache.sqlite3"
@@ -441,7 +442,7 @@ class ScanEngine:
                     # If PRIMARY KEY is only (path), need to migrate
                     if len(pk_columns) == 1 and pk_columns[0] == 'path':
                         try:
-                            print("DEBUG: Migrating phash_cache table structure from PRIMARY KEY (path) to PRIMARY KEY (path, algo)...")
+                            logger.debug("DEBUG: Migrating phash_cache table structure from PRIMARY KEY (path) to PRIMARY KEY (path, algo)...")
                             # Step 1: Create new table
                             cursor.execute("""
                                 CREATE TABLE phash_cache_new (
@@ -469,9 +470,9 @@ class ScanEngine:
                             cursor.execute("CREATE INDEX IF NOT EXISTS idx_phash_updated ON phash_cache(updated)")
                             cursor.execute("CREATE INDEX IF NOT EXISTS idx_phash_path_algo ON phash_cache(path, algo)")
                             conn.commit()
-                            print(f"DEBUG: Migration completed successfully. Migrated {migrated_count} entries.")
+                            logger.debug(f"DEBUG: Migration completed successfully. Migrated {migrated_count} entries.")
                         except Exception as migrate_error:
-                            print(f"DEBUG: Migration failed: {migrate_error}")
+                            logger.debug(f"DEBUG: Migration failed: {migrate_error}")
                             conn.rollback()
                             # Continue with old structure - backward compatibility will handle it
                 else:
@@ -592,7 +593,7 @@ class ScanEngine:
         except Exception as e:
             # Log cache query errors for debugging (only in debug mode)
             if hasattr(self, '_debug_mode') and self._debug_mode:
-                print(f"DEBUG: Cache query error for {os.path.basename(file_path)}: {e}")
+                logger.debug(f"DEBUG: Cache query error for {os.path.basename(file_path)}: {e}")
             return None
         if not row:
             return None
@@ -602,7 +603,7 @@ class ScanEngine:
         except Exception as e:
             # Log cache result parsing errors for debugging
             if hasattr(self, '_debug_mode') and self._debug_mode:
-                print(f"DEBUG: Cache result parsing error for {os.path.basename(file_path)}: {e}")
+                logger.debug(f"DEBUG: Cache result parsing error for {os.path.basename(file_path)}: {e}")
             return None
     
     def _phash_cache_put(self, file_path: str, size: int, mtime_ns: int, algo: str, hash_str: str):
@@ -739,7 +740,7 @@ class ScanEngine:
                 try:
                     img = img.convert('RGB')
                 except Exception as convert_error:
-                    print(f"DEBUG: Image mode conversion failed, using original mode: {convert_error}")
+                    logger.debug(f"DEBUG: Image mode conversion failed, using original mode: {convert_error}")
             
             # Pre-resize large images to improve accuracy
             # 256x256 matches multi-hash mode, allowing phash reuse between single and multi-hash modes
@@ -753,20 +754,20 @@ class ScanEngine:
                     img.thumbnail((256, 256), Image.Resampling.BILINEAR)
             except Exception as resize_error:
                 # If resize fails, continue with original image
-                print(f"DEBUG: Image resize failed in single hash, using original: {resize_error}")
+                logger.debug(f"DEBUG: Image resize failed in single hash, using original: {resize_error}")
             
             # Use phash (perceptual hash) - more accurate than average_hash
             try:
                 return str(imagehash.phash(img))
             except Exception as e:
-                print(f"DEBUG: phash failed: {e}")
+                logger.debug(f"DEBUG: phash failed: {e}")
                 # Fallback to average_hash if phash fails
                 try:
                     return str(imagehash.average_hash(img))
                 except Exception:
                     return None
         except Exception as e:
-            print(f"DEBUG: Single hash calculation failed: {e}")
+            logger.debug(f"DEBUG: Single hash calculation failed: {e}")
             return None
     
     def _calculate_multi_hash(self, img: Image.Image, cached_phash: Optional[str] = None) -> Optional[str]:
@@ -798,7 +799,7 @@ class ScanEngine:
                     img = img.convert('RGB')
                 except Exception as convert_error:
                     # If conversion fails, try to continue with original mode
-                    print(f"DEBUG: Image mode conversion failed, using original mode: {convert_error}")
+                    logger.debug(f"DEBUG: Image mode conversion failed, using original mode: {convert_error}")
             
             # Pre-resize large images to improve accuracy for multi-hash calculation
             # 256x256 is optimal: provides better detail than 128x128 for multiple algorithms
@@ -812,7 +813,7 @@ class ScanEngine:
                     img.thumbnail((256, 256), Image.Resampling.BILINEAR)
             except Exception as resize_error:
                 # If resize fails, continue with original image
-                print(f"DEBUG: Image resize failed in multi hash, using original: {resize_error}")
+                logger.debug(f"DEBUG: Image resize failed in multi hash, using original: {resize_error}")
             
             # Optimization: Direct calculation instead of ThreadPoolExecutor for CPU-bound tasks
             # ThreadPoolExecutor overhead (thread creation, context switching) can be slower than direct calls
@@ -823,7 +824,7 @@ class ScanEngine:
             try:
                 hash_results['average'] = str(imagehash.average_hash(img))
             except Exception as e:
-                print(f"DEBUG: average_hash failed: {e}")
+                logger.debug(f"DEBUG: average_hash failed: {e}")
                 hash_results['average'] = None
             
             # Reuse cached phash if available (from single-hash mode, both use 256x256 now)
@@ -833,19 +834,19 @@ class ScanEngine:
                 try:
                     hash_results['perceptual'] = str(imagehash.phash(img))
                 except Exception as e:
-                    print(f"DEBUG: phash failed: {e}")
+                    logger.debug(f"DEBUG: phash failed: {e}")
                     hash_results['perceptual'] = None
             
             try:
                 hash_results['difference'] = str(imagehash.dhash(img))
             except Exception as e:
-                print(f"DEBUG: dhash failed: {e}")
+                logger.debug(f"DEBUG: dhash failed: {e}")
                 hash_results['difference'] = None
             
             try:
                 hash_results['wavelet'] = str(imagehash.whash(img))
             except Exception as e:
-                print(f"DEBUG: whash failed: {e}")
+                logger.debug(f"DEBUG: whash failed: {e}")
                 hash_results['wavelet'] = None
             
             # Combine available hashes (use placeholder for failed ones)
@@ -867,7 +868,7 @@ class ScanEngine:
                 return None
             
         except Exception as e:
-            print(f"DEBUG: Multi-hash calculation failed: {e}")
+            logger.debug(f"DEBUG: Multi-hash calculation failed: {e}")
             # Fallback to single hash if multi-hash fails
             try:
                 return str(imagehash.average_hash(img))
@@ -927,7 +928,7 @@ class ScanEngine:
                 
                 return data
             except Exception as e:
-                print(f"DEBUG: File prefetch failed for {os.path.basename(file_path)}: {e}")
+                logger.debug(f"DEBUG: File prefetch failed for {os.path.basename(file_path)}: {e}")
                 return None
         except Exception:
             return None
@@ -950,12 +951,16 @@ class ScanEngine:
             except Exception:
                 pass  # Silently fail for prefetch
         
-        # Prefetch in parallel batches
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all prefetch tasks
-            futures = [executor.submit(prefetch_one, fp) for fp in file_paths[:self._file_prefetch_max_size * 2]]
-            # Don't wait for completion - let them run in background
-            # This allows hash calculation to proceed while files are being prefetched
+        # Prefetch in parallel; do not block on pool shutdown (with-block waits by default).
+        prefetch_paths = file_paths[: self._file_prefetch_max_size * 2]
+        if not prefetch_paths:
+            return
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
+            for fp in prefetch_paths:
+                executor.submit(prefetch_one, fp)
+        finally:
+            executor.shutdown(wait=False)
     
     def _load_image_from_prefetch(self, file_path: str) -> Optional['Image.Image']:
         """
@@ -1059,7 +1064,7 @@ class ScanEngine:
                                 pass
                             # Debug: Log cache miss for multi_hash to help diagnose
                             if self.use_multi_hash and self._phash_cache_misses % 100 == 0:
-                                print(f"DEBUG: Cache miss for multi_hash: {os.path.basename(file_path)} (algo={algo}, size={size}, mtime_ns={mtime_ns})")
+                                logger.debug(f"DEBUG: Cache miss for multi_hash: {os.path.basename(file_path)} (algo={algo}, size={size}, mtime_ns={mtime_ns})")
                     
                     try:
                         img = None
@@ -1109,7 +1114,7 @@ class ScanEngine:
                                 if ('unsupported file format' not in error_lower and 
                                     'not raw file' not in error_lower):
                                     # Only log unexpected errors
-                                    print(f"DEBUG: RAW file processing failed for {os.path.basename(file_path)}: {raw_error}")
+                                    logger.debug(f"DEBUG: RAW file processing failed for {os.path.basename(file_path)}: {raw_error}")
                                 # Silently fall back to MD5 for unsupported formats
                                 pass
                         else:
@@ -1195,12 +1200,12 @@ class ScanEngine:
                         # Only log unexpected errors (not common "cannot identify" errors)
                         error_str = str(img_error)
                         if 'cannot identify' not in error_str.lower() and 'unsupported' not in error_str.lower():
-                            print(f"DEBUG: Image hash calculation failed for {os.path.basename(file_path)}: {img_error}")
+                            logger.debug(f"DEBUG: Image hash calculation failed for {os.path.basename(file_path)}: {img_error}")
                         pass
             
             return self.calculate_file_hash_cpu(file_path)
         except Exception as e:
-            print(f"DEBUG: calculate_file_hash error {file_path}: {e}")
+            logger.debug(f"DEBUG: calculate_file_hash error {file_path}: {e}")
             return None
     
     def _calculate_video_perceptual_hash(self, file_path: str) -> Optional[str]:
@@ -1243,7 +1248,7 @@ class ScanEngine:
                 import cv2
             except ImportError:
                 # OpenCV not available, fall back to MD5
-                print(f"DEBUG: OpenCV not available for video hash, falling back to MD5 for {os.path.basename(file_path)}")
+                logger.debug(f"DEBUG: OpenCV not available for video hash, falling back to MD5 for {os.path.basename(file_path)}")
                 # Return None to trigger MD5 fallback in calculate_file_hash
                 return None
             
@@ -1303,7 +1308,7 @@ class ScanEngine:
                                 frame_hashes.append(frame_hash)
                             img.close()
                         except Exception as frame_error:
-                            print(f"DEBUG: Failed to process frame at {time_ratio*100}% for {file_path}: {frame_error}")
+                            logger.debug(f"DEBUG: Failed to process frame at {time_ratio*100}% for {file_path}: {frame_error}")
                             continue
                 
                 cap.release()
@@ -1329,11 +1334,11 @@ class ScanEngine:
                 
             except Exception as video_error:
                 cap.release()
-                print(f"DEBUG: Video hash calculation failed for {file_path}: {video_error}")
+                logger.debug(f"DEBUG: Video hash calculation failed for {file_path}: {video_error}")
                 return None
                 
         except Exception as e:
-            print(f"DEBUG: _calculate_video_perceptual_hash error for {file_path}: {e}")
+            logger.debug(f"DEBUG: _calculate_video_perceptual_hash error for {file_path}: {e}")
             return None
     
     def calculate_file_hash_cpu(self, file_path: str) -> Optional[str]:
@@ -1390,7 +1395,7 @@ class ScanEngine:
                     self._md5_cache_puts += 1
             return digest
         except Exception as e:
-            print(f"DEBUG: calculate_file_hash_cpu error {file_path}: {e}")
+            logger.debug(f"DEBUG: calculate_file_hash_cpu error {file_path}: {e}")
             return None
     
     def calculate_partial_hash(self, file_path: str, chunk_size: int = 4096) -> Optional[str]:
@@ -1562,7 +1567,7 @@ class ScanEngine:
             with total_image_files_lock:
                 total_image_files[0] += local_image_count
         except Exception as e:
-            print(f"collect_files_by_size error: {e}")
+            logger.debug(f"collect_files_by_size error: {e}")
     
     def perform_partial_hashing(self, file_paths: List[str], phase_num: int = None, total_phases: int = None) -> Dict[str, List[str]]:
         """Perform partial hashing for fast pre-filtering.
@@ -1647,14 +1652,8 @@ class ScanEngine:
                         pass
                     return partial_groups
                 
-                done = set()
-                try:
-                    for fut in as_completed(list(inflight.keys()), timeout=0.2):
-                        done.add(fut)
-                        break
-                except Exception:
-                    done = set()
-                
+                wait_set = frozenset(inflight.keys())
+                done, _pending = wait(wait_set, timeout=0.25, return_when=FIRST_COMPLETED)
                 if not done:
                     continue
                 
@@ -1766,6 +1765,23 @@ class ScanEngine:
             except Exception:
                 parsed_hashes[hash_val] = None
         
+        parsed_image_objs = {}
+        for hash_val, _fl in hash_list:
+            parts = parsed_hashes.get(hash_val)
+            if not parts or len(parts) != 4:
+                parsed_image_objs[hash_val] = None
+                continue
+            a, p, d, w = parts
+            try:
+                parsed_image_objs[hash_val] = (
+                    imagehash.hex_to_hash(a) if a else None,
+                    imagehash.hex_to_hash(p) if p else None,
+                    imagehash.hex_to_hash(d) if d else None,
+                    imagehash.hex_to_hash(w) if w else None,
+                )
+            except Exception:
+                parsed_image_objs[hash_val] = None
+        
         # Optimization: Early exit for exact matches (fast path)
         # First, handle exact matches (these are definitely duplicates)
         # Note: Even exact hash matches should be verified with ORB if enabled,
@@ -1779,7 +1795,7 @@ class ScanEngine:
                     # This ensures that files that are similar to each other (but not to the first file) are still grouped together
                     # Note: ORB verification will be done in a separate phase if skip_orb_verification is True
                     if self.opencv_verification_method and not skip_orb_verification:
-                        print(f"DEBUG: Exact hash match found for {len(unique_files)} files, verifying with ORB (pairwise comparison)...")
+                        logger.debug(f"DEBUG: Exact hash match found for {len(unique_files)} files, verifying with ORB (pairwise comparison)...")
                         
                         # Use union-find approach to group similar files
                         # Each file starts in its own group
@@ -1788,9 +1804,9 @@ class ScanEngine:
                         # Compare all pairs of files
                         for i, file1 in enumerate(unique_files):
                             for file2 in unique_files[i+1:]:
-                                print(f"DEBUG: Verifying exact match pair: {os.path.basename(file1)} <-> {os.path.basename(file2)}")
+                                logger.debug(f"DEBUG: Verifying exact match pair: {os.path.basename(file1)} <-> {os.path.basename(file2)}")
                                 if self._verify_similarity_opencv(hash_val, hash_val, [file1], [file2], method=self.opencv_verification_method):
-                                    print(f"DEBUG: ORB verification passed for pair")
+                                    logger.debug(f"DEBUG: ORB verification passed for pair")
                                     # Merge groups
                                     group1 = file_to_group[file1]
                                     group2 = file_to_group[file2]
@@ -1798,7 +1814,7 @@ class ScanEngine:
                                     for f in merged_group:
                                         file_to_group[f] = merged_group
                                 else:
-                                    print(f"DEBUG: ORB verification failed for pair")
+                                    logger.debug(f"DEBUG: ORB verification failed for pair")
                         
                         # Find the largest group (or all groups with at least 2 files)
                         groups = {}
@@ -1817,11 +1833,11 @@ class ScanEngine:
                                 # Use a unique key for each subgroup
                                 subgroup_key = f"{hash_val}_subgroup_{group_count}"
                                 exact_match_groups[subgroup_key] = group_files
-                                print(f"DEBUG: Exact match subgroup created with {len(group_files)} verified files: {[os.path.basename(f) for f in group_files]}")
+                                logger.debug(f"DEBUG: Exact match subgroup created with {len(group_files)} verified files: {[os.path.basename(f) for f in group_files]}")
                                 group_count += 1
                         
                         if group_count == 0:
-                            print(f"DEBUG: Exact match group rejected: no pairs passed ORB verification")
+                            logger.debug(f"DEBUG: Exact match group rejected: no pairs passed ORB verification")
                     else:
                         # No ORB verification, use all files
                         exact_match_groups[hash_val] = unique_files
@@ -1836,34 +1852,28 @@ class ScanEngine:
             # Build average_hash index for fast lookup
             avg_hash_index = {}  # avg_hash_value -> [hash_strings]
             for hash_val, files in remaining_hashes:
-                parsed = parsed_hashes.get(hash_val)
-                if parsed and parsed[0]:  # parsed[0] is average_hash
-                    try:
-                        avg_hash = imagehash.hex_to_hash(parsed[0])
-                        # Create buckets for similar average hashes
-                        # Use hash value as key (simplified, but effective)
-                        avg_key = str(avg_hash)
-                        if avg_key not in avg_hash_index:
-                            avg_hash_index[avg_key] = []
-                        avg_hash_index[avg_key].append((hash_val, files, avg_hash))
-                    except Exception:
-                        pass
+                objs = parsed_image_objs.get(hash_val)
+                if objs and objs[0]:
+                    h_avg = objs[0]
+                    avg_key = str(h_avg)
+                    if avg_key not in avg_hash_index:
+                        avg_hash_index[avg_key] = []
+                    avg_hash_index[avg_key].append((hash_val, files, h_avg))
             
             # Phase 1: LSH-based similarity search (O(n) average case)
             # Build LSH buckets using bit sampling
             # Phase 1: Find candidates using LSH (Locality-Sensitive Hashing)
-            print(f"DEBUG: Building LSH index for {len(remaining_hashes)} hashes...")
+            logger.debug(f"DEBUG: Building LSH index for {len(remaining_hashes)} hashes...")
             lsh_buckets = defaultdict(list)
             num_bands = 8
             bits_per_band = 8
             
             for hash_val, files in remaining_hashes:
-                parsed = parsed_hashes.get(hash_val)
-                if not parsed or not parsed[1]:
+                objs = parsed_image_objs.get(hash_val)
+                if not objs or not objs[1]:
                     continue
                 try:
-                    phash = imagehash.hex_to_hash(parsed[1])
-                    avg_hash = imagehash.hex_to_hash(parsed[0]) if parsed[0] else None
+                    avg_hash, phash = objs[0], objs[1]
                     hash_bits = phash.hash.flatten()
                     for band_idx in range(num_bands):
                         start_bit = (band_idx * bits_per_band) % 64
@@ -1873,7 +1883,7 @@ class ScanEngine:
                 except Exception:
                     pass
             
-            print(f"DEBUG: LSH created {len(lsh_buckets)} buckets")
+            logger.debug(f"DEBUG: LSH created {len(lsh_buckets)} buckets")
             candidate_pairs = set()
             for bucket_key, bucket_items in lsh_buckets.items():
                 if len(bucket_items) < 2:
@@ -1900,25 +1910,14 @@ class ScanEngine:
                 if hash1 in processed or hash2 in processed:
                     return None
                 
-                parsed1 = parsed_hashes.get(hash1)
-                parsed2 = parsed_hashes.get(hash2)
-                if not parsed1 or not parsed2:
+                objs1 = parsed_image_objs.get(hash1)
+                objs2 = parsed_image_objs.get(hash2)
+                if not objs1 or not objs2:
                     return None
                 
-                avg1, phash1, dhash1, whash1 = parsed1
-                avg2, phash2, dhash2, whash2 = parsed2
-                
                 try:
-                    # Pre-convert all hashes
-                    h_avg1 = imagehash.hex_to_hash(avg1) if avg1 else None
-                    h_phash1 = imagehash.hex_to_hash(phash1) if phash1 else None
-                    h_dhash1 = imagehash.hex_to_hash(dhash1) if dhash1 else None
-                    h_whash1 = imagehash.hex_to_hash(whash1) if whash1 else None
-                    
-                    h_avg2 = imagehash.hex_to_hash(avg2) if avg2 else None
-                    h_phash2 = imagehash.hex_to_hash(phash2) if phash2 else None
-                    h_dhash2 = imagehash.hex_to_hash(dhash2) if dhash2 else None
-                    h_whash2 = imagehash.hex_to_hash(whash2) if whash2 else None
+                    h_avg1, h_phash1, h_dhash1, h_whash1 = objs1
+                    h_avg2, h_phash2, h_dhash2, h_whash2 = objs2
                     
                     agreements = 0
                     distances = {}
@@ -1948,23 +1947,23 @@ class ScanEngine:
                     files1 = hash_to_files.get(hash1, [])
                     files2 = hash_to_files.get(hash2, [])
                     if agreements >= MIN_AGREEMENT:
-                        print(f"DEBUG: Hash similarity match: {os.path.basename(files1[0]) if files1 else 'N/A'} <-> {os.path.basename(files2[0]) if files2 else 'N/A'}")
-                        print(f"DEBUG:   Agreements: {agreements}/{4}, distances: {distances}, threshold: {HAMMING_THRESHOLD}, min_agreement: {MIN_AGREEMENT}")
+                        logger.debug(f"DEBUG: Hash similarity match: {os.path.basename(files1[0]) if files1 else 'N/A'} <-> {os.path.basename(files2[0]) if files2 else 'N/A'}")
+                        logger.debug(f"DEBUG:   Agreements: {agreements}/{4}, distances: {distances}, threshold: {HAMMING_THRESHOLD}, min_agreement: {MIN_AGREEMENT}")
                         # Optional OpenCV verification for higher accuracy
                         # Skip ORB if deferred (for large datasets, verify only on deletion)
                         should_verify_now = self.opencv_verification_method and not skip_orb_verification and not self.defer_orb_verification
                         if should_verify_now:
                             files1 = hash_to_files.get(hash1, [])
                             files2 = hash_to_files.get(hash2, [])
-                            print(f"DEBUG: ORB verification called for pair: {os.path.basename(files1[0]) if files1 else 'N/A'} <-> {os.path.basename(files2[0]) if files2 else 'N/A'}")
+                            logger.debug(f"DEBUG: ORB verification called for pair: {os.path.basename(files1[0]) if files1 else 'N/A'} <-> {os.path.basename(files2[0]) if files2 else 'N/A'}")
                             verification_result = self._verify_similarity_opencv(hash1, hash2, files1, files2, method=self.opencv_verification_method)
-                            print(f"DEBUG: ORB verification result: {verification_result}")
+                            logger.debug(f"DEBUG: ORB verification result: {verification_result}")
                             if not verification_result:
-                                print(f"DEBUG: ORB verification failed, rejecting pair")
+                                logger.debug(f"DEBUG: ORB verification failed, rejecting pair")
                                 return None  # Verification failed
-                            print(f"DEBUG: ORB verification passed")
+                            logger.debug(f"DEBUG: ORB verification passed")
                         elif self.defer_orb_verification and self.opencv_verification_method:
-                            print(f"DEBUG: ORB verification deferred (will verify on deletion)")
+                            logger.debug(f"DEBUG: ORB verification deferred (will verify on deletion)")
                         return (hash1, hash2)
                     return None
                 except Exception:
@@ -1976,38 +1975,35 @@ class ScanEngine:
                 # Limit candidate pairs to avoid excessive processing
                 MAX_CANDIDATE_PAIRS = min(50000, len(candidate_pairs))  # Cap at 50K pairs
                 candidate_list = list(candidate_pairs)[:MAX_CANDIDATE_PAIRS]
-                print(f"DEBUG: Found {len(candidate_pairs)} candidate pairs, processing {len(candidate_list)} pairs")
+                logger.debug(f"DEBUG: Found {len(candidate_pairs)} candidate pairs, processing {len(candidate_list)} pairs")
                 if self.opencv_verification_method:
-                    print(f"DEBUG: ORB verification enabled, will verify {len(candidate_list)} candidate pairs")
+                    logger.debug(f"DEBUG: ORB verification enabled, will verify {len(candidate_list)} candidate pairs")
                 
                 # Update status if ORB verification is enabled
                 total_pairs = len(candidate_list)
                 processed_pairs = [0]
                 last_update_time = [time.time()]
                 
-                def compare_pair_with_progress(pair):
-                    """Compare pair and update progress."""
-                    result = compare_pair_internal(pair)
-                    processed_pairs[0] += 1
-                    
-                    # Update progress every 100 pairs or every 0.5 seconds
-                    # Note: Progress updates are skipped if ORB verification is deferred to separate phase
-                    if not skip_orb_verification and (processed_pairs[0] % 100 == 0 or (time.time() - last_update_time[0]) >= 0.5):
-                        if self.opencv_verification_method:
-                            status_msg = f"Verifying {processed_pairs[0]:,}/{total_pairs:,} pairs with {self.opencv_verification_method.upper()}..."
-                            self.status_callback(status_msg)
-                            print(f"DEBUG: {status_msg}")
-                        else:
-                            status_msg = f"Comparing {processed_pairs[0]:,}/{total_pairs:,} hash pairs..."
-                            self.status_callback(status_msg)
-                        last_update_time[0] = time.time()
-                    
-                    return result
-                
-                # Use ThreadPoolExecutor for parallel comparison
+                # as_completed: faster than map() when pair costs vary (e.g. ORB), and avoids head-of-line blocking.
                 with ThreadPoolExecutor(max_workers=min(8, self.max_workers)) as executor:
-                    results = executor.map(compare_pair_with_progress, candidate_list)
-                    for result in results:
+                    futures = [executor.submit(compare_pair_internal, p) for p in candidate_list]
+                    for fut in as_completed(futures):
+                        try:
+                            result = fut.result()
+                        except Exception:
+                            result = None
+                        processed_pairs[0] += 1
+                        if not skip_orb_verification and (
+                            processed_pairs[0] % 100 == 0 or (time.time() - last_update_time[0]) >= 0.5
+                        ):
+                            if self.opencv_verification_method:
+                                status_msg = f"Verifying {processed_pairs[0]:,}/{total_pairs:,} pairs with {self.opencv_verification_method.upper()}..."
+                                self.status_callback(status_msg)
+                                logger.debug(f"DEBUG: {status_msg}")
+                            else:
+                                status_msg = f"Comparing {processed_pairs[0]:,}/{total_pairs:,} hash pairs..."
+                                self.status_callback(status_msg)
+                            last_update_time[0] = time.time()
                         if result:
                             similarity_pairs.append(result)
             
@@ -2055,20 +2051,10 @@ class ScanEngine:
                 if hash1 in processed:
                     continue
                 
-                parsed1 = parsed_hashes.get(hash1)
-                if parsed1 is None:
+                objs1 = parsed_image_objs.get(hash1)
+                if not objs1:
                     continue
-                
-                avg1, phash1, dhash1, whash1 = parsed1
-                
-                # Pre-convert hashes once for this hash1
-                try:
-                    h_avg1 = imagehash.hex_to_hash(avg1) if avg1 else None
-                    h_phash1 = imagehash.hex_to_hash(phash1) if phash1 else None
-                    h_dhash1 = imagehash.hex_to_hash(dhash1) if dhash1 else None
-                    h_whash1 = imagehash.hex_to_hash(whash1) if whash1 else None
-                except Exception:
-                    continue
+                h_avg1, h_phash1, h_dhash1, h_whash1 = objs1
                 
                 # Find similar hashes
                 similar_files = list(files1)
@@ -2080,17 +2066,15 @@ class ScanEngine:
                     
                     comparisons_made += 1
                     
-                    parsed2 = parsed_hashes.get(hash2)
-                    if parsed2 is None:
+                    objs2 = parsed_image_objs.get(hash2)
+                    if not objs2:
                         continue
-                    
-                    avg2, phash2, dhash2, whash2 = parsed2
+                    h_avg2, h_phash2, h_dhash2, h_whash2 = objs2
                     
                     # Two-phase: Quick check with average_hash first
                     agreements = 0
-                    if h_avg1 and avg2:
+                    if h_avg1 and h_avg2:
                         try:
-                            h_avg2 = imagehash.hex_to_hash(avg2)
                             dist = h_avg1 - h_avg2
                             if dist <= HAMMING_THRESHOLD:
                                 agreements += 1
@@ -2102,44 +2086,41 @@ class ScanEngine:
                     
                     # Detailed comparison only if average_hash was close
                     if agreements > 0 or h_avg1 is None:
-                        if h_phash1 and phash2:
+                        if h_phash1 and h_phash2:
                             try:
-                                h_phash2 = imagehash.hex_to_hash(phash2)
                                 if h_phash1 - h_phash2 <= HAMMING_THRESHOLD:
                                     agreements += 1
                             except Exception:
                                 pass
                         
-                        if h_dhash1 and dhash2:
+                        if h_dhash1 and h_dhash2:
                             try:
-                                h_dhash2 = imagehash.hex_to_hash(dhash2)
                                 if h_dhash1 - h_dhash2 <= HAMMING_THRESHOLD:
                                     agreements += 1
                             except Exception:
                                 pass
                         
-                        if h_whash1 and whash2:
+                        if h_whash1 and h_whash2:
                             try:
-                                h_whash2 = imagehash.hex_to_hash(whash2)
                                 if h_whash1 - h_whash2 <= HAMMING_THRESHOLD:
                                     agreements += 1
                             except Exception:
                                 pass
                     
                     if agreements >= MIN_AGREEMENT:
-                        print(f"DEBUG: Hash similarity match (small dataset path): {os.path.basename(similar_files[0]) if similar_files else 'N/A'} <-> {os.path.basename(files2[0]) if files2 else 'N/A'}")
-                        print(f"DEBUG:   Agreements: {agreements}/{4}, threshold: {HAMMING_THRESHOLD}, min_agreement: {MIN_AGREEMENT}")
+                        logger.debug(f"DEBUG: Hash similarity match (small dataset path): {os.path.basename(similar_files[0]) if similar_files else 'N/A'} <-> {os.path.basename(files2[0]) if files2 else 'N/A'}")
+                        logger.debug(f"DEBUG:   Agreements: {agreements}/{4}, threshold: {HAMMING_THRESHOLD}, min_agreement: {MIN_AGREEMENT}")
                         # Optional OpenCV verification for higher accuracy
                         # Skip ORB if deferred (for large datasets, verify only on deletion)
                         should_verify_now = self.opencv_verification_method and not skip_orb_verification and not self.defer_orb_verification
                         if should_verify_now:
-                            print(f"DEBUG: ORB verification called (small dataset path)")
+                            logger.debug(f"DEBUG: ORB verification called (small dataset path)")
                             if not self._verify_similarity_opencv(hash1, hash2, similar_files, files2, method=self.opencv_verification_method):
-                                print(f"DEBUG: ORB verification failed (small dataset path), skipping match")
+                                logger.debug(f"DEBUG: ORB verification failed (small dataset path), skipping match")
                                 continue  # Verification failed, skip this match
-                            print(f"DEBUG: ORB verification passed (small dataset path)")
+                            logger.debug(f"DEBUG: ORB verification passed (small dataset path)")
                         elif self.defer_orb_verification and self.opencv_verification_method:
-                            print(f"DEBUG: ORB verification deferred (small dataset path)")
+                            logger.debug(f"DEBUG: ORB verification deferred (small dataset path)")
                         similar_files.extend(files2)
                         processed.add(hash2)
                 
@@ -2202,7 +2183,7 @@ class ScanEngine:
                 file2 = files2[0] if files2 else None
                 
                 if not file1 or not file2 or not os.path.exists(file1) or not os.path.exists(file2):
-                    print(f"DEBUG: OpenCV {method} verification skipped: files not found or invalid")
+                    logger.debug(f"DEBUG: OpenCV {method} verification skipped: files not found or invalid")
                     return True  # Default to accepting if files don't exist
                 
                 # Read images - try OpenCV first, fallback to PIL/rawpy for unsupported formats
@@ -2236,7 +2217,7 @@ class ScanEngine:
                 # Resize to same size for comparison (use smaller dimension)
                 # Validate images before resizing
                 if img1 is None or img2 is None or len(img1.shape) < 2 or len(img2.shape) < 2:
-                    print(f"DEBUG: Invalid images before resize - img1: {img1.shape if img1 is not None else None}, img2: {img2.shape if img2 is not None else None}")
+                    logger.debug(f"DEBUG: Invalid images before resize - img1: {img1.shape if img1 is not None else None}, img2: {img2.shape if img2 is not None else None}")
                     return True  # Default to accepting if images are invalid
                 
                 h1, w1 = img1.shape[:2]
@@ -2244,7 +2225,7 @@ class ScanEngine:
                 
                 # Ensure valid dimensions
                 if h1 <= 0 or w1 <= 0 or h2 <= 0 or w2 <= 0:
-                    print(f"DEBUG: Invalid image dimensions - img1: {w1}x{h1}, img2: {w2}x{h2}")
+                    logger.debug(f"DEBUG: Invalid image dimensions - img1: {w1}x{h1}, img2: {w2}x{h2}")
                     return True  # Default to accepting if dimensions are invalid
                 
                 target_size = (min(w1, w2, 384), min(h1, h2, 384))  # Max 384x384 for better feature extraction (balance between speed and quality)
@@ -2253,13 +2234,13 @@ class ScanEngine:
                     img1_resized = cv2.resize(img1, target_size, interpolation=cv2.INTER_AREA)
                     img2_resized = cv2.resize(img2, target_size, interpolation=cv2.INTER_AREA)
                 except Exception as resize_error:
-                    print(f"DEBUG: Image resize failed: {resize_error} (img1: {w1}x{h1}, img2: {w2}x{h2}, target: {target_size})")
+                    logger.debug(f"DEBUG: Image resize failed: {resize_error} (img1: {w1}x{h1}, img2: {w2}x{h2}, target: {target_size})")
                     return True  # Default to accepting if resize fails
                 
                 if method == 'orb':
-                    print(f"DEBUG: Calling _verify_orb for {os.path.basename(file1)} <-> {os.path.basename(file2)}")
+                    logger.debug(f"DEBUG: Calling _verify_orb for {os.path.basename(file1)} <-> {os.path.basename(file2)}")
                     result = self._verify_orb(img1_resized, img2_resized, file1, file2)
-                    print(f"DEBUG: _verify_orb returned: {result}")
+                    logger.debug(f"DEBUG: _verify_orb returned: {result}")
                     return result
                 elif method == 'sift':
                     return self._verify_sift(img1_resized, img2_resized)
@@ -2273,7 +2254,7 @@ class ScanEngine:
                     pass
             
         except Exception as e:
-            print(f"DEBUG: OpenCV {method} verification failed: {e}")
+            logger.debug(f"DEBUG: OpenCV {method} verification failed: {e}")
             return True  # Default to accepting on error
     
     def _imread_safe(self, file_path: str, flags: int = None) -> Optional['np.ndarray']:
@@ -2352,7 +2333,7 @@ class ScanEngine:
                     return img_array
                 except Exception as tiff_error:
                     # PIL failed, try OpenCV as fallback (but this may trigger warnings)
-                    print(f"DEBUG: PIL failed to read TIFF/DNG {os.path.basename(file_path)}, trying OpenCV: {tiff_error}")
+                    logger.debug(f"DEBUG: PIL failed to read TIFF/DNG {os.path.basename(file_path)}, trying OpenCV: {tiff_error}")
                     pass
             
             # Skip OpenCV methods for TIFF/DNG files to avoid warnings
@@ -2534,7 +2515,7 @@ class ScanEngine:
                     cpu_img = gpu_img.download()
                     kp, des = orb.detectAndCompute(cpu_img, None)
                 except Exception as gpu_error:
-                    print(f"DEBUG: GPU ORB failed, falling back to CPU: {gpu_error}")
+                    logger.debug(f"DEBUG: GPU ORB failed, falling back to CPU: {gpu_error}")
                     # Optimized parameters for duplicate detection
                     orb = cv2.ORB_create(
                         nfeatures=150,
@@ -2557,12 +2538,12 @@ class ScanEngine:
             
             # Validate image before computing descriptors
             if img is None or img.size == 0:
-                print(f"DEBUG: ORB descriptor computation failed: invalid image for {os.path.basename(file_path) if file_path else 'unknown'}")
+                logger.debug(f"DEBUG: ORB descriptor computation failed: invalid image for {os.path.basename(file_path) if file_path else 'unknown'}")
                 return (None, None)
             
             # Check if descriptors were computed successfully
             if des is None:
-                print(f"DEBUG: ORB descriptor computation returned None for {os.path.basename(file_path) if file_path else 'unknown'} (image shape: {img.shape})")
+                logger.debug(f"DEBUG: ORB descriptor computation returned None for {os.path.basename(file_path) if file_path else 'unknown'} (image shape: {img.shape})")
                 return (None, None)
             
             # Cache the result with size limiting
@@ -2576,11 +2557,11 @@ class ScanEngine:
                     self._orb_cache[file_path] = (kp, des)
                 return (kp, des)
             else:
-                print(f"DEBUG: ORB descriptor computation: insufficient features ({len(des)} < 10) for {os.path.basename(file_path) if file_path else 'unknown'} (image shape: {img.shape})")
+                logger.debug(f"DEBUG: ORB descriptor computation: insufficient features ({len(des)} < 10) for {os.path.basename(file_path) if file_path else 'unknown'} (image shape: {img.shape})")
                 return (None, None)
             
         except Exception as e:
-            print(f"DEBUG: ORB descriptor computation error for {os.path.basename(file_path) if file_path else 'unknown'}: {e}")
+            logger.debug(f"DEBUG: ORB descriptor computation error for {os.path.basename(file_path) if file_path else 'unknown'}: {e}")
             return (None, None)
     
     def _verify_orb(self, img1: 'np.ndarray', img2: 'np.ndarray', file1: str = None, file2: str = None) -> bool:
@@ -2613,7 +2594,7 @@ class ScanEngine:
             
             # Check if images were successfully read and have valid data
             if img1 is None or img2 is None or (hasattr(img1, 'size') and img1.size == 0) or (hasattr(img2, 'size') and img2.size == 0):
-                print(f"DEBUG: ORB verification failed: invalid images (img1: {img1.shape if img1 is not None and hasattr(img1, 'shape') else None}, img2: {img2.shape if img2 is not None and hasattr(img2, 'shape') else None})")
+                logger.debug(f"DEBUG: ORB verification failed: invalid images (img1: {img1.shape if img1 is not None and hasattr(img1, 'shape') else None}, img2: {img2.shape if img2 is not None and hasattr(img2, 'shape') else None})")
                 return False
             
             # Check if keypoints and descriptors are valid
@@ -2622,10 +2603,10 @@ class ScanEngine:
                 # Use fallback method: histogram comparison for low-contrast/solid color images
                 img1_info = f"shape={img1.shape}, dtype={img1.dtype}, min={img1.min()}, max={img1.max()}" if img1 is not None and hasattr(img1, 'shape') else "None"
                 img2_info = f"shape={img2.shape}, dtype={img2.dtype}, min={img2.min()}, max={img2.max()}" if img2 is not None and hasattr(img2, 'shape') else "None"
-                print(f"DEBUG: ORB verification failed: invalid keypoints/descriptors (kp1: {kp1 is not None}, kp2: {kp2 is not None}, des1: {des1 is not None}, des2: {des2 is not None})")
+                logger.debug(f"DEBUG: ORB verification failed: invalid keypoints/descriptors (kp1: {kp1 is not None}, kp2: {kp2 is not None}, des1: {des1 is not None}, des2: {des2 is not None})")
                 if file1 and file2:
-                    print(f"DEBUG: Files - file1: {os.path.basename(file1)}, file2: {os.path.basename(file2)}")
-                print(f"DEBUG: Image info - img1: {img1_info}, img2: {img2_info}")
+                    logger.debug(f"DEBUG: Files - file1: {os.path.basename(file1)}, file2: {os.path.basename(file2)}")
+                logger.debug(f"DEBUG: Image info - img1: {img1_info}, img2: {img2_info}")
                 
                 # Fallback: Use histogram comparison for images that can't extract ORB features
                 # This helps with low-contrast, solid color, or very similar images
@@ -2635,13 +2616,13 @@ class ScanEngine:
                     correlation = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
                     # If histograms are very similar (correlation > 0.95), consider them duplicates
                     if correlation > 0.95:
-                        print(f"DEBUG: ORB fallback: histogram correlation={correlation:.3f} > 0.95, returning True")
+                        logger.debug(f"DEBUG: ORB fallback: histogram correlation={correlation:.3f} > 0.95, returning True")
                         return True
                     else:
-                        print(f"DEBUG: ORB fallback: histogram correlation={correlation:.3f} <= 0.95, returning False")
+                        logger.debug(f"DEBUG: ORB fallback: histogram correlation={correlation:.3f} <= 0.95, returning False")
                         return False
                 except Exception as hist_error:
-                    print(f"DEBUG: ORB fallback histogram comparison failed: {hist_error}")
+                    logger.debug(f"DEBUG: ORB fallback histogram comparison failed: {hist_error}")
                     # If histogram comparison also fails, default to False (not similar)
                     return False
             
@@ -2650,10 +2631,10 @@ class ScanEngine:
                 # Use fallback method: histogram comparison for low-contrast/solid color images
                 img1_info = f"shape={img1.shape}, dtype={img1.dtype}, min={img1.min()}, max={img1.max()}" if img1 is not None and hasattr(img1, 'shape') else "None"
                 img2_info = f"shape={img2.shape}, dtype={img2.dtype}, min={img2.min()}, max={img2.max()}" if img2 is not None and hasattr(img2, 'shape') else "None"
-                print(f"DEBUG: ORB verification failed: insufficient features (des1: {len(des1) if des1 is not None else 0}, des2: {len(des2) if des2 is not None else 0})")
+                logger.debug(f"DEBUG: ORB verification failed: insufficient features (des1: {len(des1) if des1 is not None else 0}, des2: {len(des2) if des2 is not None else 0})")
                 if file1 and file2:
-                    print(f"DEBUG: Files - file1: {os.path.basename(file1)}, file2: {os.path.basename(file2)}")
-                print(f"DEBUG: Image info - img1: {img1_info}, img2: {img2_info}")
+                    logger.debug(f"DEBUG: Files - file1: {os.path.basename(file1)}, file2: {os.path.basename(file2)}")
+                logger.debug(f"DEBUG: Image info - img1: {img1_info}, img2: {img2_info}")
                 
                 # Fallback: Use histogram comparison for images that can't extract ORB features
                 # This helps with low-contrast, solid color, or very similar images
@@ -2663,13 +2644,13 @@ class ScanEngine:
                     correlation = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
                     # If histograms are very similar (correlation > 0.95), consider them duplicates
                     if correlation > 0.95:
-                        print(f"DEBUG: ORB fallback: histogram correlation={correlation:.3f} > 0.95, returning True")
+                        logger.debug(f"DEBUG: ORB fallback: histogram correlation={correlation:.3f} > 0.95, returning True")
                         return True
                     else:
-                        print(f"DEBUG: ORB fallback: histogram correlation={correlation:.3f} <= 0.95, returning False")
+                        logger.debug(f"DEBUG: ORB fallback: histogram correlation={correlation:.3f} <= 0.95, returning False")
                         return False
                 except Exception as hist_error:
-                    print(f"DEBUG: ORB fallback histogram comparison failed: {hist_error}")
+                    logger.debug(f"DEBUG: ORB fallback histogram comparison failed: {hist_error}")
                     # If histogram comparison also fails, default to False (not similar)
                     return False
             
@@ -2705,11 +2686,11 @@ class ScanEngine:
             # Use descriptor count for display (more reliable than keypoint count)
             kp1_count = len(kp1) if kp1 is not None else len(des1)
             kp2_count = len(kp2) if kp2 is not None else len(des2)
-            print(f"DEBUG: ORB match details: {len(good_matches)} good matches out of {kp1_count}/{kp2_count} features, ratio={match_ratio:.3f}, threshold=0.12, result={result}")
+            logger.debug(f"DEBUG: ORB match details: {len(good_matches)} good matches out of {kp1_count}/{kp2_count} features, ratio={match_ratio:.3f}, threshold=0.12, result={result}")
             return result
             
         except Exception as e:
-            print(f"DEBUG: ORB verification error: {e}")
+            logger.debug(f"DEBUG: ORB verification error: {e}")
             return True
     
     def _verify_sift(self, img1: 'np.ndarray', img2: 'np.ndarray') -> bool:
@@ -2762,7 +2743,7 @@ class ScanEngine:
             return match_ratio >= 0.12
             
         except Exception as e:
-            print(f"DEBUG: SIFT verification error: {e}")
+            logger.debug(f"DEBUG: SIFT verification error: {e}")
             return True
     
     def _verify_ssim(self, img1: 'np.ndarray', img2: 'np.ndarray') -> bool:
@@ -2796,7 +2777,7 @@ class ScanEngine:
             return similarity >= 0.85
             
         except Exception as e:
-            print(f"DEBUG: SSIM verification error: {e}")
+            logger.debug(f"DEBUG: SSIM verification error: {e}")
             return True
     
     def verify_group_before_deletion(self, group_files: List[str]) -> bool:
@@ -2833,14 +2814,14 @@ class ScanEngine:
             )
             
             if result:
-                print(f"DEBUG: On-demand ORB verification PASSED for group: {os.path.basename(group_files[0])} <-> {os.path.basename(group_files[1])}")
+                logger.debug(f"DEBUG: On-demand ORB verification PASSED for group: {os.path.basename(group_files[0])} <-> {os.path.basename(group_files[1])}")
             else:
-                print(f"DEBUG: On-demand ORB verification FAILED for group: {os.path.basename(group_files[0])} <-> {os.path.basename(group_files[1])}")
-                print(f"DEBUG: This group may contain false positives. Review manually before deletion.")
+                logger.debug(f"DEBUG: On-demand ORB verification FAILED for group: {os.path.basename(group_files[0])} <-> {os.path.basename(group_files[1])}")
+                logger.debug(f"DEBUG: This group may contain false positives. Review manually before deletion.")
             
             return result
         except Exception as e:
-            print(f"DEBUG: On-demand verification error: {e}")
+            logger.debug(f"DEBUG: On-demand verification error: {e}")
             # On error, default to accepting (hash matching is already reliable)
             return True
     
@@ -2907,7 +2888,7 @@ class ScanEngine:
                     exact_duplicate_groups[group_id] = group_files
                     processed_files.update(group_files)
                     group_id_counter += 1
-                    print(f"DEBUG: Pre-filter exact duplicate (size+name+timestamp): {len(group_files)} files, name={basename}, size={size}")
+                    logger.debug(f"DEBUG: Pre-filter exact duplicate (size+name+timestamp): {len(group_files)} files, name={basename}, size={size}")
             
             # Strategy 2: Same size + exactly 2 files = likely exact duplicates (for non-image files)
             # For image files, we still need perceptual hash as same size doesn't mean same image
@@ -2925,7 +2906,7 @@ class ScanEngine:
                             exact_duplicate_groups[group_id] = same_size_files
                             processed_files.update(same_size_files)
                             group_id_counter += 1
-                            print(f"DEBUG: Pre-filter exact duplicate (same size pair, non-image): {len(same_size_files)} files, size={size}")
+                            logger.debug(f"DEBUG: Pre-filter exact duplicate (same size pair, non-image): {len(same_size_files)} files, size={size}")
                         else:
                             # For images, we still need hash calculation
                             remaining_files.extend(same_size_files)
@@ -3020,7 +3001,7 @@ class ScanEngine:
                             merged_groups[target_hash] = list(target_files | source_files)
                             # Remove the source group
                             del merged_groups[source_hash]
-                            print(f"DEBUG: Merged RAW/JPEG pair by timestamp: {os.path.basename(raw_path)} and {os.path.basename(jpeg_path)} (time diff: {time_diff:.2f}s)")
+                            logger.debug(f"DEBUG: Merged RAW/JPEG pair by timestamp: {os.path.basename(raw_path)} and {os.path.basename(jpeg_path)} (time diff: {time_diff:.2f}s)")
         
         return merged_groups
     
@@ -3046,15 +3027,15 @@ class ScanEngine:
                 self.opencv_verification_method = None
             
             # Debug: Log hash mode and availability
-            print(f"DEBUG: scan_duplicate_files called with use_imagehash={use_imagehash}, use_multi_hash={use_multi_hash}, use_orb_verification={use_orb_verification}")
-            print(f"DEBUG: Final settings: use_imagehash={self.use_imagehash}, use_multi_hash={self.use_multi_hash}, opencv_method={self.opencv_verification_method}")
+            logger.debug(f"DEBUG: scan_duplicate_files called with use_imagehash={use_imagehash}, use_multi_hash={use_multi_hash}, use_orb_verification={use_orb_verification}")
+            logger.debug(f"DEBUG: Final settings: use_imagehash={self.use_imagehash}, use_multi_hash={self.use_multi_hash}, opencv_method={self.opencv_verification_method}")
             
             # Check OpenCV availability (already imported at module level)
             if OPENCV_AVAILABLE:
                 try:
                     import cv2
-                    print(f"DEBUG: OpenCV available: {OPENCV_AVAILABLE}")
-                    print(f"DEBUG: OpenCV version: {cv2.__version__}")
+                    logger.debug(f"DEBUG: OpenCV available: {OPENCV_AVAILABLE}")
+                    logger.debug(f"DEBUG: OpenCV version: {cv2.__version__}")
                 except:
                     pass
             
@@ -3086,8 +3067,8 @@ class ScanEngine:
             all_image_files = []
             all_image_files_lock = threading.Lock()
             
-            print(f"DEBUG: Engine scan_duplicate_files called with paths={scan_paths}")
-            print(f"DEBUG: use_imagehash={self.use_imagehash}")
+            logger.debug(f"DEBUG: Engine scan_duplicate_files called with paths={scan_paths}")
+            logger.debug(f"DEBUG: use_imagehash={self.use_imagehash}")
             
             # Phase 1: Collect files
             # Calculate total phases: base phases + ORB verification phase if enabled
@@ -3097,10 +3078,10 @@ class ScanEngine:
             # Reset progress bar to 0% for Phase 1 (each phase has its own progress bar)
             self.progress_callback(0.0)
             if self.use_imagehash:
-                print("DEBUG: Calling status_callback: Collecting files (ImageHash enabled)...")
+                logger.debug("DEBUG: Calling status_callback: Collecting files (ImageHash enabled)...")
                 self.status_callback(f"{phase_num}/{total_phases} Scanning: Collecting files...")
             else:
-                print("DEBUG: Calling status_callback: Collecting files...")
+                logger.debug("DEBUG: Calling status_callback: Collecting files...")
                 self.status_callback(f"{phase_num}/{total_phases} Scanning: Collecting files...")
             
             scan_tasks = list(scan_paths)
@@ -3184,7 +3165,7 @@ class ScanEngine:
                             last_status_update = count
                             last_update_time = current_time
                     except Exception as e:
-                        print(f"Scan task error: {e}")
+                        logger.debug(f"Scan task error: {e}")
                         continue
                 
                 # Final status update for Phase 1
@@ -3201,7 +3182,7 @@ class ScanEngine:
             
             # Phase 2: Filter potential duplicates
             phase_num = 2
-            print(f"DEBUG: Phase 2 - Filtering potential duplicates")
+            logger.debug(f"DEBUG: Phase 2 - Filtering potential duplicates")
             # Reset progress bar to 0% for Phase 2 (each phase has its own progress bar)
             self.progress_callback(0.0)
             self.status_callback(f"{phase_num}/{total_phases} Scanning: Filtering potential duplicates...")
@@ -3246,10 +3227,10 @@ class ScanEngine:
                         potential_duplicates_by_size.extend(remaining_files)
             
             if exact_duplicate_count > 0:
-                print(f"DEBUG: Pre-filtered {exact_duplicate_count} files as exact duplicates (skipping hash calculation)")
-                print(f"DEBUG: Found {len(exact_duplicate_groups)} exact duplicate groups by size/name+timestamp")
+                logger.debug(f"DEBUG: Pre-filtered {exact_duplicate_count} files as exact duplicates (skipping hash calculation)")
+                logger.debug(f"DEBUG: Found {len(exact_duplicate_groups)} exact duplicate groups by size/name+timestamp")
             
-            print(f"DEBUG: Found {len(potential_duplicates_by_size)} potential duplicate files (need hash calculation)")
+            logger.debug(f"DEBUG: Found {len(potential_duplicates_by_size)} potential duplicate files (need hash calculation)")
             # Phase 2 complete: set progress to 100% (1.0) for this phase
             self.progress_callback(1.0)
             if not potential_duplicates_by_size:
@@ -3294,7 +3275,7 @@ class ScanEngine:
             
             files_to_full_hash = list(dict.fromkeys(files_to_full_hash))
             self.total_files = len(files_to_full_hash)
-            print(f"DEBUG: {self.total_files} files to hash")
+            logger.debug(f"DEBUG: {self.total_files} files to hash")
             
             if self.total_files == 0:
                 self.status_callback("No files to hash.")
@@ -3356,11 +3337,10 @@ class ScanEngine:
                         try:
                             file_hash = future.result()
                             if file_hash:
-                                with self.hash_lock:
-                                    if file_path not in hash_groups[file_hash]:
-                                        hash_groups[file_hash].append(file_path)
+                                if file_path not in hash_groups[file_hash]:
+                                    hash_groups[file_hash].append(file_path)
                         except Exception as e:
-                            print(f"Hash calculation error {file_path}: {e}")
+                            logger.debug(f"Hash calculation error {file_path}: {e}")
                             continue
                         
                         processed += 1
@@ -3419,7 +3399,7 @@ class ScanEngine:
                 phase_num = total_phases  # ORB verification is the last phase
                 self.progress_callback(0.0)
                 self.status_callback(f"{phase_num}/{total_phases} Scanning: Verifying duplicates with {self.opencv_verification_method.upper()}...")
-                print(f"DEBUG: Starting ORB verification phase for {len(duplicate_groups)} groups")
+                logger.debug(f"DEBUG: Starting ORB verification phase for {len(duplicate_groups)} groups")
                 
                 # Pre-filter: Separate files that can skip ORB verification
                 # IMPORTANT: Even if files are pre-filtered as duplicates (same size/name+timestamp),
@@ -3485,7 +3465,7 @@ class ScanEngine:
                             if len(name_timestamp_groups) == 1:
                                 skip_subgroups.append(size_files)
                                 basename, ts = list(name_timestamp_groups.keys())[0]
-                                print(f"DEBUG: Skipping ORB for subgroup with same size+name+timestamp: {len(size_files)} files, size={size}, name={basename}, timestamp={ts}")
+                                logger.debug(f"DEBUG: Skipping ORB for subgroup with same size+name+timestamp: {len(size_files)} files, size={size}, name={basename}, timestamp={ts}")
                             else:
                                 # Files with same size but different name/timestamp - need ORB verification
                                 need_orb_files.extend(size_files)
@@ -3497,7 +3477,7 @@ class ScanEngine:
                 
                 total_skip_subgroups = sum(len(subs) for subs in skip_orb_subgroups.values())
                 total_need_files = sum(len(files) for files in need_orb_files_by_hash.values())
-                print(f"DEBUG: Pre-filter results: {total_skip_subgroups} subgroups skip ORB, {len(need_orb_files_by_hash)} hash groups have {total_need_files} files needing ORB")
+                logger.debug(f"DEBUG: Pre-filter results: {total_skip_subgroups} subgroups skip ORB, {len(need_orb_files_by_hash)} hash groups have {total_need_files} files needing ORB")
                 
                 # Collect all file pairs that need verification
                 # OPTIMIZATION: Two-phase verification with delayed Phase 2 generation
@@ -3558,7 +3538,7 @@ class ScanEngine:
                         unique_phase1_pairs.append(pair)
                 
                 phase1_pairs = unique_phase1_pairs
-                print(f"DEBUG: Phase 1 verification pairs: {len(phase1_pairs)}")
+                logger.debug(f"DEBUG: Phase 1 verification pairs: {len(phase1_pairs)}")
                 
                 if len(phase1_pairs) > 0:
                     # Use union-find to regroup files based on ORB verification
@@ -3660,7 +3640,7 @@ class ScanEngine:
                             unique_phase2_pairs.append(pair)
                     
                     phase2_pairs = unique_phase2_pairs
-                    print(f"DEBUG: Phase 2 verification pairs: {len(phase2_pairs)} (only for unmatched files)")
+                    logger.debug(f"DEBUG: Phase 2 verification pairs: {len(phase2_pairs)} (only for unmatched files)")
                     
                     # Process Phase 2 pairs if any
                     if len(phase2_pairs) > 0:
@@ -3700,7 +3680,7 @@ class ScanEngine:
                                 last_update_time = time.time()
                     
                     total_pairs = len(phase1_pairs) + len(phase2_pairs)
-                    print(f"DEBUG: Total verification pairs: {total_pairs} (Phase 1: {len(phase1_pairs)}, Phase 2: {len(phase2_pairs)})")
+                    logger.debug(f"DEBUG: Total verification pairs: {total_pairs} (Phase 1: {len(phase1_pairs)}, Phase 2: {len(phase2_pairs)})")
                     
                     # Rebuild duplicate_groups from verified groups
                     new_duplicate_groups = {}
@@ -3736,7 +3716,7 @@ class ScanEngine:
                     duplicate_groups = new_duplicate_groups
                     duplicate_groups.update(skip_orb_groups_flat)  # Add groups that skipped ORB
                     self.progress_callback(1.0)
-                    print(f"DEBUG: ORB verification completed: {len(new_duplicate_groups)} verified groups + {len(skip_orb_groups_flat)} trusted groups = {len(duplicate_groups)} total groups")
+                    logger.debug(f"DEBUG: ORB verification completed: {len(new_duplicate_groups)} verified groups + {len(skip_orb_groups_flat)} trusted groups = {len(duplicate_groups)} total groups")
                 else:
                     # No pairs to verify, but we still have skip_orb_subgroups
                     # Convert skip_orb_subgroups to the format expected by duplicate_groups
@@ -3749,12 +3729,12 @@ class ScanEngine:
                     # duplicate_groups is already initialized earlier in the function
                     duplicate_groups.update(skip_orb_groups_flat)
                     self.progress_callback(1.0)
-                    print(f"DEBUG: ORB verification skipped: {len(skip_orb_groups_flat)} trusted groups (no verification needed)")
+                    logger.debug(f"DEBUG: ORB verification skipped: {len(skip_orb_groups_flat)} trusted groups (no verification needed)")
             
             # Merge pre-filtered exact duplicates (by size/name+timestamp) into final results
             if exact_duplicate_groups:
                 duplicate_groups.update(exact_duplicate_groups)
-                print(f"DEBUG: Added {len(exact_duplicate_groups)} pre-filtered exact duplicate groups to results")
+                logger.debug(f"DEBUG: Added {len(exact_duplicate_groups)} pre-filtered exact duplicate groups to results")
             
             # Merge RAW/JPEG pairs based on timestamp correlation
             if self.use_imagehash:
@@ -3762,7 +3742,7 @@ class ScanEngine:
                 duplicate_groups = self._merge_raw_jpeg_by_timestamp(duplicate_groups)
                 groups_after_merge = len(duplicate_groups)
                 if groups_before_merge != groups_after_merge:
-                    print(f"DEBUG: RAW/JPEG merge: {groups_before_merge} -> {groups_after_merge} groups ({groups_before_merge - groups_after_merge} merged)")
+                    logger.debug(f"DEBUG: RAW/JPEG merge: {groups_before_merge} -> {groups_after_merge} groups ({groups_before_merge - groups_after_merge} merged)")
             
             # Debug: Count groups by file type
             image_groups = 0
@@ -3791,27 +3771,27 @@ class ScanEngine:
                 md5_misses = self._md5_cache_misses
                 md5_puts = self._md5_cache_puts
             
-            print(f"DEBUG: Found {len(duplicate_groups)} duplicate groups")
-            print(f"DEBUG:   - Image groups: {image_groups}")
-            print(f"DEBUG:   - Video groups: {video_groups}")
-            print(f"DEBUG:   - Other groups: {other_groups}")
-            print(f"DEBUG:   - Total files in groups: {total_files_in_groups}")
-            print(f"DEBUG:   - use_imagehash={self.use_imagehash}, use_multi_hash={self.use_multi_hash}")
-            print(f"DEBUG: Cache stats - pHash: {phash_lookups} lookups, {phash_hits} hits, {phash_misses} misses, {phash_puts} puts")
+            logger.debug(f"DEBUG: Found {len(duplicate_groups)} duplicate groups")
+            logger.debug(f"DEBUG:   - Image groups: {image_groups}")
+            logger.debug(f"DEBUG:   - Video groups: {video_groups}")
+            logger.debug(f"DEBUG:   - Other groups: {other_groups}")
+            logger.debug(f"DEBUG:   - Total files in groups: {total_files_in_groups}")
+            logger.debug(f"DEBUG:   - use_imagehash={self.use_imagehash}, use_multi_hash={self.use_multi_hash}")
+            logger.debug(f"DEBUG: Cache stats - pHash: {phash_lookups} lookups, {phash_hits} hits, {phash_misses} misses, {phash_puts} puts")
             if phash_lookups > 0:
                 hit_rate = (phash_hits / phash_lookups) * 100
-                print(f"DEBUG: pHash cache hit rate: {hit_rate:.1f}%")
-            print(f"DEBUG: Cache stats - MD5: {md5_lookups} lookups, {md5_hits} hits, {md5_misses} misses, {md5_puts} puts")
-            print(f"DEBUG: Cache DB path: {self._phash_db_path}")
-            print(f"DEBUG: Hash mode - use_imagehash: {self.use_imagehash}, use_multi_hash: {self.use_multi_hash}")
+                logger.debug(f"DEBUG: pHash cache hit rate: {hit_rate:.1f}%")
+            logger.debug(f"DEBUG: Cache stats - MD5: {md5_lookups} lookups, {md5_hits} hits, {md5_misses} misses, {md5_puts} puts")
+            logger.debug(f"DEBUG: Cache DB path: {self._phash_db_path}")
+            logger.debug(f"DEBUG: Hash mode - use_imagehash: {self.use_imagehash}, use_multi_hash: {self.use_multi_hash}")
             
             self.file_groups_raw = duplicate_groups
-            print(f"DEBUG: Calling results_callback with {len(duplicate_groups)} groups")
+            logger.debug(f"DEBUG: Calling results_callback with {len(duplicate_groups)} groups")
             self.results_callback(duplicate_groups)
-            print(f"DEBUG: results_callback completed")
+            logger.debug(f"DEBUG: results_callback completed")
             
         except Exception as e:
-            print(f"Scan error: {e}")
+            logger.debug(f"Scan error: {e}")
             import traceback
             traceback.print_exc()
             self.results_callback({})

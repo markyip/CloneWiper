@@ -24,10 +24,13 @@ Version: 2.0
 """
 import sys
 import os
+import logging
 from typing import Dict, List, Optional, Tuple
 from collections import OrderedDict
 import time
 import threading
+
+logger = logging.getLogger(__name__)
 
 try:
     from PySide6.QtWidgets import (  # type: ignore[reportMissingImports]
@@ -52,6 +55,7 @@ except ImportError:
     print("Warning: PySide6 not found. Please install it with 'pip install PySide6'")
 
 from core.engine import ScanEngine, FileItem, Group
+from core.thumbnail_cache import PersistentThumbnailCache
 
 if not PYSIDE6_AVAILABLE:
     print("Qt UI requires PySide6. Please install it with: pip install PySide6")
@@ -294,11 +298,12 @@ class ThumbnailWorker(QRunnable):
         def __init__(self, parent=None):
             super().__init__(parent)
     
-    def __init__(self, file_path: str, max_width: int, page_token: float):
+    def __init__(self, file_path: str, max_width: int, page_token: float, cache: Optional[PersistentThumbnailCache] = None):
         super().__init__()
         self.file_path = file_path
         self.max_width = max_width
         self.page_token = page_token
+        self.cache = cache
         # Create signals object - must be created in main thread for proper signal/slot connection
         # The signals object will be moved to main thread in _request_thumbnail
         self.signals = ThumbnailWorker.Signals()
@@ -306,9 +311,42 @@ class ThumbnailWorker(QRunnable):
     def run(self):
         """Load thumbnail in background thread."""
         try:
-            print(f"DEBUG: ThumbnailWorker.run() called for {os.path.basename(self.file_path)}")
+            # logger.debug(f"DEBUG: ThumbnailWorker.run() called for {os.path.basename(self.file_path)}")
             ext = os.path.splitext(self.file_path)[1].lower()
             
+            # --- PERSISTENT CACHE CHECK ---
+            if self.cache:
+                try:
+                    st = os.stat(self.file_path)
+                    mtime = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+                    size = st.st_size
+                    
+                    cached_data = self.cache.get(self.file_path, mtime, size)
+                    if cached_data:
+                        # Cache hit!
+                        qimg = QImage.fromData(cached_data)
+                        if not qimg.isNull():
+                            pixmap = QPixmap.fromImage(qimg)
+                            aspect = 1.0
+                            if qimg.height() > 0:
+                                aspect = qimg.width() / qimg.height()
+                            
+                            self.signals.thumb_ready.emit(self.file_path, pixmap, aspect)
+                            
+                            # For metadata, we might still need to extract it if not cached, 
+                            # but for now let's skip metadata on cache hit to be super fast,
+                            # or we could cache metadata too. 
+                            # Re-extracting metadata is usually fast enough or can be done lazily.
+                            # For image dimensions, we interpret from the thumbnail but that might be 
+                            # smaller than original.
+                            # Ideally we store metadata in DB too.
+                            # For now, let's re-emit basic metadata or "Cached"
+                            # self.signals.meta_ready.emit(self.file_path, "") 
+                            return
+                except Exception as e:
+                    logger.debug("Cache read error: %s", e)
+            # -------------------------------
+
             # Image thumbnail (Standard formats)
             standard_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp'}
             raw_exts = {
@@ -346,13 +384,29 @@ class ThumbnailWorker(QRunnable):
                         pixmap = QPixmap.fromImage(qimg)
                         
                         self.signals.thumb_ready.emit(self.file_path, pixmap, aspect)
-                        print(f"DEBUG: ThumbnailWorker emitted thumb_ready for {os.path.basename(self.file_path)}")
+                        # logger.debug(f"DEBUG: ThumbnailWorker emitted thumb_ready for {os.path.basename(self.file_path)}")
+                        
+                        # Save to cache
+                        if self.cache:
+                            try:
+                                from PySide6.QtCore import QBuffer
+                                buf = QBuffer()
+                                buf.open(QBuffer.OpenModeFlag.ReadWrite)
+                                qimg.save(buf, "JPG", 85) # Save as slightly compressed JPEG
+                                data = buf.data().data() # Get bytes
+                                
+                                st = os.stat(self.file_path)
+                                mtime = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+                                size = st.st_size
+                                self.cache.put(self.file_path, mtime, size, width, height, data)
+                            except Exception as e:
+                                logger.debug("Failed to cache %s: %s", self.file_path, e)
                         
                         # Metadata
                         meta = f"{width}x{height}"
                         self.signals.meta_ready.emit(self.file_path, meta)
                 except Exception as e:
-                    print(f"DEBUG: ThumbnailWorker error for {os.path.basename(self.file_path)}: {e}")
+                    logger.debug(f"DEBUG: ThumbnailWorker error for {os.path.basename(self.file_path)}: {e}")
                     self.signals.error.emit(self.file_path, str(e))
             
             # RAW Image thumbnail (rawpy)
@@ -398,9 +452,24 @@ class ThumbnailWorker(QRunnable):
                         raw_h, raw_w = raw.sizes.height, raw.sizes.width
                         meta = f"{raw_w}x{raw_h} (RAW)"
                         self.signals.meta_ready.emit(self.file_path, meta)
+
+                        # Save to cache
+                        if self.cache:
+                            try:
+                                from PySide6.QtCore import QBuffer
+                                buf = QBuffer()
+                                buf.open(QBuffer.OpenModeFlag.ReadWrite)
+                                qimg.save(buf, "JPG", 85)
+                                data = buf.data().data()
+                                st = os.stat(self.file_path)
+                                mtime = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+                                size = st.st_size
+                                self.cache.put(self.file_path, mtime, size, raw_w, raw_h, data)
+                            except Exception:
+                                pass
                         
                 except Exception as e:
-                    print(f"DEBUG: ThumbnailWorker RAW error for {os.path.basename(self.file_path)}: {e}")
+                    logger.debug(f"DEBUG: ThumbnailWorker RAW error for {os.path.basename(self.file_path)}: {e}")
                     self.signals.error.emit(self.file_path, str(e))
             
             # Video thumbnail (OpenCV)
@@ -488,12 +557,12 @@ class ThumbnailWorker(QRunnable):
                             return
                         except ImportError as e:
                             pdfium_error = f"pypdfium2 not installed: {e}"
-                            print(f"DEBUG: pypdfium2 import failed: {e}")
+                            logger.debug(f"DEBUG: pypdfium2 import failed: {e}")
                         except Exception as e:
                             import traceback
                             pdfium_error = f"pypdfium2 error: {e}"
-                            print(f"DEBUG: pypdfium2 processing failed for {os.path.basename(self.file_path)}: {e}")
-                            print(f"DEBUG: Traceback: {traceback.format_exc()}")
+                            logger.debug(f"DEBUG: pypdfium2 processing failed for {os.path.basename(self.file_path)}: {e}")
+                            logger.debug(f"DEBUG: Traceback: {traceback.format_exc()}")
 
                     # DOCUMENT FALLBACK/PRIMARY: PyMuPDF (fitz)
                     try:
@@ -536,12 +605,12 @@ class ThumbnailWorker(QRunnable):
                         return
                     except ImportError as e:
                         pymupdf_error = f"PyMuPDF not installed: {e}"
-                        print(f"DEBUG: PyMuPDF import failed: {e}")
+                        logger.debug(f"DEBUG: PyMuPDF import failed: {e}")
                     except Exception as e:
                         import traceback
                         pymupdf_error = f"PyMuPDF error: {e}"
-                        print(f"DEBUG: PyMuPDF processing failed for {os.path.basename(self.file_path)}: {e}")
-                        print(f"DEBUG: Traceback: {traceback.format_exc()}")
+                        logger.debug(f"DEBUG: PyMuPDF processing failed for {os.path.basename(self.file_path)}: {e}")
+                        logger.debug(f"DEBUG: Traceback: {traceback.format_exc()}")
 
                     # EPUB SPECIAL: Deep Manifest Parsing (Last Resort if fitz fails)
                     epub_fallback_success = False
@@ -602,7 +671,7 @@ class ThumbnailWorker(QRunnable):
                                         return
                         except Exception as epub_error:
                             # If EPUB special parsing fails, log but don't fail yet
-                            print(f"DEBUG: EPUB fallback parsing failed for {os.path.basename(self.file_path)}: {epub_error}")
+                            logger.debug(f"DEBUG: EPUB fallback parsing failed for {os.path.basename(self.file_path)}: {epub_error}")
                             epub_fallback_success = False
                     
                     # If both PDF libraries failed, emit error with helpful message
@@ -611,7 +680,7 @@ class ThumbnailWorker(QRunnable):
                         system = platform.system()
                         install_cmd = "pip3" if system == "Darwin" else "pip"
                         error_msg = f"PDF thumbnail failed. Both libraries failed:\n  pypdfium2: {pdfium_error}\n  PyMuPDF: {pymupdf_error}\n\nInstall one of them:\n  {install_cmd} install pypdfium2\n  or\n  {install_cmd} install PyMuPDF"
-                        print(f"DEBUG: PDF thumbnail error for {os.path.basename(self.file_path)}: {error_msg}")
+                        logger.debug(f"DEBUG: PDF thumbnail error for {os.path.basename(self.file_path)}: {error_msg}")
                         self.signals.error.emit(self.file_path, error_msg)
                     elif ext == '.epub' and pymupdf_error and not epub_fallback_success:
                         # EPUB: Only show error if both PyMuPDF and fallback parsing failed
@@ -619,7 +688,7 @@ class ThumbnailWorker(QRunnable):
                         system = platform.system()
                         install_cmd = "pip3" if system == "Darwin" else "pip"
                         error_msg = f"EPUB thumbnail failed.\n\nTo fix this, install PyMuPDF:\n  {install_cmd} install PyMuPDF\n\nError details: {pymupdf_error}\n\nNote: Some EPUB files may work without PyMuPDF if they contain cover images in the correct format."
-                        print(f"DEBUG: EPUB thumbnail error for {os.path.basename(self.file_path)}: {error_msg}")
+                        logger.debug(f"DEBUG: EPUB thumbnail error for {os.path.basename(self.file_path)}: {error_msg}")
                         self.signals.error.emit(self.file_path, error_msg)
                     elif ext in {'.mobi', '.azw3'} and pymupdf_error:
                         # MOBI/AZW3: Require PyMuPDF (no fallback)
@@ -627,14 +696,14 @@ class ThumbnailWorker(QRunnable):
                         system = platform.system()
                         install_cmd = "pip3" if system == "Darwin" else "pip"
                         error_msg = f"Ebook thumbnail failed. Install PyMuPDF:\n  {install_cmd} install PyMuPDF\n\nError: {pymupdf_error}"
-                        print(f"DEBUG: Ebook thumbnail error for {os.path.basename(self.file_path)}: {error_msg}")
+                        logger.debug(f"DEBUG: Ebook thumbnail error for {os.path.basename(self.file_path)}: {error_msg}")
                         self.signals.error.emit(self.file_path, error_msg)
 
                 except Exception as e:
                     import traceback
                     error_msg = f"Doc error: {e}"
-                    print(f"DEBUG: PDF/EPUB thumbnail error for {os.path.basename(self.file_path)}: {error_msg}")
-                    print(traceback.format_exc())
+                    logger.debug(f"DEBUG: PDF/EPUB thumbnail error for {os.path.basename(self.file_path)}: {error_msg}")
+                    logger.debug("%s", traceback.format_exc())
                     self.signals.error.emit(self.file_path, error_msg)
             
             # Audio thumbnail (Album Art via Mutagen)
@@ -703,7 +772,7 @@ class ThumbnailWorker(QRunnable):
                             pixmap = QPixmap.fromImage(qimg)
                             self.signals.thumb_ready.emit(self.file_path, pixmap, aspect)
                         except Exception as img_error:
-                            print(f"DEBUG: Failed to process album art image for {os.path.basename(self.file_path)}: {img_error}")
+                            logger.debug(f"DEBUG: Failed to process album art image for {os.path.basename(self.file_path)}: {img_error}")
                     
                     # Metadata (Artist - Album, Duration)
                     try:
@@ -751,15 +820,13 @@ class ThumbnailWorker(QRunnable):
                                 if album_tag:
                                     album = str(album_tag[0]) if isinstance(album_tag, list) else str(album_tag)
                         except Exception as tag_error:
-                            print(f"DEBUG: Failed to extract tags for {os.path.basename(self.file_path)}: {tag_error}")
+                            logger.debug(f"DEBUG: Failed to extract tags for {os.path.basename(self.file_path)}: {tag_error}")
                     
                     meta = f"{artist} - {album} • {dur_str}"
                     self.signals.meta_ready.emit(self.file_path, meta)
                     
                 except Exception as e:
-                    print(f"DEBUG: Audio thumbnail error for {os.path.basename(self.file_path)}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    logger.debug(f"DEBUG: Audio thumbnail error for {os.path.basename(self.file_path)}: {e}", exc_info=True)
                     self.signals.error.emit(self.file_path, f"Audio error: {e}")
         
         except Exception as e:
@@ -1882,6 +1949,9 @@ class CloneWiperApp(QMainWindow):
         # Initialize file_groups to track scan state
         self.file_groups = None
         self.file_groups_raw = None
+
+        # Persistent Thumbnail Cache
+        self.persistent_cache = PersistentThumbnailCache()
         self._scroll_anchor: Optional[Tuple[str, int]] = None  # (group_id, scroll_value) for refresh restore
         
         # Thumbnail cache
@@ -2799,30 +2869,28 @@ class CloneWiperApp(QMainWindow):
         # Run scan in background thread
         def scan_thread():
             try:
-                print(f"DEBUG: Starting scan thread for paths: {valid_paths}")
-                print(f"DEBUG: use_imagehash={use_imagehash}")
+                logger.debug(f"DEBUG: Starting scan thread for paths: {valid_paths}")
+                logger.debug(f"DEBUG: use_imagehash={use_imagehash}")
                 # Ensure callbacks are set
-                print(f"DEBUG: status_callback={self.engine.status_callback}")
-                print(f"DEBUG: progress_callback={self.engine.progress_callback}")
-                print(f"DEBUG: results_callback={self.engine.results_callback}")
+                logger.debug(f"DEBUG: status_callback={self.engine.status_callback}")
+                logger.debug(f"DEBUG: progress_callback={self.engine.progress_callback}")
+                logger.debug(f"DEBUG: results_callback={self.engine.results_callback}")
                 
                 # Test callback immediately
                 self.engine.status_callback("Scan thread started...")
                 self.engine.progress_callback(0.01)
                 
                 self.engine.scan_duplicate_files(valid_paths, use_imagehash, use_multi_hash, use_orb_verification)
-                print("DEBUG: Scan completed")
+                logger.debug("DEBUG: Scan completed")
             except Exception as e:
-                import traceback
-                print(f"DEBUG: Scan thread exception: {e}")
-                traceback.print_exc()
+                logger.debug("Scan thread exception: %s", e, exc_info=True)
                 # Report error via status callback
                 self.engine.status_callback(f"Scan error: {e}")
                 self.engine.results_callback({})
         
         self._scan_thread = threading.Thread(target=scan_thread, daemon=True)
         self._scan_thread.start()
-        print(f"DEBUG: Scan thread started, thread={self._scan_thread}")
+        logger.debug(f"DEBUG: Scan thread started, thread={self._scan_thread}")
     
     def _on_progress(self, value: float):
         """Progress callback from engine (thread-safe via Signal)."""
@@ -2872,7 +2940,7 @@ class CloneWiperApp(QMainWindow):
     
     def _cancel_scanning(self):
         """Cancel the current scanning process."""
-        print("DEBUG: Cancel scanning requested")
+        logger.debug("DEBUG: Cancel scanning requested")
         # Set cancellation flag in engine
         self.engine.scan_cancelled = True
         
@@ -2895,7 +2963,7 @@ class CloneWiperApp(QMainWindow):
     
     def _display_results(self, duplicate_groups: Dict[str, List[str]]):
         """Display scan results."""
-        print(f"DEBUG: _display_results called with {len(duplicate_groups)} groups")
+        logger.debug(f"DEBUG: _display_results called with {len(duplicate_groups)} groups")
         
         # Hide center progress container and show results
         self.center_progress_container.setVisible(False)
@@ -2912,28 +2980,28 @@ class CloneWiperApp(QMainWindow):
         
         # Apply current sorting
         current_sort = self.sort_combo.currentText()
-        print(f"DEBUG: Applying current sorting: {current_sort}")
+        logger.debug(f"DEBUG: Applying current sorting: {current_sort}")
         self.file_groups = self.engine.apply_sorting(
             duplicate_groups,
             current_sort,
             group_by_type=False
         )
         
-        print(f"DEBUG: Enabling scan button, hiding progress bar")
+        logger.debug(f"DEBUG: Enabling scan button, hiding progress bar")
         self.center_progress_bar.setValue(0)
         
         # Show status label after scan completes
         self.status_label.setVisible(True)
         
         if not duplicate_groups:
-            print(f"DEBUG: No duplicate groups, setting status")
+            logger.debug(f"DEBUG: No duplicate groups, setting status")
             self.status_label.setText("No duplicate files found.")
             # Hide image-specific buttons when no results
             self.keep_best_btn.setVisible(False)
             self.keep_raw_btn.setVisible(False)
             return
         
-        print(f"DEBUG: Setting status and rendering page")
+        logger.debug(f"DEBUG: Setting status and rendering page")
         self.status_label.setText(f"Found {len(duplicate_groups)} duplicate groups")
         
         # Update button visibility based on applicable files
@@ -2942,17 +3010,15 @@ class CloneWiperApp(QMainWindow):
         try:
             self._render_page(0)
         except Exception as e:
-            print(f"DEBUG: Error in _render_page: {e}")
-            import traceback
-            traceback.print_exc()
-        print(f"DEBUG: _display_results completed")
+            logger.debug("Error in _render_page: %s", e, exc_info=True)
+        logger.debug(f"DEBUG: _display_results completed")
     
     def _render_page(self, page_index: int):
         """Render a page of groups."""
-        print(f"DEBUG: _render_page called with page_index={page_index}, file_groups={len(self.file_groups) if self.file_groups else 0}")
+        logger.debug(f"DEBUG: _render_page called with page_index={page_index}, file_groups={len(self.file_groups) if self.file_groups else 0}")
         # Clear existing group widgets (but keep center_progress_container and stretches)
         self._group_widgets.clear()
-        print(f"DEBUG: Clearing existing group widgets")
+        logger.debug(f"DEBUG: Clearing existing group widgets")
         # Remove all widgets except center_progress_container and stretches
         items_to_remove = []
         for i in range(self.results_layout.count()):
@@ -2966,12 +3032,12 @@ class CloneWiperApp(QMainWindow):
                 item.widget().deleteLater()
         
         if not self.file_groups:
-            print(f"DEBUG: No file_groups to render")
+            logger.debug(f"DEBUG: No file_groups to render")
             return
         
         all_groups = list(self.file_groups.items())
         total = len(all_groups)
-        print(f"DEBUG: Total groups: {total}")
+        logger.debug(f"DEBUG: Total groups: {total}")
         max_page = (total - 1) // self.groups_per_page if total else 0
         page_index = max(0, min(page_index, max_page))
         self.current_page = page_index
@@ -2979,7 +3045,7 @@ class CloneWiperApp(QMainWindow):
         start = page_index * self.groups_per_page
         end = min(total, start + self.groups_per_page)
         page_groups = all_groups[start:end]
-        print(f"DEBUG: Rendering groups {start} to {end} ({len(page_groups)} groups)")
+        logger.debug(f"DEBUG: Rendering groups {start} to {end} ({len(page_groups)} groups)")
         
         # Update pager
         total_pages = max_page + 1 if total > 0 else 1
@@ -3034,9 +3100,7 @@ class CloneWiperApp(QMainWindow):
                 for file_path in files[:12]:  # Limit preview
                     self._request_thumbnail(file_path, group_widget)
             except Exception as e:
-                print(f"DEBUG: Error creating GroupWidget for {group_id}: {e}")
-                import traceback
-                traceback.print_exc()
+                logger.debug("Error creating GroupWidget for %s: %s", group_id, e, exc_info=True)
         
         # Reset scroll to top
         QTimer.singleShot(50, lambda: self.scroll_area.verticalScrollBar().setValue(0))
@@ -3046,9 +3110,9 @@ class CloneWiperApp(QMainWindow):
             status_text = f"Loading thumbnails: 0/{self._thumbnail_total}"
         else:
             status_text = f"Groups {start+1}-{end} / {total}  (Page {page_index+1}/{total_pages})"
-        print(f"DEBUG: Setting status to: {status_text}")
+        logger.debug(f"DEBUG: Setting status to: {status_text}")
         self.status_label.setText(status_text)
-        print(f"DEBUG: _render_page completed, created {len(self._group_widgets)} group widgets")
+        logger.debug(f"DEBUG: _render_page completed, created {len(self._group_widgets)} group widgets")
         
         # Force update
         self.results_container.update()
@@ -3079,7 +3143,7 @@ class CloneWiperApp(QMainWindow):
                 self.status_label.setText(f"Loading thumbnails: {started_count}/{self._thumbnail_total}")
         
         # Submit worker
-        worker = ThumbnailWorker(file_path, 300, self._thumb_page_token)
+        worker = ThumbnailWorker(file_path, 300, self._thumb_page_token, cache=self.persistent_cache)
         
         # Store signals to prevent GC
         if not hasattr(self, '_active_signals'):
@@ -3096,7 +3160,7 @@ class CloneWiperApp(QMainWindow):
     
     def _on_thumb_ready(self, path: str, pixmap: QPixmap, aspect: float, group_widget: Optional[GroupWidget] = None):
         """Handle thumbnail ready signal."""
-        print(f"DEBUG: _on_thumb_ready called for {os.path.basename(path)}, aspect={aspect:.2f}, pixmap size={pixmap.size().width()}x{pixmap.size().height()}, group_widget={group_widget is not None}")
+        logger.debug(f"DEBUG: _on_thumb_ready called for {os.path.basename(path)}, aspect={aspect:.2f}, pixmap size={pixmap.size().width()}x{pixmap.size().height()}, group_widget={group_widget is not None}")
         
         # Update thumbnail loading progress for PDF/EPUB/MOBI/AZW3 files
         ext = os.path.splitext(path)[1].lower()
@@ -3127,7 +3191,7 @@ class CloneWiperApp(QMainWindow):
             current_time = time.monotonic()
             time_diff = abs(current_time - self._thumb_page_token)
             if time_diff > 60.0:
-                print(f"DEBUG: Thumbnail for {os.path.basename(path)} is stale (diff={time_diff:.2f}s), skipping")
+                logger.debug(f"DEBUG: Thumbnail for {os.path.basename(path)} is stale (diff={time_diff:.2f}s), skipping")
                 return
         
         # Cache
@@ -3144,7 +3208,7 @@ class CloneWiperApp(QMainWindow):
             if group_widget in self._group_widgets.values():
                 try:
                     group_widget.set_thumbnail(path, pixmap, aspect)
-                    print(f"DEBUG: Updated thumbnail for {os.path.basename(path)} in provided group widget")
+                    logger.debug(f"DEBUG: Updated thumbnail for {os.path.basename(path)} in provided group widget")
                 except RuntimeError:
                     # Widget was deleted, ignore
                     pass
@@ -3154,7 +3218,7 @@ class CloneWiperApp(QMainWindow):
                 if path in widget.files:
                     try:
                         widget.set_thumbnail(path, pixmap, aspect)
-                        print(f"DEBUG: Updated thumbnail for {os.path.basename(path)} in found group widget")
+                        logger.debug(f"DEBUG: Updated thumbnail for {os.path.basename(path)} in found group widget")
                         break
                     except RuntimeError:
                         # Widget was deleted, continue to next
@@ -3162,7 +3226,7 @@ class CloneWiperApp(QMainWindow):
     
     def _on_meta_ready(self, path: str, meta: str, group_widget: Optional[GroupWidget] = None):
         """Handle metadata ready signal."""
-        print(f"DEBUG: _on_meta_ready called for {os.path.basename(path)}, meta={meta}, group_widget={group_widget is not None}")
+        logger.debug(f"DEBUG: _on_meta_ready called for {os.path.basename(path)}, meta={meta}, group_widget={group_widget is not None}")
         self.metadata_cache[path] = meta
         if len(self.metadata_cache) > self.metadata_cache_max:
             oldest = next(iter(self.metadata_cache))
@@ -3462,7 +3526,7 @@ class CloneWiperApp(QMainWindow):
                         send2trash.send2trash(path)
                         deleted_count += 1
                     except Exception as e:
-                        print(f"Failed to delete {path}: {e}")
+                        logger.warning("Failed to delete %s: %s", path, e)
                         failed_count += 1
                 
                 # Remove deleted files from file_groups and file_groups_raw
@@ -3541,6 +3605,9 @@ class CloneWiperApp(QMainWindow):
 
 def main():
     """Main entry point."""
+    _dbg = os.environ.get("CLONEWIPER_DEBUG", "").strip().lower()
+    if _dbg in ("1", "true", "yes", "on"):
+        logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(name)s: %(message)s")
     if not PYSIDE6_AVAILABLE:
         print("PySide6 not available. Please install: pip install PySide6")
         return 1
