@@ -1,27 +1,22 @@
-# Python
+# =============================================================================
+# CloneWiper — ignore rules
+# =============================================================================
+
+# --- Python ---
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
 *.egg-info/
-.installed.cfg
+.eggs/
 *.egg
+.installed.cfg
 MANIFEST
+pip-wheel-metadata/
+share/python-wheels/
 
-# PyInstaller
-*.manifest
-*.spec
-*.app/
-*.dmg
-*.exe
-*.pkg
-warn-*.txt
-*.toc
-build/
-dist/
-
-# Virtual Environment
+# --- Virtual environments ---
 venv/
 env/
 ENV/
@@ -29,36 +24,33 @@ env.bak/
 venv.bak/
 .venv/
 
-# IDE
+# --- PyInstaller / frozen builds ---
+build/
+dist/
+*.spec
+*.manifest
+*.app/
+*.dmg
+*.pkg
+warn-*.txt
+*.toc
+
+# Built artifacts (do not commit binaries)
+*.exe
+
+# --- IDE & editors ---
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.DS_Store
 *.sublime-project
 *.sublime-workspace
 .project
 .pydevproject
 .settings/
 
-# Application specific
-*.db
-*.sqlite
-*.sqlite3
-*.log
-*.cache
-cache/
-Cache/
-
-# CloneWiper specific cache files
-*.phash.db
-*.phash_cache.db
-*.md5_cache.db
-phash_cache.sqlite3
-.md5_cache.db
-
-# OS
+# --- OS junk ---
 .DS_Store
 .DS_Store?
 ._*
@@ -69,80 +61,78 @@ Thumbs.db
 desktop.ini
 $RECYCLE.BIN/
 
-# Temporary files
-*.tmp
-*.temp
-temp_icon.iconset/
-*.bak
-*.backup
-*.old
+# --- CloneWiper runtime data (local caches / DBs) ---
+# *.db covers thumbnails.db, phash/md5 caches, and local test DBs
+*.db
+*.sqlite
+*.sqlite3
+cache/
+Cache/
+*.log
+*.cache
 
-# Icon resources (keep source files, ignore generated)
-icons/*.iconset/
-!icons/README.md
-
-# Testing
+# --- Testing & coverage ---
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
 .tox/
 .hypothesis/
 *.cover
+coverage.xml
+.ruff_cache/
 
-# Documentation
-docs/_build/
-site/
-
-# Troubleshooting guides (macOS specific - optional, can be kept for reference)
-# macOS_PDF_TROUBLESHOOTING.md  # Keep this if users run from source on macOS
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# pyenv
-.python-version
-
-# pipenv
-Pipfile.lock
-
-# PEP 582
-__pypackages__/
-
-# Celery
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath
-*.sage.py
-
-# Environments
-.env
-
-# mypy
+# --- Type checkers / linters ---
 .mypy_cache/
 .dmypy.json
 dmypy.json
-
-# Pyre
 .pyre/
-
-# pytype
 .pytype/
 
-# Cython
-*.c
-*.html
+# --- Documentation builds ---
+docs/_build/
+site/
 
-# Distribution / packaging
+# --- Jupyter ---
+.ipynb_checkpoints
+
+# --- Packaging / legacy layout ---
 develop-eggs/
 downloads/
 eggs/
-.eggs/
 lib/
 lib64/
 parts/
 sdist/
 var/
 wheels/
-pip-wheel-metadata/
-share/python-wheels/
+
+# --- Environment & secrets ---
+.env
+.env.*
+!.env.example
+
+# --- pyenv / PEP 582 ---
+.python-version
+__pypackages__/
+
+# --- Celery (unused; harmless) ---
+celerybeat-schedule
+celerybeat.pid
+
+# --- SageMath ---
+*.sage.py
+
+# --- Cython generated (narrow; do not use blanket *.html) ---
+*.c
+
+# --- Temporary files ---
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+
+# --- Icons: generated iconset only ---
+icons/*.iconset/
+!icons/README.md

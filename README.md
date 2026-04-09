@@ -1,4 +1,5 @@
 # CloneWiper
+[![Version](https://img.shields.io/badge/version-1.1-blue.svg)](https://github.com/markyip/CloneWiper/releases)
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
@@ -24,7 +25,8 @@ CloneWiper is a high-performance, modern duplicate file detection tool built wit
   - Asynchronous processing with multi-threaded file scanning
   - **Fast Scanning**: Uses `os.scandir` for efficient file system enumeration (up to 20x faster than traditional scanning)
   - Dynamic CPU optimization for hybrid architectures (P-cores/E-cores detection)
-  - Adaptive I/O strategy (preloads small files, chunks large files)
+  - Adaptive I/O strategy (preloads small files for MD5, chunks large files)
+  - Similarity grouping tuned for throughput (LSH-style candidate search, pre-parsed perceptual hashes, parallel pair comparison)
   - Batch cache writes to reduce database lock contention
 - **Persistent Caching**: 
   - **Hash Cache**: SQLite-backed cache (p-hash and MD5) for fast re-scans
@@ -80,7 +82,7 @@ CloneWiper is a high-performance, modern duplicate file detection tool built wit
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/CloneWiper.git
+   git clone https://github.com/markyip/CloneWiper.git
    cd CloneWiper
    ```
 
@@ -115,6 +117,17 @@ launch.bat
 # Or directly
 python main.py
 ```
+
+### Verbose logging (optional)
+
+By default the app stays quiet on the console. To enable detailed engine and UI debug logs:
+
+```bash
+set CLONEWIPER_DEBUG=1
+python main.py
+```
+
+(On PowerShell: `$env:CLONEWIPER_DEBUG=1` then `python main.py`.)
 
 ### macOS (Source Code Only)
 **Note**: macOS executable build is currently not supported. You can run from source code:
@@ -170,7 +183,9 @@ CloneWiper offers three hash modes for different use cases:
    - Build an optimized executable with all features
    - Exclude unnecessary modules to minimize file size
    
-   **Note**: If your executable is larger than expected (>300MB), consider creating a clean virtual environment with only required dependencies before building.
+   **Notes**:
+   - **Python 3.12+**: The script must **not** exclude `distutils` (PyInstaller 6’s `distutils` hook conflicts with `--exclude-module=distutils`). The provided `build_windows.bat` follows this.
+   - If your executable is larger than expected (>300MB), create a clean virtual environment with only the dependencies you need before building.
 
    Or manually:
    ```bash
@@ -189,19 +204,25 @@ CloneWiper offers three hash modes for different use cases:
 CloneWiper/
 ├── core/
 │   ├── __init__.py
-│   └── engine.py          # Core scanning and hashing engine
+│   ├── engine.py           # Core scanning and hashing engine
+│   └── thumbnail_cache.py  # Persistent SQLite thumbnail cache
 ├── icons/
-│   └── README.md          # Icon resources documentation
+│   └── README.md           # Icon resources documentation
 ├── main.py                 # Application entry point
-├── qt_app.py              # PySide6 UI implementation
-├── requirements.txt       # Python dependencies
-├── favicon.ico           # Application icon (Windows)
-├── launch.bat            # Windows launch script
-├── build_windows.bat     # Windows build script
-├── BUILD.md              # Build instructions
-├── README.md             # This file
-└── LICENSE               # License file
+├── qt_app.py               # PySide6 UI implementation
+├── verify_thumbnail_cache.py  # Optional utility to inspect thumbnail cache
+├── requirements.txt        # Python dependencies
+├── favicon.ico             # Application icon (Windows)
+├── launch.bat              # Windows launch script
+├── build_windows.bat       # Windows PyInstaller build script
+├── RELEASE_NOTES_v1.1.md   # Release notes for v1.1
+├── README.md               # This file
+└── LICENSE                 # License file
 ```
+
+## 📦 Releases
+
+See [RELEASE_NOTES_v1.1.md](RELEASE_NOTES_v1.1.md) for **v1.1** changes. Older tags and notes live on the [GitHub Releases](https://github.com/markyip/CloneWiper/releases) page.
 
 ##  Development
 
