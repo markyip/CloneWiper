@@ -77,6 +77,7 @@ echo.
 echo Building executable (optimized for size)...
 echo This may take several minutes...
 echo.
+REM Do not add --exclude-module=distutils: PyInstaller hook-distutils conflicts with ExcludedModule on Python 3.12+.
 
 pyinstaller --onefile ^
     --windowed ^
@@ -153,7 +154,6 @@ pyinstaller --onefile ^
     --exclude-module=tkinter ^
     --exclude-module=unittest ^
     --exclude-module=test ^
-    --exclude-module=distutils ^
     --exclude-module=setuptools ^
     --exclude-module=pkg_resources ^
     --exclude-module=email ^
