@@ -197,7 +197,7 @@ class ScanEngine:
         # Batch cache write queue to reduce lock contention
         self._cache_write_queue = []
         self._cache_write_lock = threading.Lock()
-        self._cache_write_batch_size = 50  # Batch size for cache writes
+        self._cache_write_batch_size = 200  # Batch size for SQLite cache writes
         self._cache_write_timer = None
         
         # Batch I/O optimization: Pre-read file data to memory
@@ -548,6 +548,7 @@ class ScanEngine:
     
     def _close_phash_db(self):
         try:
+            self._flush_cache_writes()
             with self._phash_db_lock:
                 if self._phash_db is not None:
                     try:
@@ -557,6 +558,74 @@ class ScanEngine:
                     self._phash_db = None
         except Exception:
             pass
+
+    def _enqueue_cache_write(self, item: Tuple):
+        """Queue cache writes and flush them in batches to reduce SQLite commits."""
+        should_flush = False
+        with self._cache_write_lock:
+            self._cache_write_queue.append(item)
+            should_flush = len(self._cache_write_queue) >= self._cache_write_batch_size
+        if should_flush:
+            self._flush_cache_writes()
+
+    def _flush_cache_writes(self):
+        """Flush pending pHash/MD5 cache writes in one SQLite transaction."""
+        with self._cache_write_lock:
+            if not self._cache_write_queue:
+                return
+            batch = self._cache_write_queue
+            self._cache_write_queue = []
+
+        self._ensure_phash_db()
+        if self._phash_db is None:
+            return
+
+        phash_rows = []
+        md5_rows = []
+        for item in batch:
+            try:
+                kind = item[0]
+                if kind == "phash":
+                    phash_rows.append(item[1:])
+                elif kind == "md5":
+                    md5_rows.append(item[1:])
+            except Exception:
+                continue
+
+        with self._phash_db_lock:
+            try:
+                if phash_rows:
+                    self._phash_db.executemany(
+                        """
+                        INSERT INTO phash_cache(path, size, mtime_ns, algo, hash, updated)
+                        VALUES(?,?,?,?,?,?)
+                        ON CONFLICT(path, algo) DO UPDATE SET
+                          size=excluded.size,
+                          mtime_ns=excluded.mtime_ns,
+                          hash=excluded.hash,
+                          updated=excluded.updated
+                        """,
+                        phash_rows,
+                    )
+                if md5_rows:
+                    self._phash_db.executemany(
+                        """
+                        INSERT INTO md5_cache(path, size, mtime_ns, hash, updated)
+                        VALUES(?,?,?,?,?)
+                        ON CONFLICT(path) DO UPDATE SET
+                          size=excluded.size,
+                          mtime_ns=excluded.mtime_ns,
+                          hash=excluded.hash,
+                          updated=excluded.updated
+                        """,
+                        md5_rows,
+                    )
+                self._phash_db.commit()
+            except Exception:
+                try:
+                    self._phash_db.rollback()
+                except Exception:
+                    pass
     
     def _phash_cache_get(self, file_path: str, size: int, mtime_ns: int, algo: str) -> Optional[str]:
         """Return cached hash string or None."""
@@ -609,31 +678,12 @@ class ScanEngine:
     def _phash_cache_put(self, file_path: str, size: int, mtime_ns: int, algo: str, hash_str: str):
         if not self.phash_cache_enabled:
             return
-        self._ensure_phash_db()
-        if self._phash_db is None:
-            return
         try:
             p = os.path.abspath(file_path)
         except Exception:
             p = file_path
         now = int(time.time())
-        with self._phash_db_lock:
-            try:
-                self._phash_db.execute(
-                    """
-                    INSERT INTO phash_cache(path, size, mtime_ns, algo, hash, updated)
-                    VALUES(?,?,?,?,?,?)
-                    ON CONFLICT(path, algo) DO UPDATE SET
-                      size=excluded.size,
-                      mtime_ns=excluded.mtime_ns,
-                      hash=excluded.hash,
-                      updated=excluded.updated
-                    """,
-                    (p, int(size), int(mtime_ns), str(algo), str(hash_str), now),
-                )
-                self._phash_db.commit()
-            except Exception:
-                pass
+        self._enqueue_cache_write(("phash", p, int(size), int(mtime_ns), str(algo), str(hash_str), now))
     
     def _md5_cache_get(self, file_path: str, size: int, mtime_ns: int) -> Optional[str]:
         """Return cached MD5 string or None."""
@@ -666,31 +716,12 @@ class ScanEngine:
     def _md5_cache_put(self, file_path: str, size: int, mtime_ns: int, hash_str: str):
         if not self.md5_cache_enabled:
             return
-        self._ensure_phash_db()
-        if self._phash_db is None:
-            return
         try:
             p = os.path.abspath(file_path)
         except Exception:
             p = file_path
         now = int(time.time())
-        with self._phash_db_lock:
-            try:
-                self._phash_db.execute(
-                    """
-                    INSERT INTO md5_cache(path, size, mtime_ns, hash, updated)
-                    VALUES(?,?,?,?,?)
-                    ON CONFLICT(path) DO UPDATE SET
-                      size=excluded.size,
-                      mtime_ns=excluded.mtime_ns,
-                      hash=excluded.hash,
-                      updated=excluded.updated
-                    """,
-                    (p, int(size), int(mtime_ns), str(hash_str), now),
-                )
-                self._phash_db.commit()
-            except Exception:
-                pass
+        self._enqueue_cache_write(("md5", p, int(size), int(mtime_ns), str(hash_str), now))
     
     def is_image_file(self, file_path: str) -> bool:
         return os.path.splitext(file_path.lower())[1] in self.IMAGE_EXTENSIONS
@@ -1885,22 +1916,44 @@ class ScanEngine:
             
             logger.debug(f"DEBUG: LSH created {len(lsh_buckets)} buckets")
             candidate_pairs = set()
+            max_bucket_pair_items = 256
+            large_bucket_window = 64
+
+            def iter_bucket_pairs(bucket_items):
+                """Yield deterministic candidate pairs, pruning very large LSH buckets."""
+                item_count = len(bucket_items)
+                if item_count <= max_bucket_pair_items:
+                    for i, item1 in enumerate(bucket_items):
+                        for item2 in bucket_items[i + 1:]:
+                            yield item1, item2
+                    return
+
+                # Dense buckets can degrade into O(n^2). Sort by hash string and only
+                # compare nearby entries; the pHash/avg-hash filters below still decide
+                # whether the pair is close enough to keep.
+                sorted_items = sorted(bucket_items, key=lambda item: item[0])
+                for i, item1 in enumerate(sorted_items):
+                    end = min(item_count, i + large_bucket_window + 1)
+                    for item2 in sorted_items[i + 1:end]:
+                        yield item1, item2
+
             for bucket_key, bucket_items in lsh_buckets.items():
                 if len(bucket_items) < 2:
                     continue
-                for i, (hash1, files1, h_avg1, h_phash1) in enumerate(bucket_items):
-                    for j in range(i + 1, len(bucket_items)):
-                        hash2, files2, h_avg2, h_phash2 = bucket_items[j]
-                        if hash1 != hash2:
-                            try:
-                                phash_dist = h_phash1 - h_phash2 if h_phash1 and h_phash2 else 999
-                                if phash_dist <= HAMMING_THRESHOLD * 2:
-                                    if hash1 < hash2:
-                                        candidate_pairs.add((hash1, hash2))
-                                    else:
-                                        candidate_pairs.add((hash2, hash1))
-                            except Exception:
-                                pass
+                for (hash1, files1, h_avg1, h_phash1), (hash2, files2, h_avg2, h_phash2) in iter_bucket_pairs(bucket_items):
+                    if hash1 == hash2:
+                        continue
+                    try:
+                        if h_avg1 and h_avg2 and (h_avg1 - h_avg2) > HAMMING_THRESHOLD * 2:
+                            continue
+                        phash_dist = h_phash1 - h_phash2 if h_phash1 and h_phash2 else 999
+                        if phash_dist <= HAMMING_THRESHOLD * 2:
+                            if hash1 < hash2:
+                                candidate_pairs.add((hash1, hash2))
+                            else:
+                                candidate_pairs.add((hash2, hash1))
+                    except Exception:
+                        pass
             
             # Phase 2: Detailed comparison only for candidate pairs
             # Use parallel processing for detailed comparison
@@ -1974,7 +2027,7 @@ class ScanEngine:
             if candidate_pairs:
                 # Limit candidate pairs to avoid excessive processing
                 MAX_CANDIDATE_PAIRS = min(50000, len(candidate_pairs))  # Cap at 50K pairs
-                candidate_list = list(candidate_pairs)[:MAX_CANDIDATE_PAIRS]
+                candidate_list = sorted(candidate_pairs)[:MAX_CANDIDATE_PAIRS]
                 logger.debug(f"DEBUG: Found {len(candidate_pairs)} candidate pairs, processing {len(candidate_list)} pairs")
                 if self.opencv_verification_method:
                     logger.debug(f"DEBUG: ORB verification enabled, will verify {len(candidate_list)} candidate pairs")
@@ -3317,61 +3370,80 @@ class ScanEngine:
                     next_batch = files_to_full_hash[prefetch_batch_size:prefetch_batch_size * 2]
                     self._prefetch_files_batch(next_batch, max_workers=min(8, self.hash_workers))
                 
-                # Use hash_workers (more threads) for I/O-bound hash calculation
+                # Keep only a bounded number of hash tasks in flight. This avoids creating
+                # tens of thousands of Future objects and prevents overwhelming disk I/O.
+                max_inflight = max(self.hash_workers * 6, 64)
                 with ThreadPoolExecutor(max_workers=self.hash_workers) as executor:
-                    future_to_file = {
-                        executor.submit(self.calculate_file_hash, file_path): file_path
-                        for file_path in files_to_full_hash
-                    }
-                    
-                    # Prefetch next batch while processing
+                    file_iter = iter(files_to_full_hash)
+                    inflight = {}
+
+                    def submit_hash_task() -> bool:
+                        try:
+                            file_path = next(file_iter)
+                        except StopIteration:
+                            return False
+                        if self.scan_cancelled:
+                            return False
+                        inflight[executor.submit(self.calculate_file_hash, file_path)] = file_path
+                        return True
+
+                    for _ in range(min(max_inflight, len(files_to_full_hash))):
+                        if not submit_hash_task():
+                            break
+
                     processed_count = 0
                     prefetch_trigger = prefetch_batch_size
-                    
-                    for future in as_completed(future_to_file):
+
+                    while inflight:
                         if self.scan_cancelled:
                             executor.shutdown(wait=False, cancel_futures=True)
                             return
-                        
-                        file_path = future_to_file[future]
-                        try:
-                            file_hash = future.result()
-                            if file_hash:
-                                if file_path not in hash_groups[file_hash]:
-                                    hash_groups[file_hash].append(file_path)
-                        except Exception as e:
-                            logger.debug(f"Hash calculation error {file_path}: {e}")
+
+                        done, _pending = wait(frozenset(inflight.keys()), timeout=0.25, return_when=FIRST_COMPLETED)
+                        if not done:
                             continue
-                        
-                        processed += 1
-                        processed_count += 1
-                        self.files_scanned = processed
-                        
-                        # Trigger prefetch of next batch when we've processed enough files
-                        if self._file_prefetch_enabled and processed_count >= prefetch_trigger and processed < len(files_to_full_hash):
-                            # Prefetch next batch in background
-                            next_start = processed
-                            next_end = min(next_start + prefetch_batch_size, len(files_to_full_hash))
-                            if next_start < len(files_to_full_hash):
-                                next_batch = files_to_full_hash[next_start:next_end]
-                                self._prefetch_files_batch(next_batch, max_workers=min(8, self.hash_workers))
-                            prefetch_trigger += prefetch_batch_size
-                        
-                        # Update progress with throttling
-                        current_time = time.time()
-                        should_update = (
-                            processed % progress_update_interval == 0 or 
-                            processed == self.total_files or
-                            (current_time - last_update_time[0]) >= min_update_interval
-                        )
-                        
-                        if should_update:
-                            # Calculate phase progress (0.0-1.0) for current phase only
-                            phase_progress = processed / self.total_files if self.total_files > 0 else 0.0
-                            # Pass phase progress (0.0-1.0) instead of overall progress
-                            self.progress_callback(phase_progress)
-                            self.status_callback(f"{phase_num}/{total_phases} Scanning: Calculating hash {processed:,}/{self.total_files:,}")
-                            last_update_time[0] = current_time
+
+                        for future in done:
+                            file_path = inflight.pop(future, None)
+                            try:
+                                file_hash = future.result()
+                                if file_hash and file_path not in hash_groups[file_hash]:
+                                    hash_groups[file_hash].append(file_path)
+                            except Exception as e:
+                                logger.debug(f"Hash calculation error {file_path}: {e}")
+                            
+                            processed += 1
+                            processed_count += 1
+                            self.files_scanned = processed
+                            
+                            # Trigger prefetch of next batch when we've processed enough files
+                            if self._file_prefetch_enabled and processed_count >= prefetch_trigger and processed < len(files_to_full_hash):
+                                # Prefetch next batch in background
+                                next_start = processed
+                                next_end = min(next_start + prefetch_batch_size, len(files_to_full_hash))
+                                if next_start < len(files_to_full_hash):
+                                    next_batch = files_to_full_hash[next_start:next_end]
+                                    self._prefetch_files_batch(next_batch, max_workers=min(8, self.hash_workers))
+                                prefetch_trigger += prefetch_batch_size
+                            
+                            # Update progress with throttling
+                            current_time = time.time()
+                            should_update = (
+                                processed % progress_update_interval == 0 or 
+                                processed == self.total_files or
+                                (current_time - last_update_time[0]) >= min_update_interval
+                            )
+                            
+                            if should_update:
+                                # Calculate phase progress (0.0-1.0) for current phase only
+                                phase_progress = processed / self.total_files if self.total_files > 0 else 0.0
+                                # Pass phase progress (0.0-1.0) instead of overall progress
+                                self.progress_callback(phase_progress)
+                                self.status_callback(f"{phase_num}/{total_phases} Scanning: Calculating hash {processed:,}/{self.total_files:,}")
+                                last_update_time[0] = current_time
+
+                            while len(inflight) < max_inflight and submit_hash_task():
+                                pass
             
             # Filter duplicate groups (without ORB verification first)
             # For multi-algorithm hash, use hamming distance comparison instead of exact match
@@ -3743,6 +3815,8 @@ class ScanEngine:
                 groups_after_merge = len(duplicate_groups)
                 if groups_before_merge != groups_after_merge:
                     logger.debug(f"DEBUG: RAW/JPEG merge: {groups_before_merge} -> {groups_after_merge} groups ({groups_before_merge - groups_after_merge} merged)")
+
+            self._flush_cache_writes()
             
             # Debug: Count groups by file type
             image_groups = 0
@@ -3795,6 +3869,8 @@ class ScanEngine:
             import traceback
             traceback.print_exc()
             self.results_callback({})
+        finally:
+            self._flush_cache_writes()
     
     def apply_sorting(
         self,
