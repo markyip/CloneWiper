@@ -1,5 +1,5 @@
 # CloneWiper
-[![Version](https://img.shields.io/badge/version-1.1-blue.svg)](https://github.com/markyip/CloneWiper/releases)
+[![Version](https://img.shields.io/badge/version-1.2-blue.svg)](https://github.com/markyip/CloneWiper/releases)
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
@@ -30,19 +30,19 @@ CloneWiper is a high-performance, modern duplicate file detection tool built wit
   - Batch cache writes to reduce database lock contention
 - **Persistent Caching**: 
   - **Hash Cache**: SQLite-backed cache (p-hash and MD5) for fast re-scans
-  - **Thumbnail Cache**: Local SQLite database stores generated thumbnails for instant scrolling on subsequent runs
+  - **Thumbnail Cache**: Local SQLite database persists only expensive previews (documents, videos, and audio artwork); regular images use memory cache only
 
 ### User Interface
 - **Material Design 3 UI**: Clean, modern dark-themed interface with rounded corners (when not maximized)
-- **Custom Title Bar**: Frameless window with custom controls and window management
+- **Custom Title Bar**: Frameless window with native Windows resize, drag-to-snap, and Windows 11 Snap Layout support
 - **Smart Thumbnails**: 
   - **Images**: Fast previews, including RAW support (`.arw`, `.cr2`, `.nef`, etc.)
   - **Video**: Frame extraction for common video formats
   - **Documents**: High-quality **PDF**, **EPUB**, **MOBI**, and **AZW3** thumbnails using **pypdfium2** and **PyMuPDF**
   - **Music**: Album art extraction and rich metadata display using **mutagen**
-- **Interactive File Cards**: Hover effects, scrolling text for long filenames, and selection management
-- **Pagination**: Efficient handling of large result sets with clickable page indicator dropdown
-- **Drag & Drop**: Drag and drop folders onto the results area for easy folder selection
+- **Interactive File Cards**: Hover effects, scrolling text for long filenames, selection management, and visually aligned rounded thumbnail cards
+- **Pagination**: Efficient handling of large result sets with 100 groups per page and clickable page indicator dropdown
+- **Drag & Drop**: Drag and drop folders onto the results area for easy folder selection; remove folders with the inline `x`, Delete, Backspace, or context menu
 - **Real-Time Progress**: Centered progress indicator with adaptive update intervals
 - **Quick Selection Strategies**:
   - **Keep Newest**: Keeps the most recently modified file
@@ -51,6 +51,7 @@ CloneWiper is a high-performance, modern duplicate file detection tool built wit
   - **Keep Smallest**: Keeps the highest resolution image; if multiple share the highest resolution, keeps the smallest file size
   - **Keep RAW**: Prefers RAW files over JPEG when both exist in the same group
 - **Quick Actions**: Delete Selected, Clear Selection (with scope: Current Page or All Pages)
+  - Selected quick-selection strategy remains highlighted after use
 
 ### Advanced Features
 - **Multi-Algorithm Perceptual Hashing**: 
@@ -65,11 +66,13 @@ CloneWiper is a high-performance, modern duplicate file detection tool built wit
 - **Multiple Sorting Options**: Sort by count, size, name, or date (ascending/descending)
 - **Scope Control**: Apply actions to current page or all pages
 - **Safe Deletion**: Uses `send2trash` to move files to recycle bin/trash
+  - Batch recycle-bin operations improve delete speed for large selections
+  - Deleted files are removed from memory and thumbnail caches
 - **Persistent Cache**: 
   - **Hash Cache**: Stores calculated hashes (p-hash and MD5)
-  - **Thumbnail Cache**: Offloads thumbnail generation to a local database (`thumbnails.db`), significantly speeding up gallery load times.
-  - Cache persists across sessions - no need to recalculate hashes or regenerate thumbnails on re-scan
-  - Automatic cache management with hit/miss statistics
+  - **Thumbnail Cache**: Offloads expensive document/video/audio-art thumbnail generation to a local database (`thumbnails.db`) while keeping regular image thumbnails memory-only
+  - Cache persists across sessions for costly media previews without storing thumbnails for every image
+  - Automatic cache cleanup removes stale entries and prunes formats that are no longer persistently cached
 
 ## 📋 Prerequisites
 
@@ -216,13 +219,14 @@ CloneWiper/
 ├── launch.bat              # Windows launch script
 ├── build_windows.bat       # Windows PyInstaller build script
 ├── RELEASE_NOTES_v1.1.md   # Release notes for v1.1
+├── RELEASE_NOTES_v1.2.md   # Release notes for v1.2
 ├── README.md               # This file
 └── LICENSE                 # License file
 ```
 
 ## 📦 Releases
 
-See [RELEASE_NOTES_v1.1.md](RELEASE_NOTES_v1.1.md) for **v1.1** changes. Older tags and notes live on the [GitHub Releases](https://github.com/markyip/CloneWiper/releases) page.
+See [RELEASE_NOTES_v1.2.md](RELEASE_NOTES_v1.2.md) for the latest changes. Older notes live in [RELEASE_NOTES_v1.1.md](RELEASE_NOTES_v1.1.md) and on the [GitHub Releases](https://github.com/markyip/CloneWiper/releases) page.
 
 ##  Development
 

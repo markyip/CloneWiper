@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import os
 import time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Iterable, Set
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,7 @@ class PersistentThumbnailCache:
             try:
                 conn = sqlite3.connect(self.db_path, check_same_thread=False)
                 conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS thumbnails (
                         path TEXT PRIMARY KEY,
@@ -81,19 +82,20 @@ class PersistentThumbnailCache:
             with sqlite3.connect(self.db_path, timeout=5) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT data FROM thumbnails WHERE path=? AND mtime_ns=? AND size=?",
+                    "SELECT data, last_access FROM thumbnails WHERE path=? AND mtime_ns=? AND size=?",
                     (abs_path, mtime_ns, size)
                 )
                 row = cursor.fetchone()
                 if row:
-                    # Update last access time asynchronously or lazily?
-                    # For now, let's update it to implement LRU later if needed
-                    # We do it successfully but don't block return on it if it fails
+                    now = int(time.time())
+                    last_access = row[1] or 0
+                    # Avoid turning every cache hit into a write during large thumbnail bursts.
                     try: 
-                        conn.execute(
-                            "UPDATE thumbnails SET last_access=? WHERE path=?",
-                            (int(time.time()), abs_path)
-                        )
+                        if now - last_access > 3600:
+                            conn.execute(
+                                "UPDATE thumbnails SET last_access=? WHERE path=?",
+                                (now, abs_path)
+                            )
                     except: 
                         pass
                     return row[0]
@@ -109,6 +111,7 @@ class PersistentThumbnailCache:
             now = int(time.time())
             
             with sqlite3.connect(self.db_path, timeout=5) as conn:
+                conn.execute("PRAGMA synchronous=NORMAL;")
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO thumbnails (path, mtime_ns, size, width, height, data, last_access)
@@ -119,12 +122,41 @@ class PersistentThumbnailCache:
         except Exception as e:
             logger.debug("Error saving to thumbnail cache: %s", e)
 
-    def cleanup(self, max_days=30):
+    def remove_many(self, paths: Iterable[str]):
+        """Remove cache rows for files that no longer need thumbnails."""
+        try:
+            abs_paths = [(os.path.abspath(path),) for path in paths]
+            if not abs_paths:
+                return
+            with sqlite3.connect(self.db_path, timeout=5) as conn:
+                conn.executemany("DELETE FROM thumbnails WHERE path=?", abs_paths)
+        except Exception as e:
+            logger.debug("Error removing thumbnails from cache: %s", e)
+
+    def restrict_to_extensions(self, extensions: Iterable[str]):
+        """Remove rows whose file extension is no longer persistently cached."""
+        allowed: Set[str] = {ext.lower() for ext in extensions}
+        try:
+            with sqlite3.connect(self.db_path, timeout=5) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT path FROM thumbnails")
+                stale_paths = [
+                    (path,)
+                    for (path,) in cursor.fetchall()
+                    if os.path.splitext(path)[1].lower() not in allowed
+                ]
+                if stale_paths:
+                    conn.executemany("DELETE FROM thumbnails WHERE path=?", stale_paths)
+        except Exception as e:
+            logger.debug("Error pruning thumbnail cache by extension: %s", e)
+
+    def cleanup(self, max_days=30, vacuum=False):
         """Remove old entries."""
         try:
             cutoff = int(time.time()) - (max_days * 86400)
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("DELETE FROM thumbnails WHERE last_access < ?", (cutoff,))
-                conn.execute("VACUUM")
+                if vacuum:
+                    conn.execute("VACUUM")
         except Exception as e:
             logger.debug("Error cleaning thumbnail cache: %s", e)

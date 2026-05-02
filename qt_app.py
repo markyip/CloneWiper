@@ -25,6 +25,8 @@ Version: 2.0
 import sys
 import os
 import logging
+import ctypes
+import ctypes.wintypes
 from typing import Dict, List, Optional, Tuple
 from collections import OrderedDict
 import time
@@ -38,12 +40,12 @@ try:
         QPushButton, QLabel, QLineEdit, QCheckBox, QComboBox, QScrollArea,
         QFrame, QListView, QStyledItemDelegate, QStyleOptionViewItem,
         QSizePolicy, QMessageBox, QFileDialog, QProgressBar, QGridLayout, QScrollBar,
-        QListWidget, QDialogButtonBox, QDialog, QStyleOptionComboBox, QStyle
+        QListWidget, QListWidgetItem, QDialogButtonBox, QDialog, QStyleOptionComboBox, QStyle
     )
     from PySide6.QtCore import (  # type: ignore[reportMissingImports]
         Qt, QSize, QThread, QThreadPool, QRunnable, Signal, QObject, QModelIndex,
         QAbstractListModel, QRect, QPoint, QTimer, QMutex, QWaitCondition, Slot, QSettings,
-        QVariantAnimation, QEasingCurve, QPropertyAnimation, QEvent
+        QVariantAnimation, QEasingCurve, QPropertyAnimation, QEvent, QBuffer
     )
     from PySide6.QtGui import (  # type: ignore[reportMissingImports]
         QPixmap, QPainter, QFont, QColor, QPen, QBrush, QImage, QIcon, QPainterPath,
@@ -97,6 +99,7 @@ class ToggleSwitch(QWidget):
         self._active_color = active_color
         self._bg_color = bg_color
         self._circle_pos = 4
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._animation = QVariantAnimation(self)
         self._animation.setDuration(200)
         self._animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
@@ -261,11 +264,14 @@ class CustomTitleBar(QFrame):
     def _toggle_maximize(self):
         if self._is_maximized:
             self.parent.showNormal()
-            self.max_btn.setText("⬜")
         else:
             self.parent.showMaximized()
-            self.max_btn.setText("❐")
-        self._is_maximized = not self._is_maximized
+        self.set_maximized_state(not self._is_maximized)
+
+    def set_maximized_state(self, is_maximized: bool):
+        """Keep the custom title bar state in sync with OS-driven window changes."""
+        self._is_maximized = is_maximized
+        self.max_btn.setText("❐" if is_maximized else "⬜")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -289,6 +295,11 @@ class CustomTitleBar(QFrame):
 
 class ThumbnailWorker(QRunnable):
     """Background worker for loading thumbnails."""
+    PERSISTENT_CACHE_EXTS = {
+        '.pdf', '.epub', '.mobi', '.azw3',
+        '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v',
+        '.mp3', '.flac', '.m4a', '.aac', '.ogg', '.wma', '.opus', '.alac', '.ape', '.aiff'
+    }
     
     class Signals(QObject):
         thumb_ready = Signal(str, QPixmap, float)  # path, pixmap, aspect_ratio
@@ -307,6 +318,26 @@ class ThumbnailWorker(QRunnable):
         # Create signals object - must be created in main thread for proper signal/slot connection
         # The signals object will be moved to main thread in _request_thumbnail
         self.signals = ThumbnailWorker.Signals()
+
+    def _should_use_persistent_cache(self) -> bool:
+        ext = os.path.splitext(self.file_path)[1].lower()
+        return ext in self.PERSISTENT_CACHE_EXTS
+
+    def _save_thumbnail_cache(self, qimg: QImage, width: int, height: int):
+        """Persist the generated thumbnail so heavy media formats are fast next session."""
+        if not self.cache or qimg.isNull() or not self._should_use_persistent_cache():
+            return
+        try:
+            buf = QBuffer()
+            buf.open(QBuffer.OpenModeFlag.ReadWrite)
+            qimg.save(buf, "JPG", 85)
+            data = buf.data().data()
+            st = os.stat(self.file_path)
+            mtime = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+            size = st.st_size
+            self.cache.put(self.file_path, mtime, size, width, height, data)
+        except Exception as e:
+            logger.debug("Failed to cache %s: %s", self.file_path, e)
     
     def run(self):
         """Load thumbnail in background thread."""
@@ -315,7 +346,7 @@ class ThumbnailWorker(QRunnable):
             ext = os.path.splitext(self.file_path)[1].lower()
             
             # --- PERSISTENT CACHE CHECK ---
-            if self.cache:
+            if self.cache and self._should_use_persistent_cache():
                 try:
                     st = os.stat(self.file_path)
                     mtime = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
@@ -386,22 +417,6 @@ class ThumbnailWorker(QRunnable):
                         self.signals.thumb_ready.emit(self.file_path, pixmap, aspect)
                         # logger.debug(f"DEBUG: ThumbnailWorker emitted thumb_ready for {os.path.basename(self.file_path)}")
                         
-                        # Save to cache
-                        if self.cache:
-                            try:
-                                from PySide6.QtCore import QBuffer
-                                buf = QBuffer()
-                                buf.open(QBuffer.OpenModeFlag.ReadWrite)
-                                qimg.save(buf, "JPG", 85) # Save as slightly compressed JPEG
-                                data = buf.data().data() # Get bytes
-                                
-                                st = os.stat(self.file_path)
-                                mtime = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
-                                size = st.st_size
-                                self.cache.put(self.file_path, mtime, size, width, height, data)
-                            except Exception as e:
-                                logger.debug("Failed to cache %s: %s", self.file_path, e)
-                        
                         # Metadata
                         meta = f"{width}x{height}"
                         self.signals.meta_ready.emit(self.file_path, meta)
@@ -453,21 +468,6 @@ class ThumbnailWorker(QRunnable):
                         meta = f"{raw_w}x{raw_h} (RAW)"
                         self.signals.meta_ready.emit(self.file_path, meta)
 
-                        # Save to cache
-                        if self.cache:
-                            try:
-                                from PySide6.QtCore import QBuffer
-                                buf = QBuffer()
-                                buf.open(QBuffer.OpenModeFlag.ReadWrite)
-                                qimg.save(buf, "JPG", 85)
-                                data = buf.data().data()
-                                st = os.stat(self.file_path)
-                                mtime = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
-                                size = st.st_size
-                                self.cache.put(self.file_path, mtime, size, raw_w, raw_h, data)
-                            except Exception:
-                                pass
-                        
                 except Exception as e:
                     logger.debug(f"DEBUG: ThumbnailWorker RAW error for {os.path.basename(self.file_path)}: {e}")
                     self.signals.error.emit(self.file_path, str(e))
@@ -481,6 +481,16 @@ class ThumbnailWorker(QRunnable):
                         self.signals.error.emit(self.file_path, "OpenCV not available")
                         return
                     cap = cv2.VideoCapture(self.file_path)
+                    if not cap.isOpened():
+                        self.signals.error.emit(self.file_path, "Unable to open video")
+                        return
+
+                    video_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    video_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                    duration_sec = int(frames / fps) if fps and fps > 0 else 0
+
                     ret, frame = cap.read()
                     cap.release()
                     
@@ -498,19 +508,11 @@ class ThumbnailWorker(QRunnable):
                         qimg = QImage(img_bytes, base_width, new_height, QImage.Format.Format_RGB888)
                         pixmap = QPixmap.fromImage(qimg)
                         self.signals.thumb_ready.emit(self.file_path, pixmap, aspect)
+                        self._save_thumbnail_cache(qimg, video_w or width, video_h or height)
                         
                         # Metadata
-                        cap2 = cv2.VideoCapture(self.file_path)
-                        w = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        h = int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        fps = cap2.get(cv2.CAP_PROP_FPS)
-                        duration_sec = 0
-                        if fps > 0:
-                            frames = cap2.get(cv2.CAP_PROP_FRAME_COUNT)
-                            duration_sec = int(frames / fps)
-                        cap2.release()
                         dur_str = f"{duration_sec//60}:{duration_sec%60:02d}"
-                        meta = f"{w}x{h} • {dur_str}"
+                        meta = f"{video_w or width}x{video_h or height} • {dur_str}"
                         self.signals.meta_ready.emit(self.file_path, meta)
                 except Exception as e:
                     self.signals.error.emit(self.file_path, str(e))
@@ -539,12 +541,19 @@ class ThumbnailWorker(QRunnable):
                                 pdf.close()
                                 raise ValueError("PDF has no pages")
                             
+                            base_width = min(self.max_width, 512)
                             page = pdf[0]
-                            bitmap = page.render(scale=2, rotation=0)
+                            try:
+                                page_width, _page_height = page.get_size()
+                                render_scale = max(0.25, min(2.0, base_width / page_width)) if page_width else 1.0
+                            except Exception:
+                                render_scale = 1.0
+                            bitmap = page.render(scale=render_scale, rotation=0)
                             pil_image = bitmap.to_pil()
+                            if pil_image.mode != 'RGB':
+                                pil_image = pil_image.convert('RGB')
                             width, height = pil_image.size
                             aspect = width / height
-                            base_width = min(self.max_width, 512)
                             scale = base_width / width
                             new_height = int(height * scale)
                             img_resized = pil_image.resize((base_width, new_height), Image.Resampling.LANCZOS)
@@ -553,6 +562,7 @@ class ThumbnailWorker(QRunnable):
                             pixmap = QPixmap.fromImage(qimg)
                             self.signals.thumb_ready.emit(self.file_path, pixmap, aspect)
                             self.signals.meta_ready.emit(self.file_path, f"{len(pdf)} pages")
+                            self._save_thumbnail_cache(qimg, width, height)
                             pdf.close()
                             return
                         except ImportError as e:
@@ -581,12 +591,14 @@ class ThumbnailWorker(QRunnable):
                             doc.close()
                             raise ValueError("Document has no pages")
                         
+                        base_width = min(self.max_width, 512)
                         page = doc.load_page(0)
-                        pix = page.get_pixmap(alpha=False)
+                        page_width = float(page.rect.width) if page.rect.width else base_width
+                        zoom = max(0.25, min(2.0, base_width / page_width))
+                        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                         width, height = img.size
                         aspect = width / height
-                        base_width = min(self.max_width, 512)
                         scale = base_width / width
                         new_height = int(height * scale)
                         img_resized = img.resize((base_width, new_height), Image.Resampling.LANCZOS)
@@ -601,6 +613,7 @@ class ThumbnailWorker(QRunnable):
                         elif ext == '.mobi': meta = "Ebook (MOBI)"
                         elif ext == '.azw3': meta = "Ebook (AZW3)"
                         self.signals.meta_ready.emit(self.file_path, meta)
+                        self._save_thumbnail_cache(qimg, width, height)
                         doc.close()
                         return
                     except ImportError as e:
@@ -667,6 +680,7 @@ class ThumbnailWorker(QRunnable):
                                         pixmap = QPixmap.fromImage(qimg)
                                         self.signals.thumb_ready.emit(self.file_path, pixmap, aspect)
                                         self.signals.meta_ready.emit(self.file_path, "Ebook (EPUB-M)")
+                                        self._save_thumbnail_cache(qimg, width, height)
                                         epub_fallback_success = True
                                         return
                         except Exception as epub_error:
@@ -771,6 +785,7 @@ class ThumbnailWorker(QRunnable):
                             qimg = QImage(img_bytes, base_width, new_height, QImage.Format.Format_RGB888)
                             pixmap = QPixmap.fromImage(qimg)
                             self.signals.thumb_ready.emit(self.file_path, pixmap, aspect)
+                            self._save_thumbnail_cache(qimg, width, height)
                         except Exception as img_error:
                             logger.debug(f"DEBUG: Failed to process album art image for {os.path.basename(self.file_path)}: {img_error}")
                     
@@ -934,36 +949,40 @@ class FileCardDelegate(QStyledItemDelegate):
         
         # Background (Material 3 Card)
         border_radius = 12
+        card_rect = rect.adjusted(1, 1, -1, -1)
         if selected:
             # Material 3 error container color with rounded corners
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             painter.setBrush(QBrush(QColor(MD3_COLORS['error_container'])))
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), border_radius, border_radius)
+            painter.drawRoundedRect(card_rect, border_radius, border_radius)
             # Red border
             pen = QPen(QColor(MD3_COLORS['error']), 2)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), border_radius, border_radius)
+            painter.drawRoundedRect(card_rect, border_radius, border_radius)
         else:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             painter.setBrush(QBrush(QColor(MD3_COLORS['surface'])))  # Material 3 surface
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), border_radius, border_radius)
+            painter.drawRoundedRect(card_rect, border_radius, border_radius)
             # Subtle border
             pen = QPen(QColor(MD3_COLORS['surface_variant']), 1)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), border_radius, border_radius)
+            painter.drawRoundedRect(card_rect, border_radius, border_radius)
         
         # Thumbnail (Material 3 rounded corners)
         # Use consistent padding (8px) for all sides
         padding = 8
-        # Thumbnail corner radius = card radius - padding (12 - 8 = 4px)
-        thumb_radius = border_radius - padding
+        thumb_x = rect.x() + padding
+        thumb_y = rect.y() + padding
+        content_inset = max(0, thumb_x - card_rect.x())
+        # Keep nested rounded corners optically parallel to the outer card.
+        thumb_radius = max(0, border_radius - content_inset)
         thumb_height = int(self.card_width / aspect) if aspect > 0 else self.card_width
         thumb_height = max(150, min(thumb_height, self.card_width * 3))
-        thumb_rect = QRect(rect.x() + padding, rect.y() + padding, self.card_width - (padding * 2), thumb_height)
+        thumb_rect = QRect(thumb_x, thumb_y, self.card_width - (padding * 2), thumb_height)
         
         if thumb:
             # Create rounded thumbnail with full visibility
@@ -1380,8 +1399,18 @@ class GroupWidget(QFrame):
         
         # Header
         header = QFrame()
+        header.setObjectName("groupHeader")
         header.setFixedHeight(48)
-        header.setStyleSheet(f"background-color: {MD3_COLORS['bg_subtle']}; border: none;")
+        header.setStyleSheet(f"""
+            QFrame#groupHeader {{
+                background-color: {MD3_COLORS['bg_subtle']};
+                border: none;
+                border-top-left-radius: 11px;
+                border-top-right-radius: 11px;
+                border-bottom-left-radius: 0px;
+                border-bottom-right-radius: 0px;
+            }}
+        """)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(16, 4, 16, 4)
         header_layout.setSpacing(12)
@@ -1408,7 +1437,7 @@ class GroupWidget(QFrame):
             title = QLabel(f"Group {group_index + 1}/{total_groups} • {len(files)} files • {size_str}")
         else:
             title = QLabel(f"{len(files)} files • {size_str}")
-        title.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; font-size: 14px; font-weight: 500; font-family: 'Roboto', 'Segoe UI', sans-serif; border: none;")
+        title.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; background-color: transparent; font-size: 14px; font-weight: 500; font-family: 'Roboto', 'Segoe UI', sans-serif; border: none;")
         header_layout.addWidget(title)
         
         header_layout.addStretch()
@@ -1508,9 +1537,16 @@ class GroupWidget(QFrame):
         if self.is_expanded:
             self.list_view.show()
             self.toggle_btn.setText("▼")
+            # Collapsing leaves the view at height 0; restore a temporary
+            # height so Qt can lay out items before the masonry height pass.
+            self.list_view.setFixedHeight(100)
+            self.list_view.doItemsLayout()
+            QTimer.singleShot(0, self._update_height)
         else:
             self.list_view.hide()
+            self.list_view.setFixedHeight(0)
             self.toggle_btn.setText("▶")
+        self.updateGeometry()
     
     def _on_item_entered(self, index: QModelIndex):
         """Handle mouse enter event for hover scrolling."""
@@ -1627,6 +1663,7 @@ class CustomDialog(QDialog):
             flags |= Qt.WindowType.MSWindowsFixedSizeDialogHint
         self.setWindowFlags(flags)
         self.setModal(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         
         # Default buttons
         if buttons is None:
@@ -1634,14 +1671,26 @@ class CustomDialog(QDialog):
         
         self.setStyleSheet(f"""
             QDialog {{
+                background-color: transparent;
+            }}
+            QFrame#dialogCard {{
                 background-color: {MD3_COLORS['bg_subtle']};
                 border: 2px solid {MD3_COLORS['outline']};
                 border-radius: 12px;
             }}
         """)
         
-        # Layout
-        layout = QVBoxLayout(self)
+        # Keep the native top-level dialog transparent; draw the visible rounded
+        # surface in a child frame so square window corners do not show through.
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        self.dialog_card = QFrame(self)
+        self.dialog_card.setObjectName("dialogCard")
+        root_layout.addWidget(self.dialog_card)
+
+        layout = QVBoxLayout(self.dialog_card)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(16)
         
@@ -1880,12 +1929,29 @@ class CloneWiperApp(QMainWindow):
     progress_updated = Signal(float)
     status_updated = Signal(str)
     results_ready = Signal(dict)
+    _is_windows = sys.platform.startswith("win")
+    _resize_border = 8
+    _win_ht_values = {
+        "HTNOWHERE": 0,
+        "HTCLIENT": 1,
+        "HTCAPTION": 2,
+        "HTLEFT": 10,
+        "HTRIGHT": 11,
+        "HTTOP": 12,
+        "HTTOPLEFT": 13,
+        "HTTOPRIGHT": 14,
+        "HTBOTTOM": 15,
+        "HTBOTTOMLEFT": 16,
+        "HTBOTTOMRIGHT": 17,
+        "HTMAXBUTTON": 9,
+    }
     
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CloneWiper - Smart Duplicate Finder")
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setGeometry(100, 100, 1400, 850)
+        self.setMinimumSize(960, 640)
         
         # Set window icon (for taskbar) - try multiple paths (works in dev and when packaged)
         # Get the directory where the script is located
@@ -1944,7 +2010,7 @@ class CloneWiperApp(QMainWindow):
         self.file_groups_raw: Dict[str, List[str]] = {}
         self.selection_state: Dict[str, bool] = {}  # path -> should_delete
         self.current_page = 0
-        self.groups_per_page = 50
+        self.groups_per_page = 100
         
         # Initialize file_groups to track scan state
         self.file_groups = None
@@ -1952,11 +2018,12 @@ class CloneWiperApp(QMainWindow):
 
         # Persistent Thumbnail Cache
         self.persistent_cache = PersistentThumbnailCache()
+        self._cleanup_thumbnail_cache(vacuum=True)
         self._scroll_anchor: Optional[Tuple[str, int]] = None  # (group_id, scroll_value) for refresh restore
         
         # Thumbnail cache
         self.thumb_cache: Dict[str, QPixmap] = OrderedDict()
-        self.thumb_cache_max = 450
+        self.thumb_cache_max = 1200
         self.thumb_aspects: Dict[str, float] = {}
         self.metadata_cache: Dict[str, str] = OrderedDict()
         self.metadata_cache_max = 4000
@@ -2079,25 +2146,25 @@ class CloneWiperApp(QMainWindow):
                 padding: 0px;
             }}
             QListWidget::item {{
-                padding: 0px 8px;
+                padding: 0px;
                 border-radius: 6px;
                 margin: 0px 2px 0px 2px;
-                min-height: 20px;
-                height: 20px;
+                min-height: 24px;
+                height: 24px;
             }}
             QListWidget::item:only-child {{
                 /* Vertically center when only one item */
-                min-height: 20px;
-                height: 20px;
+                min-height: 24px;
+                height: 24px;
                 padding-top: 0px;
                 padding-bottom: 0px;
             }}
             QListWidget::item:selected {{
                 background-color: {MD3_COLORS['primary_container']};
                 color: {MD3_COLORS['on_primary_container']};
-                padding: 0px 8px;
-                min-height: 20px;
-                height: 20px;
+                padding: 0px;
+                min-height: 24px;
+                height: 24px;
             }}
             QScrollBar:vertical {{
                 background-color: transparent;
@@ -2115,7 +2182,7 @@ class CloneWiperApp(QMainWindow):
         self.path_list_widget.model().rowsInserted.connect(self._adjust_path_list_height)
         self.path_list_widget.model().rowsRemoved.connect(self._adjust_path_list_height)
         
-        # Folder removal via Context Menu and Delete Key
+        # Folder removal via row action, context menu, Delete, and Backspace.
         self.path_list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.path_list_widget.customContextMenuRequested.connect(self._show_path_context_menu)
         self.path_list_widget.keyPressEvent = self._path_list_key_press
@@ -2354,8 +2421,8 @@ class CloneWiperApp(QMainWindow):
             }}
         """)
         footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(24, 8, 24, 8)
-        footer_layout.setSpacing(12)
+        footer_layout.setContentsMargins(16, 8, 16, 8)
+        footer_layout.setSpacing(8)
         footer_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)  # Vertical center alignment
         
         # Quick select buttons (Material 3 Outlined Button)
@@ -2366,10 +2433,10 @@ class CloneWiperApp(QMainWindow):
                 font-size: 13px;
                 font-weight: 500;
                 font-family: 'Roboto', 'Segoe UI', sans-serif;
-                padding: 0px 24px;
+                padding: 0px 16px;
                 border: 1px solid {MD3_COLORS['outline']};
                 border-radius: 20px;
-                min-width: 100px;
+                min-width: 92px;
                 text-align: center;
             }}
             QPushButton:hover {{
@@ -2379,19 +2446,28 @@ class CloneWiperApp(QMainWindow):
             QPushButton:pressed {{
                 background-color: rgba(103, 80, 164, 0.12);
             }}
+            QPushButton[quickSelected="true"] {{
+                background-color: {MD3_COLORS['primary_container']};
+                color: {MD3_COLORS['on_primary_container']};
+                border-color: {MD3_COLORS['primary']};
+            }}
+            QPushButton[quickSelected="true"]:hover {{
+                background-color: {MD3_COLORS['primary_container']};
+                color: {MD3_COLORS['on_primary_container']};
+            }}
         """
         
-        keep_newest_btn = QPushButton("Keep Newest")
-        keep_newest_btn.setFixedHeight(40)
-        keep_newest_btn.setStyleSheet(outlined_button_style)
-        keep_newest_btn.clicked.connect(lambda: self._quick_select('newest'))
-        footer_layout.addWidget(keep_newest_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self.keep_newest_btn = QPushButton("Keep Newest")
+        self.keep_newest_btn.setFixedHeight(40)
+        self.keep_newest_btn.setStyleSheet(outlined_button_style)
+        self.keep_newest_btn.clicked.connect(lambda: self._quick_select('newest'))
+        footer_layout.addWidget(self.keep_newest_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         
-        keep_oldest_btn = QPushButton("Keep Oldest")
-        keep_oldest_btn.setFixedHeight(40)
-        keep_oldest_btn.setStyleSheet(outlined_button_style)
-        keep_oldest_btn.clicked.connect(lambda: self._quick_select('oldest'))
-        footer_layout.addWidget(keep_oldest_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self.keep_oldest_btn = QPushButton("Keep Oldest")
+        self.keep_oldest_btn.setFixedHeight(40)
+        self.keep_oldest_btn.setStyleSheet(outlined_button_style)
+        self.keep_oldest_btn.clicked.connect(lambda: self._quick_select('oldest'))
+        footer_layout.addWidget(self.keep_oldest_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         
         self.keep_best_btn = QPushButton("Keep Best")
         self.keep_best_btn.setFixedHeight(40)
@@ -2410,9 +2486,16 @@ class CloneWiperApp(QMainWindow):
         self.keep_raw_btn.setStyleSheet(outlined_button_style)
         self.keep_raw_btn.clicked.connect(lambda: self._quick_select('keep_raw'))
         footer_layout.addWidget(self.keep_raw_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self.quick_select_buttons = {
+            'newest': self.keep_newest_btn,
+            'oldest': self.keep_oldest_btn,
+            'best_res': self.keep_best_btn,
+            'keep_smallest': self.keep_smallest_btn,
+            'keep_raw': self.keep_raw_btn,
+        }
         
         # Group controls on the left
-        footer_layout.addSpacing(24)
+        footer_layout.addSpacing(8)
         
         # Scope toggle (Switch)
         toggle_container = QWidget()
@@ -2422,17 +2505,20 @@ class CloneWiperApp(QMainWindow):
         toggle_hbox.setAlignment(Qt.AlignmentFlag.AlignVCenter)  # Vertical center alignment
         toggle_container.setStyleSheet("background-color: transparent;") # Ensure transparent background for container
         
-        toggle_label = QLabel("All Pages")
-        toggle_label.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; font-size: 13px; font-family: 'Roboto', 'Segoe UI', sans-serif;")
-        toggle_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.scope_label = QLabel("Current Page")
+        self.scope_label.setMinimumWidth(86)
+        self.scope_label.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; font-size: 13px; font-family: 'Roboto', 'Segoe UI', sans-serif;")
+        self.scope_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         
         self.scope_toggle = ToggleSwitch(active_color=MD3_COLORS['primary'], bg_color=MD3_COLORS['surface_variant'])
+        self.scope_toggle.setToolTip("Toggle quick select scope between the current page and all pages.")
+        self.scope_toggle.toggled.connect(self._update_scope_label)
         
-        toggle_hbox.addWidget(toggle_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        toggle_hbox.addWidget(self.scope_label, alignment=Qt.AlignmentFlag.AlignVCenter)
         toggle_hbox.addWidget(self.scope_toggle, alignment=Qt.AlignmentFlag.AlignVCenter)
         footer_layout.addWidget(toggle_container, alignment=Qt.AlignmentFlag.AlignVCenter)
         
-        footer_layout.addSpacing(16)
+        footer_layout.addSpacing(8)
         
         # Sort (No Label) - Custom QComboBox with centered text
         # Note: CenteredComboBox is already defined at the start of _setup_ui
@@ -2720,34 +2806,43 @@ class CloneWiperApp(QMainWindow):
         """Dynamically adjust path list height based on items (max 1.5 rows)."""
         count = self.path_list_widget.count()
         if count == 0:
-            h = 22  # Empty: default height (20px item + 2px container)
+            h = 26  # Empty: default height (24px item + 2px container)
         elif count == 1:
-            h = 22  # Single folder: 20px item + 2px container
-            # Set item height to 20px
+            h = 26  # Single folder: 24px item + 2px container
             item = self.path_list_widget.item(0)
             if item:
-                item.setSizeHint(QSize(-1, 20))
+                item.setSizeHint(QSize(-1, 24))
         else:
-            # Multiple folders: 20px per item + 0px margin between items
-            # Show 1.5 rows: 20px + 0px + 10px (half item) = 30px
-            h = 30
-            # Set all items to 20px height
+            # Show about 1.5 compact rows.
+            h = 38
             for i in range(count):
                 item = self.path_list_widget.item(i)
                 if item:
-                    item.setSizeHint(QSize(-1, 20))
+                    item.setSizeHint(QSize(-1, 24))
         self.path_list_widget.setFixedHeight(h)
         self.updateGeometry()
 
     def _path_list_key_press(self, event):
-        """Handle Delete key for folder removal."""
-        if event.key() == Qt.Key.Key_Delete:
-            item = self.path_list_widget.currentItem()
-            if item:
-                self.path_list_widget.takeItem(self.path_list_widget.row(item))
+        """Handle Delete/Backspace key for folder removal."""
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self._remove_selected_folder()
         else:
             # Fallback to standard QListWidget key handling
             QListWidget.keyPressEvent(self.path_list_widget, event)
+
+    def _remove_folder_item(self, item: Optional[QListWidgetItem]):
+        """Remove a folder row from the scan list."""
+        if not item:
+            return
+        row = self.path_list_widget.row(item)
+        if row >= 0:
+            removed = self.path_list_widget.takeItem(row)
+            if removed:
+                del removed
+
+    def _remove_selected_folder(self):
+        """Remove the currently selected folder row."""
+        self._remove_folder_item(self.path_list_widget.currentItem())
 
     def _show_path_context_menu(self, position):
         from PySide6.QtWidgets import QMenu  # type: ignore[reportMissingImports]
@@ -2755,9 +2850,7 @@ class CloneWiperApp(QMainWindow):
         remove_action = menu.addAction("Remove Folder")
         action = menu.exec(self.path_list_widget.mapToGlobal(position))
         if action == remove_action:
-            item = self.path_list_widget.currentItem()
-            if item:
-                self.path_list_widget.takeItem(self.path_list_widget.row(item))
+            self._remove_selected_folder()
 
     def _browse_path(self):
         # Get last path from settings to open dialog at that location
@@ -2777,10 +2870,44 @@ class CloneWiperApp(QMainWindow):
         """Add a folder to the path list if not already present."""
         items = [self.path_list_widget.item(i).text() for i in range(self.path_list_widget.count())]
         if path not in items:
-            item = self.path_list_widget.addItem(path)
-            # Set item height to 20px (text 19px + 1px minimal spacing)
-            if item:
-                item.setSizeHint(QSize(-1, 20))
+            item = QListWidgetItem(path)
+            item.setSizeHint(QSize(-1, 24))
+            self.path_list_widget.addItem(item)
+
+            row_widget = QFrame()
+            row_widget.setStyleSheet("background-color: transparent; border: none;")
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(8, 0, 4, 0)
+            row_layout.setSpacing(6)
+
+            label = QLabel(path)
+            label.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; font-size: 12px; background-color: transparent; border: none;")
+            label.setToolTip(path)
+            row_layout.addWidget(label, stretch=1)
+
+            remove_btn = QPushButton("×")
+            remove_btn.setFixedSize(18, 18)
+            remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            remove_btn.setToolTip("Remove folder")
+            remove_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: transparent;
+                    color: {MD3_COLORS['on_surface_variant']};
+                    border: none;
+                    border-radius: 9px;
+                    font-size: 14px;
+                    font-weight: 600;
+                    padding: 0px;
+                }}
+                QPushButton:hover {{
+                    background-color: {MD3_COLORS['error_container']};
+                    color: {MD3_COLORS['error']};
+                }}
+            """)
+            remove_btn.clicked.connect(lambda _checked=False, item=item: self._remove_folder_item(item))
+            row_layout.addWidget(remove_btn)
+
+            self.path_list_widget.setItemWidget(item, row_widget)
     
     def _on_folders_dropped(self, paths: list):
         """Handle folders dropped on results area - supports multiple folders."""
@@ -2935,7 +3062,16 @@ class CloneWiperApp(QMainWindow):
     @Slot(dict)
     def _on_results_slot(self, duplicate_groups: Dict[str, List[str]]):
         """Slot for results updates (runs on main thread)."""
+        self._cleanup_thumbnail_cache()
         self._display_results(duplicate_groups)
+
+    def _cleanup_thumbnail_cache(self, vacuum: bool = False):
+        """Keep persistent cache focused on recent expensive media thumbnails."""
+        try:
+            self.persistent_cache.restrict_to_extensions(ThumbnailWorker.PERSISTENT_CACHE_EXTS)
+            self.persistent_cache.cleanup(max_days=30, vacuum=vacuum)
+        except Exception as e:
+            logger.debug("Thumbnail cache cleanup failed: %s", e)
     
     
     def _cancel_scanning(self):
@@ -3334,6 +3470,9 @@ class CloneWiperApp(QMainWindow):
         self._update_delete_ui()
 
     def mousePressEvent(self, event):
+        if self._is_windows:
+            super().mousePressEvent(event)
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             edge = self._get_resize_edge(event.pos())
             if edge:
@@ -3344,6 +3483,9 @@ class CloneWiperApp(QMainWindow):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._is_windows:
+            super().mouseMoveEvent(event)
+            return
         edge = self._get_resize_edge(event.pos())
         if edge:
             if edge in ('left', 'right'): self.setCursor(Qt.CursorShape.SizeHorCursor)
@@ -3376,7 +3518,7 @@ class CloneWiperApp(QMainWindow):
         super().mouseReleaseEvent(event)
 
     def _get_resize_edge(self, pos):
-        margin = 8
+        margin = self._resize_border
         w, h = self.width(), self.height()
         x, y = pos.x(), pos.y()
         
@@ -3387,11 +3529,86 @@ class CloneWiperApp(QMainWindow):
         elif y > h - margin: edge.append('bottom')
         
         return '_'.join(edge) if edge else None
+
+    def nativeEvent(self, event_type, message):
+        """Use Windows hit testing so frameless chrome still supports native resize/snap."""
+        if not self._is_windows:
+            return super().nativeEvent(event_type, message)
+
+        msg = ctypes.wintypes.MSG.from_address(int(message))
+        wm_nchittest = 0x0084
+        wm_nclbuttondown = 0x00A1
+        wm_nclbuttonup = 0x00A2
+        if msg.message in (wm_nclbuttondown, wm_nclbuttonup) and msg.wParam == self._win_ht_values["HTMAXBUTTON"]:
+            if msg.message == wm_nclbuttonup and hasattr(self, "custom_title_bar"):
+                x = ctypes.c_short(msg.lParam & 0xFFFF).value
+                y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+                max_button_pos = self.custom_title_bar.max_btn.mapFromGlobal(QPoint(x, y))
+                if self.custom_title_bar.max_btn.rect().contains(max_button_pos):
+                    self.custom_title_bar._toggle_maximize()
+            return True, 0
+
+        if msg.message != wm_nchittest:
+            return super().nativeEvent(event_type, message)
+
+        x = ctypes.c_short(msg.lParam & 0xFFFF).value
+        y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+        pos = self.mapFromGlobal(QPoint(x, y))
+        hit_test = self._native_hit_test(pos, QPoint(x, y))
+        if hit_test is None:
+            return super().nativeEvent(event_type, message)
+        return True, hit_test
+
+    def _native_hit_test(self, pos: QPoint, global_pos: QPoint):
+        """Return Windows HT* codes for resize borders, caption drag, and snap layout."""
+        if not self.rect().contains(pos):
+            return None
+
+        ht = self._win_ht_values
+        if not (self.isMaximized() or self.isFullScreen()):
+            margin = self._resize_border
+            left = pos.x() < margin
+            right = pos.x() >= self.width() - margin
+            top = pos.y() < margin
+            bottom = pos.y() >= self.height() - margin
+
+            if top and left:
+                return ht["HTTOPLEFT"]
+            if top and right:
+                return ht["HTTOPRIGHT"]
+            if bottom and left:
+                return ht["HTBOTTOMLEFT"]
+            if bottom and right:
+                return ht["HTBOTTOMRIGHT"]
+            if left:
+                return ht["HTLEFT"]
+            if right:
+                return ht["HTRIGHT"]
+            if top:
+                return ht["HTTOP"]
+            if bottom:
+                return ht["HTBOTTOM"]
+
+        if hasattr(self, "custom_title_bar") and self.custom_title_bar.geometry().contains(pos):
+            max_button_pos = self.custom_title_bar.max_btn.mapFromGlobal(global_pos)
+            if self.custom_title_bar.max_btn.rect().contains(max_button_pos):
+                return ht["HTMAXBUTTON"]
+
+            title_bar_pos = self.custom_title_bar.mapFromGlobal(global_pos)
+            child = self.custom_title_bar.childAt(title_bar_pos)
+            if child in (self.custom_title_bar.min_btn, self.custom_title_bar.max_btn, self.custom_title_bar.close_btn):
+                return ht["HTCLIENT"]
+            return ht["HTCAPTION"]
+
+        return None
     
     def changeEvent(self, event):
         """Handle window state changes (maximized/restored) to toggle rounded corners."""
         if event.type() == event.Type.WindowStateChange:
-            if self.isMaximized() or self.isFullScreen():
+            is_maximized = self.isMaximized() or self.isFullScreen()
+            if hasattr(self, "custom_title_bar"):
+                self.custom_title_bar.set_maximized_state(is_maximized)
+            if is_maximized:
                 # Remove rounded corners when maximized/fullscreen
                 self.setMask(QRegion())
             else:
@@ -3469,6 +3686,21 @@ class CloneWiperApp(QMainWindow):
         self.keep_smallest_btn.setVisible(has_applicable_images)
         self.keep_raw_btn.setVisible(has_raw_mixed)
 
+    def _update_scope_label(self, apply_all_pages: bool):
+        """Keep quick-select scope wording aligned with the toggle state."""
+        if hasattr(self, "scope_label"):
+            self.scope_label.setText("All Pages" if apply_all_pages else "Current Page")
+
+    def _highlight_quick_select_mode(self, mode: str):
+        """Visually mark the last quick-select strategy the user applied."""
+        if not hasattr(self, "quick_select_buttons"):
+            return
+        for button_mode, button in self.quick_select_buttons.items():
+            button.setProperty("quickSelected", button_mode == mode)
+            button.style().unpolish(button)
+            button.style().polish(button)
+            button.update()
+
     def _quick_select(self, mode: str):
         """Apply quick selection."""
         if not self.file_groups:
@@ -3500,6 +3732,7 @@ class CloneWiperApp(QMainWindow):
                     widget.set_selection(path, decisions[path])
         
         # Update UI
+        self._highlight_quick_select_mode(mode)
         self._update_delete_ui()
         
         scope_text = "All groups" if apply_all else "Current page"
@@ -3519,42 +3752,64 @@ class CloneWiperApp(QMainWindow):
         if result == "Yes":
             try:
                 import send2trash
-                deleted_count = 0
-                failed_count = 0
-                for path in selected:
-                    try:
-                        send2trash.send2trash(path)
-                        deleted_count += 1
-                    except Exception as e:
-                        logger.warning("Failed to delete %s: %s", path, e)
-                        failed_count += 1
-                
-                # Remove deleted files from file_groups and file_groups_raw
-                deleted_set = set(selected)
-                if self.file_groups:
-                    # Update file_groups
+                deleted_paths = set(selected)
+                failed_paths = []
+
+                try:
+                    # send2trash accepts a list of paths on Windows, which avoids one COM
+                    # file operation per file and is much faster for large selections.
+                    send2trash.send2trash(selected)
+                    deleted_count = len(selected)
+                except Exception as batch_error:
+                    logger.warning("Batch delete failed, falling back to per-file delete: %s", batch_error)
+                    deleted_paths.clear()
+                    for path in selected:
+                        try:
+                            send2trash.send2trash(path)
+                            deleted_paths.add(path)
+                        except Exception as e:
+                            logger.warning("Failed to delete %s: %s", path, e)
+                            failed_paths.append(path)
+                    deleted_count = len(deleted_paths)
+                failed_count = len(failed_paths)
+
+                if not deleted_paths and failed_count:
+                    message = f"No files were deleted.\n{failed_count} files failed to delete."
+                    dialog = CustomDialog(self, title="Delete Failed", message=message, buttons=["OK"])
+                    dialog.exec()
+                    return
+
+                def keep_duplicate_groups(groups):
                     updated_groups = {}
-                    for group_id, files in self.file_groups.items():
-                        remaining_files = [f for f in files if f not in deleted_set and os.path.exists(f)]
-                        if len(remaining_files) > 1:  # Keep groups with at least 2 files
+                    for group_id, files in groups.items():
+                        remaining_files = [f for f in files if f not in deleted_paths]
+                        if len(remaining_files) > 1:
                             updated_groups[group_id] = remaining_files
-                        elif len(remaining_files) == 1:
-                            # Single file left, remove from groups (no longer a duplicate)
-                            pass
-                    self.file_groups = updated_groups
+                    return updated_groups
+
+                # Remove deleted files from file_groups and file_groups_raw without
+                # extra exists() calls; the selected set already tells us what changed.
+                if self.file_groups:
+                    self.file_groups = keep_duplicate_groups(self.file_groups)
                 
                 if self.file_groups_raw:
-                    # Update file_groups_raw
-                    updated_groups_raw = {}
-                    for group_id, files in self.file_groups_raw.items():
-                        remaining_files = [f for f in files if f not in deleted_set and os.path.exists(f)]
-                        if len(remaining_files) > 1:  # Keep groups with at least 2 files
-                            updated_groups_raw[group_id] = remaining_files
-                    self.file_groups_raw = updated_groups_raw
+                    self.file_groups_raw = keep_duplicate_groups(self.file_groups_raw)
+                
+                if deleted_paths:
+                    self.persistent_cache.remove_many(deleted_paths)
+                    for path in deleted_paths:
+                        self.thumb_cache.pop(path, None)
+                        self.thumb_aspects.pop(path, None)
+                        self.metadata_cache.pop(path, None)
                 
                 # Clear selection state for deleted files
-                for path in selected:
+                for path in deleted_paths:
                     self.selection_state.pop(path, None)
+                for path in failed_paths:
+                    try:
+                        self.selection_state[path] = True
+                    except Exception:
+                        pass
                 
                 # Update delete button UI
                 self._update_delete_ui()
