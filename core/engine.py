@@ -28,6 +28,7 @@ import hashlib
 import sqlite3
 import time
 import atexit
+from functools import lru_cache
 from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from dataclasses import dataclass
@@ -99,6 +100,38 @@ class Group:
     id: str  # Hash value
     files: List[FileItem]
     total_size: int = 0
+
+
+class UnionFind:
+    """Disjoint-set union with path compression and union by rank."""
+
+    def __init__(self):
+        self.parent: Dict[str, str] = {}
+        self.rank: Dict[str, int] = {}
+
+    def find(self, x: str) -> str:
+        if x not in self.parent:
+            self.parent[x] = x
+            self.rank[x] = 0
+        if self.parent[x] != x:
+            self.parent[x] = self.find(self.parent[x])
+        return self.parent[x]
+
+    def union(self, x: str, y: str) -> None:
+        rx, ry = self.find(x), self.find(y)
+        if rx == ry:
+            return
+        if self.rank[rx] < self.rank[ry]:
+            rx, ry = ry, rx
+        self.parent[ry] = rx
+        if self.rank[rx] == self.rank[ry]:
+            self.rank[rx] += 1
+
+    def groups(self) -> Dict[str, List[str]]:
+        result: Dict[str, List[str]] = defaultdict(list)
+        for x in self.parent:
+            result[self.find(x)].append(x)
+        return dict(result)
 
 
 class ScanEngine:
@@ -271,6 +304,51 @@ class ScanEngine:
             atexit.register(lambda: self._close_phash_db())
         except Exception:
             pass
+
+        self._last_progress_report_time = 0.0
+
+    def _progress_update_interval(self, total: int) -> int:
+        """Choose a progress reporting stride based on workload size."""
+        if total < 100:
+            return 1
+        if total < 1000:
+            return 10
+        return min(max(1, total // 100), 5000)
+
+    def _begin_scan_phase(self, phase_num: int, total_phases: int, detail: str) -> None:
+        """Reset phase progress and show the first status line."""
+        self._last_progress_report_time = 0.0
+        self.progress_callback(0.0)
+        self._report_scan_progress(phase_num, total_phases, 0.0, detail, force=True)
+
+    def _report_scan_progress(
+        self,
+        phase_num: int,
+        total_phases: int,
+        phase_progress: float,
+        detail: str,
+        *,
+        force: bool = False,
+        min_interval: float = 0.1,
+        log_debug: bool = True,
+    ) -> None:
+        """Update UI status/progress with time-based throttling and debug logging."""
+        phase_progress = max(0.0, min(1.0, phase_progress))
+        pct = int(phase_progress * 100)
+        if log_debug:
+            logger.debug(
+                "Phase %d/%d (%d%%): %s",
+                phase_num,
+                total_phases,
+                pct,
+                detail,
+            )
+        now = time.time()
+        if not force and (now - self._last_progress_report_time) < min_interval:
+            return
+        self._last_progress_report_time = now
+        self.progress_callback(phase_progress)
+        self.status_callback(f"{phase_num}/{total_phases} Scanning: {detail}")
     
     def _detect_cpu_architecture(self) -> Dict[str, int]:
         """
@@ -437,12 +515,15 @@ class ScanEngine:
                     # Check PRIMARY KEY structure
                     cursor.execute("PRAGMA table_info(phash_cache)")
                     columns = cursor.fetchall()
-                    pk_columns = [col[1] for col in columns if col[5] == 1]  # col[5] is pk flag
+                    pk_columns = [col[1] for col in columns if col[5] >= 1]  # col[5] is pk flag (1, 2, ...)
+                    logger.debug(f"DEBUG: phash_cache PK columns: {pk_columns}")
                     
-                    # If PRIMARY KEY is only (path), need to migrate
+                    # If PRIMARY KEY is only (path), need to migrate to (path, algo)
                     if len(pk_columns) == 1 and pk_columns[0] == 'path':
                         try:
                             logger.debug("DEBUG: Migrating phash_cache table structure from PRIMARY KEY (path) to PRIMARY KEY (path, algo)...")
+                            # Step 0: Clean up any failed previous migration attempt
+                            cursor.execute("DROP TABLE IF EXISTS phash_cache_new")
                             # Step 1: Create new table
                             cursor.execute("""
                                 CREATE TABLE phash_cache_new (
@@ -455,13 +536,14 @@ class ScanEngine:
                                     PRIMARY KEY (path, algo)
                                 )
                             """)
-                            # Step 2: Copy data
+                            logger.debug("DEBUG: Copying data to new table (this may take a moment for large databases)...")
                             cursor.execute("""
                                 INSERT INTO phash_cache_new (path, size, mtime_ns, algo, hash, updated)
                                 SELECT path, size, mtime_ns, algo, hash, updated
                                 FROM phash_cache
                             """)
                             migrated_count = cursor.rowcount
+                            logger.debug(f"DEBUG: Data copy finished, {migrated_count} rows copied. Pruning and renaming...")
                             # Step 3: Drop old table
                             cursor.execute("DROP TABLE phash_cache")
                             # Step 4: Rename new table
@@ -728,6 +810,64 @@ class ScanEngine:
     
     def is_raw_image_file(self, file_path: str) -> bool:
         return os.path.splitext(file_path.lower())[1] in self.RAW_EXTENSIONS
+
+    def _get_image_pixel_dimensions(self, file_path: str) -> Tuple[int, int]:
+        """Return display-oriented (width, height), matching thumbnail metadata where possible."""
+        if self.is_raw_image_file(file_path):
+            try:
+                import rawpy
+                with rawpy.imread(file_path) as raw:
+                    return int(raw.sizes.width), int(raw.sizes.height)
+            except Exception:
+                pass
+
+        if not IMAGEHASH_AVAILABLE:
+            return 0, 0
+
+        try:
+            from PIL import ImageOps
+            with Image.open(file_path) as im:
+                im = ImageOps.exif_transpose(im)
+                w, h = im.size
+                if w > 0 and h > 0:
+                    return int(w), int(h)
+        except Exception:
+            pass
+        return 0, 0
+
+    def _build_image_quick_select_details(self, img_files: List[str]) -> List[dict]:
+        """Collect resolution and file-size metadata for quick-select image strategies."""
+        details: List[dict] = []
+        for fp in img_files:
+            try:
+                st = os.stat(fp)
+                size_bytes = int(getattr(st, "st_size", 0) or 0)
+                mtime = float(getattr(st, "st_mtime", 0.0) or 0.0)
+                w, h = self._get_image_pixel_dimensions(fp)
+                details.append({
+                    "path": fp,
+                    "resolution": int(w * h),
+                    "width": int(w),
+                    "height": int(h),
+                    "size": size_bytes,
+                    "mtime": mtime,
+                })
+            except Exception:
+                continue
+        return details
+
+    def _apply_image_group_keep_decisions(
+        self,
+        decisions: Dict[str, bool],
+        files: List[str],
+        img_files: List[str],
+        keep: str,
+    ) -> None:
+        """Mark every file except the keeper for deletion (including non-image sidecars)."""
+        if keep not in files and img_files:
+            keep = img_files[0]
+        for fp in files:
+            decisions[fp] = (fp != keep)
     
     def is_video_file(self, file_path: str) -> bool:
         return os.path.splitext(file_path.lower())[1] in self.VIDEO_EXTENSIONS
@@ -1238,6 +1378,240 @@ class ScanEngine:
         except Exception as e:
             logger.debug(f"DEBUG: calculate_file_hash error {file_path}: {e}")
             return None
+
+    def calculate_phash_only(self, file_path: str) -> Optional[str]:
+        """Compute phash (single_hash algo) for tier-1 duplicate screening."""
+        saved_multi = self.use_multi_hash
+        try:
+            self.use_multi_hash = False
+            result = self.calculate_file_hash(file_path)
+            if result and result.startswith('img_'):
+                return result[4:]
+            return None
+        finally:
+            self.use_multi_hash = saved_multi
+
+    def _find_phash_candidate_files(
+        self,
+        image_files: List[str],
+        phase_num: int,
+        total_phases: int,
+    ) -> Set[str]:
+        """
+        Tier-1 screening: compute phash for all images, return only files that
+        might have duplicates (exact or LSH-similar phash). Skips unique images.
+        """
+        if not image_files or not IMAGEHASH_AVAILABLE:
+            return set(image_files)
+
+        phash_to_files: Dict[str, List[str]] = defaultdict(list)
+        failed_files: List[str] = []
+        total = len(image_files)
+        processed = 0
+
+        max_workers = self.hash_workers
+        max_inflight = max(max_workers * 6, 64)
+        last_update_time = time.time()
+        phash_progress_end = 0.72
+
+        def report_tier(phase_progress: float, detail: str, *, force: bool = False) -> None:
+            self._report_scan_progress(
+                phase_num,
+                total_phases,
+                phase_progress,
+                detail,
+                force=force,
+            )
+
+        report_tier(0.0, f"pHash pre-screen 0/{total:,}", force=True)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            file_iter = iter(image_files)
+            inflight: Dict = {}
+
+            def submit_one() -> bool:
+                try:
+                    fp = next(file_iter)
+                except StopIteration:
+                    return False
+                if self.scan_cancelled:
+                    return False
+                inflight[executor.submit(self.calculate_phash_only, fp)] = fp
+                return True
+
+            for _ in range(min(max_inflight, total)):
+                if not submit_one():
+                    break
+
+            while inflight:
+                if self.scan_cancelled:
+                    try:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
+                    return set(image_files)
+
+                done, _pending = wait(frozenset(inflight.keys()), timeout=0.25, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+
+                for fut in done:
+                    fp = inflight.pop(fut, None)
+                    try:
+                        ph = fut.result()
+                        if ph:
+                            phash_to_files[ph].append(fp)
+                        else:
+                            failed_files.append(fp)
+                    except Exception:
+                        failed_files.append(fp)
+
+                    processed += 1
+                    current_time = time.time()
+                    if (
+                        processed % 50 == 0
+                        or processed == total
+                        or (current_time - last_update_time) >= 0.25
+                    ):
+                        phase_progress = phash_progress_end * (processed / total if total > 0 else 0.0)
+                        report_tier(
+                            phase_progress,
+                            f"pHash pre-screen {processed:,}/{total:,}",
+                        )
+                        last_update_time = current_time
+
+                    while len(inflight) < max_inflight and submit_one():
+                        pass
+
+        candidates: Set[str] = set(failed_files)
+
+        for _ph, files in phash_to_files.items():
+            if len(files) > 1:
+                candidates.update(files)
+
+        unique_phashes = [ph for ph, files in phash_to_files.items() if len(files) == 1]
+        if len(unique_phashes) > 1:
+            report_tier(
+                phash_progress_end,
+                f"pHash done for {total:,} images — building similarity index ({len(unique_phashes):,} unique)...",
+                force=True,
+            )
+
+            uf = UnionFind()
+            phash_objs: Dict[str, object] = {}
+            threshold = self.hamming_threshold * 2
+            num_bands = 8
+            bits_per_band = 8
+            max_bucket_pair_items = 256
+            large_bucket_window = 64
+            lsh_build_start = phash_progress_end
+            lsh_build_end = 0.93
+            last_update_time = time.time()
+            lsh_buckets: Dict = defaultdict(list)
+
+            for idx, ph in enumerate(unique_phashes, 1):
+                if self.scan_cancelled:
+                    return set(image_files)
+                uf.find(ph)
+                obj = None
+                try:
+                    obj = imagehash.hex_to_hash(ph)
+                    phash_objs[ph] = obj
+                except Exception:
+                    phash_objs[ph] = None
+                if obj is not None:
+                    try:
+                        hash_bits = obj.hash.flatten()
+                        for band_idx in range(num_bands):
+                            start_bit = (band_idx * bits_per_band) % 64
+                            sampled_bits = [
+                                int(hash_bits[(start_bit + i * 7) % 64]) for i in range(bits_per_band)
+                            ]
+                            bucket_key = (band_idx, int(''.join(map(str, sampled_bits)), 2))
+                            lsh_buckets[bucket_key].append((ph, obj))
+                    except Exception:
+                        pass
+                now = time.time()
+                if idx == len(unique_phashes) or idx % 5000 == 0 or (now - last_update_time) >= 0.5:
+                    last_update_time = now
+                    progress = lsh_build_start + (lsh_build_end - lsh_build_start) * (
+                        idx / len(unique_phashes)
+                    )
+                    report_tier(
+                        progress,
+                        f"pHash similarity index {idx:,}/{len(unique_phashes):,}...",
+                    )
+
+            def iter_phash_bucket_pairs(bucket_items):
+                item_count = len(bucket_items)
+                if item_count <= max_bucket_pair_items:
+                    for i, item1 in enumerate(bucket_items):
+                        for item2 in bucket_items[i + 1:]:
+                            yield item1, item2
+                    return
+                sorted_items = sorted(bucket_items, key=lambda item: item[0])
+                for i, item1 in enumerate(sorted_items):
+                    end = min(item_count, i + large_bucket_window + 1)
+                    for item2 in sorted_items[i + 1:end]:
+                        yield item1, item2
+
+            active_buckets = [items for items in lsh_buckets.values() if len(items) >= 2]
+            total_active_buckets = len(active_buckets)
+            buckets_done = 0
+            lsh_compare_start = 0.94
+            last_update_time = time.time()
+
+            if total_active_buckets > 0:
+                report_tier(
+                    lsh_compare_start,
+                    f"Comparing {total_active_buckets:,} phash buckets for near-duplicates...",
+                    force=True,
+                )
+
+            for bucket_items in active_buckets:
+                if self.scan_cancelled:
+                    return set(image_files)
+                for (ph1, obj1), (ph2, obj2) in iter_phash_bucket_pairs(bucket_items):
+                    if ph1 == ph2:
+                        continue
+                    try:
+                        if obj1 - obj2 <= threshold:
+                            uf.union(ph1, ph2)
+                    except Exception:
+                        pass
+                buckets_done += 1
+                now = time.time()
+                if (
+                    buckets_done == total_active_buckets
+                    or buckets_done % 500 == 0
+                    or (now - last_update_time) >= 0.5
+                ):
+                    last_update_time = now
+                    progress = lsh_compare_start + 0.06 * (
+                        buckets_done / total_active_buckets
+                    )
+                    report_tier(
+                        progress,
+                        f"Comparing phash buckets {buckets_done:,}/{total_active_buckets:,}...",
+                    )
+
+            for _root, ph_list in uf.groups().items():
+                if len(ph_list) >= 2:
+                    for ph in ph_list:
+                        candidates.update(phash_to_files[ph])
+
+        skipped = total - len(candidates)
+        report_tier(
+            1.0,
+            f"pHash pre-screen complete: {len(candidates):,} candidates, {skipped:,} skipped",
+            force=True,
+        )
+        logger.debug(
+            "DEBUG: Tier-1 phash screening: %d candidates, %d skipped (unique phash)",
+            len(candidates),
+            skipped,
+        )
+        return candidates
     
     def _calculate_video_perceptual_hash(self, file_path: str) -> Optional[str]:
         """Calculate perceptual hash for video files by extracting keyframes."""
@@ -1429,22 +1803,34 @@ class ScanEngine:
             logger.debug(f"DEBUG: calculate_file_hash_cpu error {file_path}: {e}")
             return None
     
-    def calculate_partial_hash(self, file_path: str, chunk_size: int = 4096) -> Optional[str]:
+    def calculate_partial_hash(
+        self,
+        file_path: str,
+        chunk_size: int = 4096,
+        file_size: Optional[int] = None,
+        mtime_ns: Optional[int] = None,
+    ) -> Optional[str]:
         """Calculate partial MD5 hash (Start + Middle + End) with caching.
         
         The partial hash is cached to avoid recalculating on every scan.
         Uses a special cache key format: "partial_{hash}" in MD5 cache.
+        
+        Args:
+            file_path: Path to the file
+            chunk_size: Bytes to read from start/middle/end
+            file_size: Pre-known file size (avoids redundant os.stat)
+            mtime_ns: Pre-known mtime in nanoseconds (avoids redundant os.stat)
         """
         try:
-            st = os.stat(file_path)
-            file_size = int(getattr(st, "st_size", 0) or 0)
+            if file_size is None or mtime_ns is None:
+                st = os.stat(file_path)
+                file_size = int(getattr(st, "st_size", 0) or 0)
+                try:
+                    mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+                except Exception:
+                    mtime_ns = int(getattr(st, "st_mtime", 0.0) * 1e9)
             if file_size <= 0:
                 return None
-            
-            try:
-                mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
-            except Exception:
-                mtime_ns = int(getattr(st, "st_mtime", 0.0) * 1e9)
             
             # Check cache first (reuse MD5 cache infrastructure with special marker)
             # We use a virtual path with "partial_" prefix to distinguish from full MD5
@@ -1505,6 +1891,8 @@ class ScanEngine:
         total_image_files_lock: threading.Lock,
         all_image_files: Optional[List[str]] = None,
         all_image_files_lock: Optional[threading.Lock] = None,
+        file_metadata: Optional[Dict[str, Tuple[int, float]]] = None,
+        file_metadata_lock: Optional[threading.Lock] = None,
     ):
         """Collect files and group by size (optimized with os.scandir)."""
         try:
@@ -1513,6 +1901,7 @@ class ScanEngine:
             local_count = 0
             local_image_count = 0
             local_all_images = []
+            local_file_metadata = {}
             
             stack = [path]
             system_dirs_lower = self._get_system_dirs()
@@ -1549,6 +1938,7 @@ class ScanEngine:
                                     
                                     if file_size > 0:
                                         local_size_groups[file_size].append(entry.path)
+                                        local_file_metadata[entry.path] = (file_size, stat_info.st_mtime)
                                         local_count += 1
                                         
                                         if self.is_image_file(entry.name):
@@ -1577,6 +1967,11 @@ class ScanEngine:
                                                     all_image_files.extend(local_all_images)
                                                 local_all_images = []
                                             
+                                            if file_metadata is not None and file_metadata_lock is not None and local_file_metadata:
+                                                with file_metadata_lock:
+                                                    file_metadata.update(local_file_metadata)
+                                                local_file_metadata = {}
+                                            
                                             update_counter = 0
                             except (OSError, PermissionError):
                                 continue
@@ -1591,6 +1986,10 @@ class ScanEngine:
             if all_image_files is not None and all_image_files_lock is not None and local_all_images:
                 with all_image_files_lock:
                     all_image_files.extend(local_all_images)
+            
+            if file_metadata is not None and file_metadata_lock is not None and local_file_metadata:
+                with file_metadata_lock:
+                    file_metadata.update(local_file_metadata)
             
             with total_collected_lock:
                 total_collected[0] += local_count
@@ -1628,7 +2027,11 @@ class ScanEngine:
                 size = int(getattr(st, "st_size", 0) or 0)
                 if size <= 0:
                     return None
-                ph = self.calculate_partial_hash(fp)
+                try:
+                    mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+                except Exception:
+                    mtime_ns = int(getattr(st, "st_mtime", 0.0) * 1e9)
+                ph = self.calculate_partial_hash(fp, file_size=size, mtime_ns=mtime_ns)
                 if not ph:
                     return None
                 return f"{size}_{ph}"
@@ -1828,42 +2231,24 @@ class ScanEngine:
                     if self.opencv_verification_method and not skip_orb_verification:
                         logger.debug(f"DEBUG: Exact hash match found for {len(unique_files)} files, verifying with ORB (pairwise comparison)...")
                         
-                        # Use union-find approach to group similar files
-                        # Each file starts in its own group
-                        file_to_group = {f: {f} for f in unique_files}
+                        orb_uf = UnionFind()
+                        for f in unique_files:
+                            orb_uf.find(f)
                         
-                        # Compare all pairs of files
                         for i, file1 in enumerate(unique_files):
-                            for file2 in unique_files[i+1:]:
+                            for file2 in unique_files[i + 1:]:
                                 logger.debug(f"DEBUG: Verifying exact match pair: {os.path.basename(file1)} <-> {os.path.basename(file2)}")
                                 if self._verify_similarity_opencv(hash_val, hash_val, [file1], [file2], method=self.opencv_verification_method):
                                     logger.debug(f"DEBUG: ORB verification passed for pair")
-                                    # Merge groups
-                                    group1 = file_to_group[file1]
-                                    group2 = file_to_group[file2]
-                                    merged_group = group1 | group2
-                                    for f in merged_group:
-                                        file_to_group[f] = merged_group
+                                    orb_uf.union(file1, file2)
                                 else:
                                     logger.debug(f"DEBUG: ORB verification failed for pair")
                         
-                        # Find the largest group (or all groups with at least 2 files)
-                        groups = {}
-                        seen_files = set()
-                        for file, group in file_to_group.items():
-                            if file not in seen_files:
-                                group_id = min(group)  # Use minimum file path as group ID
-                                if group_id not in groups:
-                                    groups[group_id] = sorted(list(group))
-                                seen_files.update(group)
-                        
-                        # Create groups for all sets with at least 2 files
                         group_count = 0
-                        for group_id, group_files in groups.items():
+                        for _root, group_files in orb_uf.groups().items():
                             if len(group_files) >= 2:
-                                # Use a unique key for each subgroup
                                 subgroup_key = f"{hash_val}_subgroup_{group_count}"
-                                exact_match_groups[subgroup_key] = group_files
+                                exact_match_groups[subgroup_key] = sorted(group_files)
                                 logger.debug(f"DEBUG: Exact match subgroup created with {len(group_files)} verified files: {[os.path.basename(f) for f in group_files]}")
                                 group_count += 1
                         
@@ -1879,21 +2264,7 @@ class ScanEngine:
         remaining_hashes = [(h, f) for h, f in hash_list if h not in processed]
         
         if len(remaining_hashes) > 100:
-            # Phase 1: Quick filter using average_hash (fastest algorithm)
-            # Build average_hash index for fast lookup
-            avg_hash_index = {}  # avg_hash_value -> [hash_strings]
-            for hash_val, files in remaining_hashes:
-                objs = parsed_image_objs.get(hash_val)
-                if objs and objs[0]:
-                    h_avg = objs[0]
-                    avg_key = str(h_avg)
-                    if avg_key not in avg_hash_index:
-                        avg_hash_index[avg_key] = []
-                    avg_hash_index[avg_key].append((hash_val, files, h_avg))
-            
             # Phase 1: LSH-based similarity search (O(n) average case)
-            # Build LSH buckets using bit sampling
-            # Phase 1: Find candidates using LSH (Locality-Sensitive Hashing)
             logger.debug(f"DEBUG: Building LSH index for {len(remaining_hashes)} hashes...")
             lsh_buckets = defaultdict(list)
             num_bands = 8
@@ -2022,68 +2393,110 @@ class ScanEngine:
                 except Exception:
                     return None
             
-            # Parallel comparison of candidate pairs
+            # Parallel comparison of candidate pairs (priority-ordered, bounded inflight)
             similarity_pairs = []
             if candidate_pairs:
-                # Limit candidate pairs to avoid excessive processing
-                MAX_CANDIDATE_PAIRS = min(50000, len(candidate_pairs))  # Cap at 50K pairs
-                candidate_list = sorted(candidate_pairs)[:MAX_CANDIDATE_PAIRS]
-                logger.debug(f"DEBUG: Found {len(candidate_pairs)} candidate pairs, processing {len(candidate_list)} pairs")
+                MAX_CANDIDATE_PAIRS = min(50000, len(candidate_pairs))
+
+                def _pair_priority(pair: Tuple[str, str]) -> int:
+                    hash1, hash2 = pair
+                    objs1 = parsed_image_objs.get(hash1)
+                    objs2 = parsed_image_objs.get(hash2)
+                    if objs1 and objs2 and objs1[1] and objs2[1]:
+                        try:
+                            return objs1[1] - objs2[1]
+                        except Exception:
+                            pass
+                    return 999
+
+                candidate_list = sorted(candidate_pairs, key=_pair_priority)[:MAX_CANDIDATE_PAIRS]
+                logger.debug(
+                    f"DEBUG: Found {len(candidate_pairs)} candidate pairs, processing {len(candidate_list)} (priority-ordered)"
+                )
                 if self.opencv_verification_method:
                     logger.debug(f"DEBUG: ORB verification enabled, will verify {len(candidate_list)} candidate pairs")
                 
-                # Update status if ORB verification is enabled
                 total_pairs = len(candidate_list)
                 processed_pairs = [0]
                 last_update_time = [time.time()]
+                pair_workers = min(8, self.max_workers)
+                max_pair_inflight = max(pair_workers * 6, 64)
                 
-                # as_completed: faster than map() when pair costs vary (e.g. ORB), and avoids head-of-line blocking.
-                with ThreadPoolExecutor(max_workers=min(8, self.max_workers)) as executor:
-                    futures = [executor.submit(compare_pair_internal, p) for p in candidate_list]
-                    for fut in as_completed(futures):
+                with ThreadPoolExecutor(max_workers=pair_workers) as executor:
+                    pair_iter = iter(candidate_list)
+                    inflight_pairs: Dict = {}
+
+                    def submit_pair() -> bool:
                         try:
-                            result = fut.result()
-                        except Exception:
-                            result = None
-                        processed_pairs[0] += 1
-                        if not skip_orb_verification and (
-                            processed_pairs[0] % 100 == 0 or (time.time() - last_update_time[0]) >= 0.5
-                        ):
-                            if self.opencv_verification_method:
-                                status_msg = f"Verifying {processed_pairs[0]:,}/{total_pairs:,} pairs with {self.opencv_verification_method.upper()}..."
-                                self.status_callback(status_msg)
-                                logger.debug(f"DEBUG: {status_msg}")
-                            else:
-                                status_msg = f"Comparing {processed_pairs[0]:,}/{total_pairs:,} hash pairs..."
-                                self.status_callback(status_msg)
-                            last_update_time[0] = time.time()
-                        if result:
-                            similarity_pairs.append(result)
+                            p = next(pair_iter)
+                        except StopIteration:
+                            return False
+                        if self.scan_cancelled:
+                            return False
+                        inflight_pairs[executor.submit(compare_pair_internal, p)] = p
+                        return True
+
+                    for _ in range(min(max_pair_inflight, total_pairs)):
+                        if not submit_pair():
+                            break
+
+                    while inflight_pairs:
+                        if self.scan_cancelled:
+                            try:
+                                executor.shutdown(wait=False, cancel_futures=True)
+                            except Exception:
+                                pass
+                            break
+
+                        done, _pending = wait(
+                            frozenset(inflight_pairs.keys()), timeout=0.25, return_when=FIRST_COMPLETED
+                        )
+                        if not done:
+                            continue
+
+                        for fut in done:
+                            inflight_pairs.pop(fut, None)
+                            try:
+                                result = fut.result()
+                            except Exception:
+                                result = None
+                            processed_pairs[0] += 1
+                            if not skip_orb_verification and (
+                                processed_pairs[0] % 100 == 0 or (time.time() - last_update_time[0]) >= 0.5
+                            ):
+                                if self.opencv_verification_method:
+                                    status_msg = (
+                                        f"Verifying {processed_pairs[0]:,}/{total_pairs:,} pairs "
+                                        f"with {self.opencv_verification_method.upper()}..."
+                                    )
+                                    self.status_callback(status_msg)
+                                    logger.debug(f"DEBUG: {status_msg}")
+                                else:
+                                    status_msg = f"Comparing {processed_pairs[0]:,}/{total_pairs:,} hash pairs..."
+                                    self.status_callback(status_msg)
+                                last_update_time[0] = time.time()
+                            if result:
+                                similarity_pairs.append(result)
+
+                            while len(inflight_pairs) < max_pair_inflight and submit_pair():
+                                pass
             
-            # Build groups from similarity pairs
-            # Use union-find approach for grouping
-            hash_to_group = {}  # hash -> set of hashes in same group
+            # Build groups from similarity pairs using Union-Find
+            hash_uf = UnionFind()
             for hash1, hash2 in similarity_pairs:
-                if hash1 not in hash_to_group:
-                    hash_to_group[hash1] = {hash1}
-                if hash2 not in hash_to_group:
-                    hash_to_group[hash2] = {hash2}
-                # Merge groups
-                group1 = hash_to_group[hash1]
-                group2 = hash_to_group[hash2]
-                merged = group1 | group2
-                for h in merged:
-                    hash_to_group[h] = merged
+                hash_uf.find(hash1)
+                hash_uf.find(hash2)
+                hash_uf.union(hash1, hash2)
             
-            # Create duplicate groups
             seen_groups = set()
-            for hash_val, group in hash_to_group.items():
-                group_id = min(group)  # Use minimum hash as group ID
+            for _root, group in hash_uf.groups().items():
+                if len(group) < 2:
+                    continue
+                group_id = min(group)
                 if group_id in seen_groups:
                     continue
                 seen_groups.add(group_id)
                 
-                # Collect all files from this group
                 all_files = []
                 for h in group:
                     if h in hash_to_files:
@@ -2878,103 +3291,169 @@ class ScanEngine:
             # On error, default to accepting (hash matching is already reliable)
             return True
     
-    
-    def _prefilter_exact_duplicates(self, files: List[str]) -> tuple:
+    @staticmethod
+    @lru_cache(maxsize=500_000)
+    def _file_basename_lower(file_path: str) -> str:
+        return os.path.splitext(os.path.basename(file_path))[0].lower()
+
+    def _prefilter_from_size_groups(
+        self,
+        size_groups: Dict[int, List[str]],
+        file_metadata: Dict[str, Tuple[int, float]],
+        phase_num: Optional[int] = None,
+        total_phases: Optional[int] = None,
+    ) -> Tuple[Dict[str, List[str]], List[str]]:
         """
-        Pre-filter files to identify exact duplicates by size and name+timestamp.
-        This reduces the number of files that need hash calculation.
-        
-        Args:
-            files: List of file paths to check
-            
-        Returns:
-            tuple: (exact_duplicate_groups, remaining_files)
-                - exact_duplicate_groups: Dict mapping group_id to list of duplicate files
-                - remaining_files: List of files that still need hash calculation
+        Fast exact-duplicate prefilter using Phase-1 size_groups (no re-indexing).
+
+        Single-file size groups cannot contain same-size duplicates, so they are
+        appended to remaining_files in one bulk pass. Only multi-file groups run
+        the name+timestamp and size-pair checks.
         """
+        exact_duplicate_groups: Dict[str, List[str]] = {}
+        remaining_files: List[str] = []
+        group_id_counter = 0
+        last_ui_report = time.time()
+        report_ui = phase_num is not None and total_phases is not None
+
+        multi_groups = [(size, files) for size, files in size_groups.items() if len(files) >= 2]
+        total_multi = len(multi_groups)
+
+        for files in size_groups.values():
+            if len(files) == 1:
+                remaining_files.append(files[0])
+
+        logger.debug(
+            "DEBUG: _prefilter_from_size_groups: %d single-file groups (fast path), "
+            "%d multi-file groups to check",
+            len(size_groups) - total_multi,
+            total_multi,
+        )
+
+        if report_ui and total_multi > 0:
+            self._report_scan_progress(
+                phase_num,
+                total_phases,
+                0.1,
+                f"Checking {total_multi:,} multi-file size groups for exact duplicates...",
+                force=True,
+            )
+
+        for idx, (size, size_group_files) in enumerate(multi_groups, 1):
+            if self.scan_cancelled:
+                return exact_duplicate_groups, remaining_files
+
+            now = time.time()
+            if report_ui and (now - last_ui_report >= 0.5 or idx == total_multi):
+                last_ui_report = now
+                phase_progress = 0.1 + 0.9 * (idx / total_multi)
+                self._report_scan_progress(
+                    phase_num,
+                    total_phases,
+                    phase_progress,
+                    (
+                        f"Checking multi-file groups {idx:,}/{total_multi:,} "
+                        f"({len(exact_duplicate_groups):,} exact groups found)..."
+                    ),
+                    force=True,
+                )
+
+            matched_in_group: Set[str] = set()
+            name_mtime_groups: Dict[Tuple[str, float], List[str]] = defaultdict(list)
+            for file_path in size_group_files:
+                meta = file_metadata.get(file_path)
+                if not meta:
+                    continue
+                _size, mtime = meta
+                basename = self._file_basename_lower(file_path)
+                name_mtime_groups[(basename, mtime)].append(file_path)
+
+            for group_files in name_mtime_groups.values():
+                if len(group_files) > 1:
+                    group_id = f"exact_size_name_ts_{group_id_counter}_{size}"
+                    exact_duplicate_groups[group_id] = group_files
+                    matched_in_group.update(group_files)
+                    group_id_counter += 1
+
+            if len(size_group_files) - len(matched_in_group) == 2:
+                remaining_pair = [f for f in size_group_files if f not in matched_in_group]
+                if not self.is_image_file(remaining_pair[0]):
+                    group_id = f"exact_size_pair_{group_id_counter}_{size}"
+                    exact_duplicate_groups[group_id] = remaining_pair
+                    matched_in_group.update(remaining_pair)
+                    group_id_counter += 1
+                else:
+                    remaining_files.extend(remaining_pair)
+            else:
+                remaining_files.extend(
+                    file_path for file_path in size_group_files if file_path not in matched_in_group
+                )
+
+        if report_ui:
+            self._report_scan_progress(
+                phase_num,
+                total_phases,
+                1.0,
+                (
+                    f"Exact-duplicate filter done: {len(exact_duplicate_groups):,} groups, "
+                    f"{len(remaining_files):,} files need hashing"
+                ),
+                force=True,
+            )
+        logger.debug(
+            "DEBUG: _prefilter_from_size_groups done: %d exact groups, %d remaining files",
+            len(exact_duplicate_groups),
+            len(remaining_files),
+        )
+        return exact_duplicate_groups, remaining_files
+
+    def _prefilter_exact_duplicates(
+        self,
+        files: List[str],
+        cached_metadata: Optional[Dict[str, Tuple[int, float]]] = None,
+        phase_num: Optional[int] = None,
+        total_phases: Optional[int] = None,
+        progress_base: float = 0.0,
+        progress_scale: float = 1.0,
+    ) -> tuple:
+        """Build size groups from a file list, then run the optimized size-group prefilter."""
         if len(files) < 2:
             return {}, files
-        
-        exact_duplicate_groups = {}
-        remaining_files = []
-        
-        # Group files by size first
-        size_groups = defaultdict(list)
-        file_info = {}  # path -> (size, mtime, basename)
-        
-        for file_path in files:
-            try:
-                st = os.stat(file_path)
-                size = st.st_size
-                mtime = st.st_mtime
-                basename = os.path.splitext(os.path.basename(file_path))[0].lower()
-                size_groups[size].append(file_path)
-                file_info[file_path] = (size, mtime, basename)
-            except (OSError, PermissionError):
-                remaining_files.append(file_path)
-                continue
-        
-        # Check each size group for exact duplicates
-        processed_files = set()
-        group_id_counter = 0
-        
-        for size, size_group_files in size_groups.items():
-            if len(size_group_files) < 2:
-                remaining_files.extend(size_group_files)
-                continue
-            
-            # Strategy 1: Same size + same name + same timestamp = exact duplicate
-            # Group by (basename, timestamp_bucket)
-            name_timestamp_groups = defaultdict(list)
-            for file_path in size_group_files:
-                if file_path in file_info:
-                    size_val, mtime, basename = file_info[file_path]
-                    # Round timestamp to nearest second for matching
-                    timestamp_bucket = int(mtime)
-                    name_timestamp_groups[(basename, timestamp_bucket)].append(file_path)
-            
-            # If all files in this size group share the same (basename, timestamp), they're exact duplicates
-            for (basename, ts), group_files in name_timestamp_groups.items():
-                if len(group_files) >= 2:
-                    # All files with same size, name, and timestamp = exact duplicates
-                    group_id = f"exact_size_name_ts_{group_id_counter}"
-                    exact_duplicate_groups[group_id] = group_files
-                    processed_files.update(group_files)
-                    group_id_counter += 1
-                    logger.debug(f"DEBUG: Pre-filter exact duplicate (size+name+timestamp): {len(group_files)} files, name={basename}, size={size}")
-            
-            # Strategy 2: Same size + exactly 2 files = likely exact duplicates (for non-image files)
-            # For image files, we still need perceptual hash as same size doesn't mean same image
-            # But for non-image files (like documents), same size often means exact duplicate
-            for file_path in size_group_files:
-                if file_path not in processed_files:
-                    # Check if this file is part of a same-size pair
-                    same_size_files = [f for f in size_group_files if f not in processed_files]
-                    if len(same_size_files) == 2:
-                        # Only 2 files with same size = likely exact duplicates
-                        # But we need to be careful: for images, same size doesn't mean same content
-                        # So we only apply this for non-image files
-                        if not self.is_image_file(same_size_files[0]):
-                            group_id = f"exact_size_pair_{group_id_counter}"
-                            exact_duplicate_groups[group_id] = same_size_files
-                            processed_files.update(same_size_files)
-                            group_id_counter += 1
-                            logger.debug(f"DEBUG: Pre-filter exact duplicate (same size pair, non-image): {len(same_size_files)} files, size={size}")
-                        else:
-                            # For images, we still need hash calculation
-                            remaining_files.extend(same_size_files)
-                            processed_files.update(same_size_files)
-                    else:
-                        # More than 2 files with same size, need hash calculation
-                        remaining_files.append(file_path)
-        
-        # Add any unprocessed files
-        for file_path in files:
-            if file_path not in processed_files:
-                remaining_files.append(file_path)
-        
-        return exact_duplicate_groups, remaining_files
-    
+
+        metadata: Dict[str, Tuple[int, float]] = dict(cached_metadata or {})
+        size_groups: Dict[int, List[str]] = defaultdict(list)
+        files_to_stat: List[str] = []
+
+        for fp in files:
+            if fp in metadata:
+                size, mtime = metadata[fp]
+                size_groups[size].append(fp)
+            else:
+                files_to_stat.append(fp)
+
+        if files_to_stat:
+            def get_file_stat(fp: str):
+                try:
+                    st = os.stat(fp)
+                    return fp, st.st_size, st.st_mtime
+                except (OSError, PermissionError):
+                    return fp, None, None
+
+            with ThreadPoolExecutor(max_workers=min(32, self.max_workers * 2)) as executor:
+                for fp, size, mtime in executor.map(get_file_stat, files_to_stat):
+                    if self.scan_cancelled:
+                        return {}, files
+                    if size is not None:
+                        size_groups[size].append(fp)
+                        metadata[fp] = (size, mtime)
+
+        return self._prefilter_from_size_groups(
+            size_groups,
+            metadata,
+            phase_num=phase_num,
+            total_phases=total_phases,
+        )
+
     def _merge_raw_jpeg_by_timestamp(self, duplicate_groups: Dict[str, List[str]], time_threshold: float = 5.0) -> Dict[str, List[str]]:
         """
         Merge RAW and JPEG files that have similar timestamps into the same group.
@@ -3119,6 +3598,8 @@ class ScanEngine:
             total_image_files_lock = threading.Lock()
             all_image_files = []
             all_image_files_lock = threading.Lock()
+            file_metadata = {}
+            file_metadata_lock = threading.Lock()
             
             logger.debug(f"DEBUG: Engine scan_duplicate_files called with paths={scan_paths}")
             logger.debug(f"DEBUG: use_imagehash={self.use_imagehash}")
@@ -3164,8 +3645,8 @@ class ScanEngine:
                                             if self.is_image_file(entry.name):
                                                 total_image_files[0] += 1
                                                 if self.use_imagehash:
-                                                    with all_image_files_lock:
-                                                        all_image_files.append(entry.path)
+                                                    all_image_files.append(entry.path)
+                                            file_metadata[entry.path] = (st.st_size, st.st_mtime)
                                 except (OSError, PermissionError):
                                     continue
                     except Exception:
@@ -3186,7 +3667,8 @@ class ScanEngine:
                         path, size_groups, total_collected, size_groups_lock, total_collected_lock,
                         total_image_files, total_image_files_lock,
                         all_image_files if self.use_imagehash else None,
-                        all_image_files_lock if self.use_imagehash else None
+                        all_image_files_lock if self.use_imagehash else None,
+                        file_metadata, file_metadata_lock
                     )
                     futures.append(future)
                 
@@ -3235,57 +3717,39 @@ class ScanEngine:
             
             # Phase 2: Filter potential duplicates
             phase_num = 2
-            logger.debug(f"DEBUG: Phase 2 - Filtering potential duplicates")
-            # Reset progress bar to 0% for Phase 2 (each phase has its own progress bar)
-            self.progress_callback(0.0)
-            self.status_callback(f"{phase_num}/{total_phases} Scanning: Filtering potential duplicates...")
+            logger.debug(f"DEBUG: Phase 2 - Filtering potential duplicates (total_collected={total_collected[0]})")
+            self._begin_scan_phase(
+                phase_num,
+                total_phases,
+                "Preparing exact-duplicate filter...",
+            )
             potential_duplicates_by_size = []
+            logger.debug(f"DEBUG: Phase 2 - Initializing filtering, use_imagehash={self.use_imagehash}")
             
-            # Pre-filter: Identify exact duplicates by size and name+timestamp (skip hash calculation)
-            # These will be added directly to results without hash calculation
-            exact_duplicate_groups = {}  # hash_val -> list of files
-            exact_duplicate_count = 0
-            
-            if self.use_imagehash:
-                image_files_for_hash = list(dict.fromkeys(all_image_files))
-                non_image_files_by_size = []
-                
-                for size, files in size_groups.items():
-                    if len(files) > 1:
-                        non_image_in_group = [fp for fp in files if not self.is_image_file(fp)]
-                        if len(non_image_in_group) > 1:
-                            # Pre-filter: Check for exact duplicates by size and name+timestamp
-                            exact_groups, remaining_files = self._prefilter_exact_duplicates(non_image_in_group)
-                            exact_duplicate_groups.update(exact_groups)
-                            exact_duplicate_count += sum(len(files) for files in exact_groups.values())
-                            non_image_files_by_size.extend(remaining_files)
-                
-                # Pre-filter image files by size and name+timestamp
-                if len(image_files_for_hash) > 1:
-                    exact_image_groups, remaining_image_files = self._prefilter_exact_duplicates(image_files_for_hash)
-                    exact_duplicate_groups.update(exact_image_groups)
-                    exact_duplicate_count += sum(len(files) for files in exact_image_groups.values())
-                    potential_duplicates_by_size.extend(remaining_image_files)
-                else:
-                    potential_duplicates_by_size.extend(image_files_for_hash)
-                
-                potential_duplicates_by_size.extend(non_image_files_by_size)
-            else:
-                for size, files in size_groups.items():
-                    if len(files) > 1:
-                        # Pre-filter: Check for exact duplicates by size and name+timestamp
-                        exact_groups, remaining_files = self._prefilter_exact_duplicates(files)
-                        exact_duplicate_groups.update(exact_groups)
-                        exact_duplicate_count += sum(len(files) for files in exact_groups.values())
-                        potential_duplicates_by_size.extend(remaining_files)
+            # Pre-filter using Phase-1 size_groups directly (no re-indexing of 300k+ files)
+            exact_duplicate_groups, potential_duplicates_by_size = self._prefilter_from_size_groups(
+                size_groups,
+                file_metadata,
+                phase_num=phase_num,
+                total_phases=total_phases,
+            )
+            exact_duplicate_count = sum(len(files) for files in exact_duplicate_groups.values())
             
             if exact_duplicate_count > 0:
                 logger.debug(f"DEBUG: Pre-filtered {exact_duplicate_count} files as exact duplicates (skipping hash calculation)")
                 logger.debug(f"DEBUG: Found {len(exact_duplicate_groups)} exact duplicate groups by size/name+timestamp")
             
             logger.debug(f"DEBUG: Found {len(potential_duplicates_by_size)} potential duplicate files (need hash calculation)")
-            # Phase 2 complete: set progress to 100% (1.0) for this phase
-            self.progress_callback(1.0)
+            self._report_scan_progress(
+                phase_num,
+                total_phases,
+                1.0,
+                (
+                    f"Filtering complete: {len(potential_duplicates_by_size):,} files need hashing, "
+                    f"{len(exact_duplicate_groups):,} exact groups found"
+                ),
+                force=True,
+            )
             if not potential_duplicates_by_size:
                 self.status_callback("No duplicate files found.")
                 self.results_callback({})
@@ -3327,19 +3791,53 @@ class ScanEngine:
                         files_to_full_hash.extend(files)
             
             files_to_full_hash = list(dict.fromkeys(files_to_full_hash))
+
+            # Tier-1 phash screening: skip full multi-hash for images with unique phash
+            if self.use_imagehash and self.use_multi_hash and IMAGEHASH_AVAILABLE:
+                tier_phase = 4 if not self.use_imagehash else 3
+                image_files_for_tier = []
+                non_tier_files = []
+                for fp in files_to_full_hash:
+                    ext = os.path.splitext(fp)[1].lower()
+                    if ext in self.VIDEO_EXTENSIONS:
+                        non_tier_files.append(fp)
+                    elif self.is_image_file(fp):
+                        image_files_for_tier.append(fp)
+                    else:
+                        non_tier_files.append(fp)
+
+                if image_files_for_tier:
+                    phash_candidates = self._find_phash_candidate_files(
+                        image_files_for_tier,
+                        phase_num=tier_phase,
+                        total_phases=total_phases,
+                    )
+                    files_to_full_hash = list(dict.fromkeys(non_tier_files + list(phash_candidates)))
+                    logger.debug(
+                        f"DEBUG: Tier-1 reduced full-hash set from "
+                        f"{len(non_tier_files) + len(image_files_for_tier)} to {len(files_to_full_hash)} files"
+                    )
+
             self.total_files = len(files_to_full_hash)
             logger.debug(f"DEBUG: {self.total_files} files to hash")
             
             if self.total_files == 0:
+                if exact_duplicate_groups:
+                    self._flush_cache_writes()
+                    self.status_callback("Scan complete.")
+                    self.results_callback(dict(exact_duplicate_groups))
+                    return
                 self.status_callback("No files to hash.")
                 self.results_callback({})
                 return
             
             # Phase 4: Full hash calculation (or Phase 3 if using imagehash)
             phase_num = 4 if not self.use_imagehash else 3
-            is_3_phase = self.use_imagehash  # True if 3 phases, False if 4 phases
-            # Reset progress bar to 0% for hash calculation phase
-            self.progress_callback(0.0)
+            self._begin_scan_phase(
+                phase_num,
+                total_phases,
+                f"Calculating hash 0/{self.total_files:,}",
+            )
             hash_groups = defaultdict(list)
             processed = 0
             
@@ -3407,7 +3905,7 @@ class ScanEngine:
                             file_path = inflight.pop(future, None)
                             try:
                                 file_hash = future.result()
-                                if file_hash and file_path not in hash_groups[file_hash]:
+                                if file_hash:
                                     hash_groups[file_hash].append(file_path)
                             except Exception as e:
                                 logger.debug(f"Hash calculation error {file_path}: {e}")
@@ -3501,13 +3999,19 @@ class ScanEngine:
                     file_basenames = {}
                     
                     for file_path in unique_files:
-                        try:
-                            st = os.stat(file_path)
-                            file_sizes[file_path] = st.st_size
-                            file_timestamps[file_path] = st.st_mtime
+                        if file_path in file_metadata:
+                            size, mtime = file_metadata[file_path]
+                            file_sizes[file_path] = size
+                            file_timestamps[file_path] = mtime
                             file_basenames[file_path] = os.path.splitext(os.path.basename(file_path))[0].lower()
-                        except (OSError, PermissionError):
-                            continue
+                        else:
+                            try:
+                                st = os.stat(file_path)
+                                file_sizes[file_path] = st.st_size
+                                file_timestamps[file_path] = st.st_mtime
+                                file_basenames[file_path] = os.path.splitext(os.path.basename(file_path))[0].lower()
+                            except (OSError, PermissionError):
+                                continue
                     
                     # Group files by size
                     size_groups = defaultdict(list)
@@ -4008,111 +4512,68 @@ class ScanEngine:
                     decisions[fp] = (fp != keep_path)
         
         elif mode == 'best_res':
-            # Keep highest resolution image (W*H), if multiple images share the highest resolution, keep the one with largest file size
+            # Keep highest resolution (W*H); exact same dimensions tie on largest file size.
             for hash_val, files in items:
                 if len(files) < 2:
                     continue
                 img_files = [fp for fp in files if self.is_image_file(fp)]
                 if len(img_files) < 2:
+                    if len(img_files) == 1:
+                        self._apply_image_group_keep_decisions(
+                            decisions, files, img_files, img_files[0]
+                        )
                     continue
-                details = []
-                for fp in img_files:
-                    try:
-                        st = os.stat(fp)
-                        size_bytes = int(getattr(st, "st_size", 0) or 0)
-                        mtime = float(getattr(st, "st_mtime", 0.0) or 0.0)
-                        w = h = 0
-                        try:
-                            with Image.open(fp) as im:
-                                w, h = im.size
-                        except Exception:
-                            w = h = 0
-                        # Calculate resolution as W * H (area)
-                        resolution = int(w * h)
-                        details.append({
-                            "path": fp,
-                            "resolution": resolution,
-                            "width": int(w),
-                            "height": int(h),
-                            "size": size_bytes,
-                            "mtime": mtime,
-                        })
-                    except Exception:
-                        continue
+                details = self._build_image_quick_select_details(img_files)
                 if not details:
                     continue
-                
-                # Step 1: Find the highest resolution (W*H)
-                max_resolution = max(d["resolution"] for d in details)
-                
-                # Step 2: Filter to only images with the highest resolution
-                highest_res_images = [d for d in details if d["resolution"] == max_resolution]
-                
-                # Step 3: Among images with highest resolution, keep the one with largest file size
-                # (better quality, less compression)
-                # If file sizes are equal, use mtime, path length, and path as tiebreakers
+
+                best_dims = max(details, key=lambda d: (d["resolution"], d["width"], d["height"]))
+                highest_res_images = [
+                    d for d in details
+                    if d["resolution"] == best_dims["resolution"]
+                    and d["width"] == best_dims["width"]
+                    and d["height"] == best_dims["height"]
+                ]
+                if not highest_res_images:
+                    highest_res_images = details
+
                 keep = max(
                     highest_res_images,
                     key=lambda d: (d["size"], -d["mtime"], -len(d["path"]), d["path"])
                 )["path"]
-                
-                if keep not in img_files and img_files:
-                    keep = img_files[0]
-                for fp in img_files:
-                    decisions[fp] = (fp != keep)
+                self._apply_image_group_keep_decisions(decisions, files, img_files, keep)
         
         elif mode == 'keep_smallest':
-            # Keep highest resolution image (W*H), if multiple images share the highest resolution, keep the one with smallest file size
+            # Keep highest resolution; exact same dimensions tie on smallest file size.
             for hash_val, files in items:
                 if len(files) < 2:
                     continue
                 img_files = [fp for fp in files if self.is_image_file(fp)]
                 if len(img_files) < 2:
+                    if len(img_files) == 1:
+                        self._apply_image_group_keep_decisions(
+                            decisions, files, img_files, img_files[0]
+                        )
                     continue
-                details = []
-                for fp in img_files:
-                    try:
-                        st = os.stat(fp)
-                        size_bytes = int(getattr(st, "st_size", 0) or 0)
-                        mtime = float(getattr(st, "st_mtime", 0.0) or 0.0)
-                        w = h = 0
-                        try:
-                            with Image.open(fp) as im:
-                                w, h = im.size
-                        except Exception:
-                            w = h = 0
-                        # Calculate resolution as W * H (area)
-                        resolution = int(w * h)
-                        details.append({
-                            "path": fp,
-                            "resolution": resolution,
-                            "width": int(w),
-                            "height": int(h),
-                            "size": size_bytes,
-                            "mtime": mtime,
-                        })
-                    except Exception:
-                        continue
+                details = self._build_image_quick_select_details(img_files)
                 if not details:
                     continue
-                
-                # Step 1: Find the highest resolution (W*H)
-                max_resolution = max(d["resolution"] for d in details)
-                
-                # Step 2: Filter to only images with the highest resolution
-                highest_res_images = [d for d in details if d["resolution"] == max_resolution]
-                
-                # Step 3: Among images with highest resolution, keep the one with smallest file size
-                # If file sizes are equal, use mtime, path length, and path as tiebreakers
+
+                best_dims = max(details, key=lambda d: (d["resolution"], d["width"], d["height"]))
+                highest_res_images = [
+                    d for d in details
+                    if d["resolution"] == best_dims["resolution"]
+                    and d["width"] == best_dims["width"]
+                    and d["height"] == best_dims["height"]
+                ]
+                if not highest_res_images:
+                    highest_res_images = details
+
                 keep = min(
                     highest_res_images,
                     key=lambda d: (d["size"], d["mtime"], len(d["path"]), d["path"])
                 )["path"]
-                
-                if keep not in img_files and img_files:
-                    keep = img_files[0]
-                for fp in img_files:
-                    decisions[fp] = (fp != keep)
+                self._apply_image_group_keep_decisions(decisions, files, img_files, keep)
         
         elif mode == 'keep_raw':
             # Keep RAW file if present, only applicable when RAW and non-RAW files are mixed
@@ -4133,12 +4594,7 @@ class ScanEngine:
                         try:
                             st = os.stat(fp)
                             mtime = float(getattr(st, "st_mtime", 0.0) or 0.0)
-                            w = h = 0
-                            try:
-                                with Image.open(fp) as im:
-                                    w, h = im.size
-                            except Exception:
-                                pass
+                            w, h = self._get_image_pixel_dimensions(fp)
                             maxd = int(max(w, h)) if w and h else 0
                             mind = int(min(w, h)) if w and h else 0
                             area = int(maxd * mind)

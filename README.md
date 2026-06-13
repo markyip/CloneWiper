@@ -1,5 +1,5 @@
 # CloneWiper
-[![Version](https://img.shields.io/badge/version-1.2-blue.svg)](https://github.com/markyip/CloneWiper/releases)
+[![Version](https://img.shields.io/badge/version-1.3-blue.svg)](https://github.com/markyip/CloneWiper/releases)
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
@@ -11,13 +11,16 @@ CloneWiper is a high-performance, modern duplicate file detection tool built wit
 ## ✨ Features
 
 ### Core Functionality
-- **Smart Duplicate Detection**: Three hash modes for flexible duplicate detection
+- **Smart Duplicate Detection**: Five hash modes for flexible duplicate detection
   - **MD5 Only**: Fast exact duplicate detection using MD5 checksums (best for identical files)
-  - **Single Perceptual Hash**: Detects visually similar images using average hash algorithm
+  - **Single Perceptual Hash**: Detects visually similar images using phash algorithm
   - **Multi-Algorithm Perceptual Hashing** (Default): Combines four algorithms (average_hash, phash, dhash, whash) with voting mechanism for superior accuracy
     - Uses Hamming distance comparison with voting (requires 3/4 algorithms to agree)
     - Detects duplicates even when images are resized, compressed, or slightly modified
-    - Optimized with parallel hash calculation and two-phase filtering
+    - **Tier-1 pHash screening** skips full multi-hash work for images with a unique perceptual hash
+    - Optimized with parallel hash calculation, batched size-group prefiltering, and Union-Find similarity grouping
+  - **Single P-Hash + ORB**: Single perceptual hash with ORB feature verification for higher-confidence image matches
+  - **Multi-Algo P-Hash + ORB**: Multi-algorithm voting plus ORB verification (most accurate, slowest)
   - **Image Support**: Works with common formats (JPEG, PNG, GIF, BMP, TIFF, WebP) and RAW files (CR2, NEF, ARW, etc.)
   - **Video Support**: Perceptual hashing for video files using keyframe extraction
 - **Cross-Platform Support**: Works on Windows (macOS support from source code only)
@@ -26,7 +29,7 @@ CloneWiper is a high-performance, modern duplicate file detection tool built wit
   - **Fast Scanning**: Uses `os.scandir` for efficient file system enumeration (up to 20x faster than traditional scanning)
   - Dynamic CPU optimization for hybrid architectures (P-cores/E-cores detection)
   - Adaptive I/O strategy (preloads small files for MD5, chunks large files)
-  - Similarity grouping tuned for throughput (LSH-style candidate search, pre-parsed perceptual hashes, parallel pair comparison)
+  - Similarity grouping tuned for throughput (tiered pHash screening, LSH-style candidate search, Union-Find clustering, priority-ordered pair comparison)
   - Batch cache writes to reduce database lock contention
 - **Persistent Caching**: 
   - **Hash Cache**: SQLite-backed cache (p-hash and MD5) for fast re-scans
@@ -43,14 +46,15 @@ CloneWiper is a high-performance, modern duplicate file detection tool built wit
 - **Interactive File Cards**: Hover effects, scrolling text for long filenames, selection management, and visually aligned rounded thumbnail cards
 - **Pagination**: Efficient handling of large result sets with 100 groups per page and clickable page indicator dropdown
 - **Drag & Drop**: Drag and drop folders onto the results area for easy folder selection; remove folders with the inline `x`, Delete, Backspace, or context menu
-- **Real-Time Progress**: Centered progress indicator with adaptive update intervals
+- **Real-Time Progress**: Centered progress indicator with phase detail and percentage; adaptive update intervals for large scans (prefilter, pHash index, and hash phases)
 - **Quick Selection Strategies**:
   - **Keep Newest**: Keeps the most recently modified file
   - **Keep Oldest**: Keeps the oldest file by modification time
-  - **Keep Best**: Keeps the highest resolution image; if multiple share the highest resolution, keeps the largest file size
-  - **Keep Smallest**: Keeps the highest resolution image; if multiple share the highest resolution, keeps the smallest file size
+  - **Keep Best**: Keeps the highest resolution image (exact width × height); if multiple match, keeps the largest file size; marks sidecars and non-image files in the group for deletion
+  - **Keep Smallest**: Keeps the highest resolution image; if multiple match, keeps the smallest file size
   - **Keep RAW**: Prefers RAW files over JPEG when both exist in the same group
 - **Quick Actions**: Delete Selected, Clear Selection (with scope: Current Page or All Pages)
+  - Footer quick-action bar scrolls horizontally on narrow windows and stays hidden during scans
   - Selected quick-selection strategy remains highlighted after use
 
 ### Advanced Features
@@ -145,7 +149,7 @@ python3 main.py
 
 ### Hash Mode Selection
 
-CloneWiper offers three hash modes for different use cases:
+CloneWiper offers five hash modes for different use cases:
 
 1. **MD5 Only** (Fastest)
    - Best for: Finding exact duplicate files
@@ -155,17 +159,29 @@ CloneWiper offers three hash modes for different use cases:
 
 2. **Single Perceptual Hash** (Balanced)
    - Best for: Finding visually similar images with moderate accuracy
-   - Uses: Average hash algorithm
+   - Uses: phash algorithm
    - Pros: Faster than multi-algorithm, detects resized/compressed images
    - Cons: Less accurate than multi-algorithm mode
 
-3. **Multi-Algorithm Perceptual Hash** (Most Accurate - Default)
-   - Best for: Finding visually similar images with highest accuracy
+3. **Multi-Algorithm Perceptual Hash** (Most Accurate — Default)
+   - Best for: Finding visually similar images with highest accuracy without ORB overhead
    - Uses: Four algorithms (average, perceptual, difference, wavelet) with voting
-   - Pros: Highest accuracy, detects duplicates even with modifications
-   - Cons: Slower than other modes (but optimized with parallel processing)
+   - Pros: Highest hash-only accuracy, tier-1 pHash screening speeds up large libraries
+   - Cons: Slower than single-hash or MD5 modes
 
-**Recommendation**: Use Multi-Algorithm Perceptual Hash for most cases, as it provides the best balance of accuracy and performance with caching enabled.
+4. **Single P-Hash + ORB** (Accurate with verification)
+   - Best for: Image libraries where false positives must be minimized
+   - Uses: phash plus ORB feature matching on candidate pairs
+   - Pros: Strong visual verification on top of perceptual hashing
+   - Cons: Slower than hash-only modes
+
+5. **Multi-Algo P-Hash + ORB** (Maximum accuracy)
+   - Best for: Critical deduplication where accuracy matters more than speed
+   - Uses: Multi-algorithm voting plus ORB verification
+   - Pros: Strictest matching
+   - Cons: Slowest mode
+
+**Recommendation**: Use **Multi-Algorithm Perceptual Hash** for most cases. Use an **ORB** mode when you need extra verification on near-duplicate images.
 
 ## 🔨 Building Executables
 
@@ -185,9 +201,10 @@ CloneWiper offers three hash modes for different use cases:
    - Check and install PyInstaller if needed
    - Build an optimized executable with all features
    - Exclude unnecessary modules to minimize file size
-   
-   **Notes**:
+
+   **Notes:**
    - **Python 3.12+**: The script must **not** exclude `distutils` (PyInstaller 6’s `distutils` hook conflicts with `--exclude-module=distutils`). The provided `build_windows.bat` follows this.
+   - **Application icon**: the build bundles `icons\favicon.ico` into an `icons/` folder inside the executable so the taskbar and title bar show the correct icon.
    - If your executable is larger than expected (>300MB), create a clean virtual environment with only the dependencies you need before building.
 
    Or manually:
@@ -210,6 +227,7 @@ CloneWiper/
 │   ├── engine.py           # Core scanning and hashing engine
 │   └── thumbnail_cache.py  # Persistent SQLite thumbnail cache
 ├── icons/
+│   ├── favicon.ico         # Multi-size application icon (Windows)
 │   └── README.md           # Icon resources documentation
 ├── main.py                 # Application entry point
 ├── qt_app.py               # PySide6 UI implementation
@@ -220,13 +238,14 @@ CloneWiper/
 ├── build_windows.bat       # Windows PyInstaller build script
 ├── RELEASE_NOTES_v1.1.md   # Release notes for v1.1
 ├── RELEASE_NOTES_v1.2.md   # Release notes for v1.2
+├── RELEASE_NOTES_v1.3.md   # Release notes for v1.3
 ├── README.md               # This file
 └── LICENSE                 # License file
 ```
 
 ## 📦 Releases
 
-See [RELEASE_NOTES_v1.2.md](RELEASE_NOTES_v1.2.md) for the latest changes. Older notes live in [RELEASE_NOTES_v1.1.md](RELEASE_NOTES_v1.1.md) and on the [GitHub Releases](https://github.com/markyip/CloneWiper/releases) page.
+See [RELEASE_NOTES_v1.3.md](RELEASE_NOTES_v1.3.md) for the latest changes. Older notes live in [RELEASE_NOTES_v1.2.md](RELEASE_NOTES_v1.2.md), [RELEASE_NOTES_v1.1.md](RELEASE_NOTES_v1.1.md), and on the [GitHub Releases](https://github.com/markyip/CloneWiper/releases) page.
 
 ##  Development
 

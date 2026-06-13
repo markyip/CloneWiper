@@ -84,7 +84,7 @@ pyinstaller --onefile ^
     --name=CloneWiper ^
     %ICON_ARG% ^
     --add-data "core;core" ^
-    --add-data "%ICON_DATA%;." ^
+    --add-data "icons\favicon.ico;icons" ^
     --hidden-import=PySide6.QtCore ^
     --hidden-import=PySide6.QtGui ^
     --hidden-import=PySide6.QtWidgets ^

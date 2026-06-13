@@ -156,7 +156,10 @@ class PersistentThumbnailCache:
             cutoff = int(time.time()) - (max_days * 86400)
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("DELETE FROM thumbnails WHERE last_access < ?", (cutoff,))
-                if vacuum:
+            
+            # VACUUM must be outside a transaction
+            if vacuum:
+                with sqlite3.connect(self.db_path) as conn:
                     conn.execute("VACUUM")
         except Exception as e:
             logger.debug("Error cleaning thumbnail cache: %s", e)

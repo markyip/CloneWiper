@@ -57,6 +57,48 @@ except ImportError:
     print("Warning: PySide6 not found. Please install it with 'pip install PySide6'")
 
 from core.engine import ScanEngine, FileItem, Group
+
+
+def _resolve_favicon_path() -> Optional[str]:
+    """Locate favicon.ico for dev runs and PyInstaller onefile bundles."""
+    candidates: List[str] = []
+    if getattr(sys, 'frozen', False):
+        meipass = getattr(sys, '_MEIPASS', '')
+        if meipass:
+            candidates.extend([
+                os.path.join(meipass, 'icons', 'favicon.ico'),
+                os.path.join(meipass, 'favicon.ico'),
+            ])
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.extend([
+        os.path.join(script_dir, 'icons', 'favicon.ico'),
+        os.path.join(script_dir, 'favicon.ico'),
+        os.path.join(os.getcwd(), 'icons', 'favicon.ico'),
+        os.path.join(os.getcwd(), 'favicon.ico'),
+    ])
+    seen: set = set()
+    for path in candidates:
+        norm = os.path.normpath(path)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if os.path.isfile(norm):
+            return norm
+    return None
+
+
+def _load_app_icon() -> Optional['QIcon']:
+    """Load application icon from resolved favicon path."""
+    if not PYSIDE6_AVAILABLE:
+        return None
+    icon_path = _resolve_favicon_path()
+    if not icon_path:
+        return None
+    try:
+        icon = QIcon(icon_path)
+        return icon if not icon.isNull() else None
+    except Exception:
+        return None
 from core.thumbnail_cache import PersistentThumbnailCache
 
 if not PYSIDE6_AVAILABLE:
@@ -173,38 +215,17 @@ class CustomTitleBar(QFrame):
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.icon_label.setStyleSheet("background-color: transparent; border: none;")
         
-        # Load favicon - try multiple paths (works in dev and when packaged)
-        # Get the directory where the script is located
-        if getattr(sys, 'frozen', False):
-            # Running as compiled executable
-            base_path = sys._MEIPASS
-        else:
-            # Running as script
-            base_path = os.path.dirname(os.path.abspath(__file__))
-        
-        icon_paths = [
-            os.path.join(base_path, "icons", "favicon.ico"),
-            os.path.join(base_path, "favicon.ico"),  # Fallback for old builds
-            os.path.join(os.getcwd(), "icons", "favicon.ico"),
-            os.path.join(os.getcwd(), "favicon.ico"),  # Fallback
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons", "favicon.ico"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.ico"),  # Fallback
-            "icons/favicon.ico",
-            "favicon.ico"  # Fallback
-        ]
-        
+        # Load favicon for title bar logo
         icon_loaded = False
-        for icon_path in icon_paths:
-            if os.path.exists(icon_path):
-                try:
-                    icon = QIcon(icon_path)
-                    pixmap = icon.pixmap(28, 28)
-                    if not pixmap.isNull():
-                        self.icon_label.setPixmap(pixmap)
-                        icon_loaded = True
-                        break
-                except Exception:
-                    continue
+        app_icon = _load_app_icon()
+        if app_icon is not None:
+            try:
+                pixmap = app_icon.pixmap(28, 28)
+                if not pixmap.isNull():
+                    self.icon_label.setPixmap(pixmap)
+                    icon_loaded = True
+            except Exception:
+                pass
         
         if not icon_loaded:
             # Fallback to 'C' if favicon not found
@@ -389,8 +410,9 @@ class ThumbnailWorker(QRunnable):
             
             if ext in standard_exts:
                 try:
-                    from PIL import Image
+                    from PIL import Image, ImageOps
                     with Image.open(self.file_path) as img:
+                        img = ImageOps.exif_transpose(img)
                         # Use draft mode for JPEG
                         if img.format == 'JPEG' and hasattr(img, 'draft'):
                             img.draft('RGB', (self.max_width, self.max_width * 3))
@@ -1398,20 +1420,11 @@ class GroupWidget(QFrame):
         layout.setSpacing(0)
         
         # Header
-        header = QFrame()
-        header.setObjectName("groupHeader")
-        header.setFixedHeight(48)
-        header.setStyleSheet(f"""
-            QFrame#groupHeader {{
-                background-color: {MD3_COLORS['bg_subtle']};
-                border: none;
-                border-top-left-radius: 11px;
-                border-top-right-radius: 11px;
-                border-bottom-left-radius: 0px;
-                border-bottom-right-radius: 0px;
-            }}
-        """)
-        header_layout = QHBoxLayout(header)
+        self.header = QFrame()
+        self.header.setObjectName("groupHeader")
+        self.header.setFixedHeight(48)
+        self._update_header_style()
+        header_layout = QHBoxLayout(self.header)
         header_layout.setContentsMargins(16, 4, 16, 4)
         header_layout.setSpacing(12)
         
@@ -1442,7 +1455,7 @@ class GroupWidget(QFrame):
         
         header_layout.addStretch()
         
-        layout.addWidget(header)
+        layout.addWidget(self.header)
         
         # List view with masonry delegate
         self.list_view = QListView()
@@ -1547,7 +1560,22 @@ class GroupWidget(QFrame):
             self.list_view.setFixedHeight(0)
             self.toggle_btn.setText("▶")
         self.updateGeometry()
+        self._update_header_style()
     
+    def _update_header_style(self):
+        """Update header style with dynamic rounding based on expanded state."""
+        bottom_radius = 0 if self.is_expanded else 11
+        self.header.setStyleSheet(f"""
+            QFrame#groupHeader {{
+                background-color: {MD3_COLORS['bg_subtle']};
+                border: none;
+                border-top-left-radius: 11px;
+                border-top-right-radius: 11px;
+                border-bottom-left-radius: {bottom_radius}px;
+                border-bottom-right-radius: {bottom_radius}px;
+            }}
+        """)
+
     def _on_item_entered(self, index: QModelIndex):
         """Handle mouse enter event for hover scrolling."""
         path = index.data(Qt.ItemDataRole.UserRole)
@@ -1953,35 +1981,10 @@ class CloneWiperApp(QMainWindow):
         self.setGeometry(100, 100, 1400, 850)
         self.setMinimumSize(960, 640)
         
-        # Set window icon (for taskbar) - try multiple paths (works in dev and when packaged)
-        # Get the directory where the script is located
-        if getattr(sys, 'frozen', False):
-            # Running as compiled executable
-            base_path = sys._MEIPASS
-        else:
-            # Running as script
-            base_path = os.path.dirname(os.path.abspath(__file__))
-        
-        icon_paths = [
-            os.path.join(base_path, "icons", "favicon.ico"),
-            os.path.join(base_path, "favicon.ico"),  # Fallback for old builds
-            os.path.join(os.getcwd(), "icons", "favicon.ico"),
-            os.path.join(os.getcwd(), "favicon.ico"),  # Fallback
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons", "favicon.ico"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.ico"),  # Fallback
-            "icons/favicon.ico",
-            "favicon.ico"  # Fallback
-        ]
-        
-        for icon_path in icon_paths:
-            if os.path.exists(icon_path):
-                try:
-                    icon = QIcon(icon_path)
-                    if not icon.isNull():
-                        self.setWindowIcon(icon)
-                        break
-                except Exception:
-                    continue
+        # Set window icon (taskbar / Alt+Tab)
+        app_icon = _load_app_icon()
+        if app_icon is not None:
+            self.setWindowIcon(app_icon)
         
         # Resize state
         self._resize_edge_active = False
@@ -2091,9 +2094,10 @@ class CloneWiperApp(QMainWindow):
         
         central = QWidget()
         self.setCentralWidget(central)
-        # Set background color only (rounded corners applied to window, not sections)
+        central.setObjectName("centralWidget")
+        # Set background color only to the central widget, not all children
         central.setStyleSheet(f"""
-            QWidget {{
+            QWidget#centralWidget {{
                 background-color: {MD3_COLORS['surface']};
             }}
         """)
@@ -2410,19 +2414,42 @@ class CloneWiperApp(QMainWindow):
         self.main_layout.setStretch(2, 0) # Status Bar
         self.main_layout.setStretch(3, 1) # Results Area (Grow)
         
-        # Footer (Material 3 Bottom App Bar style)
-        footer = QFrame()
-        footer.setFixedHeight(64)
-        footer.setFrameShape(QFrame.Shape.NoFrame)
-        footer.setStyleSheet(f"""
-            QFrame {{
+        # Footer (Material 3 Bottom App Bar style) - Wrap in Scroll Area
+        self.footer = QScrollArea()
+        self.footer.setFixedHeight(64)
+        self.footer.setWidgetResizable(True)
+        self.footer.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.footer.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.footer.setFrameShape(QFrame.Shape.NoFrame)
+        # Initially hide footer (no results)
+        self.footer.setVisible(False)
+        self.footer.setStyleSheet(f"""
+            QScrollArea {{
                 background-color: {MD3_COLORS['bg_tertiary']};
                 border: none;
+                border-top: 1px solid {MD3_COLORS['surface_variant']};
+            }}
+            QScrollBar:horizontal {{
+                background-color: transparent;
+                height: 4px;
+                margin: 0px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background-color: {MD3_COLORS['surface_variant']};
+                border-radius: 2px;
+                min-width: 20px;
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                width: 0px;
             }}
         """)
-        footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(16, 8, 16, 8)
-        footer_layout.setSpacing(8)
+
+        footer_content = QWidget()
+        footer_content.setObjectName("footerContent")
+        footer_content.setStyleSheet(f"QWidget#footerContent {{ background-color: {MD3_COLORS['bg_tertiary']}; border: none; }}")
+        footer_layout = QHBoxLayout(footer_content)
+        footer_layout.setContentsMargins(12, 0, 12, 0)
+        footer_layout.setSpacing(6)
         footer_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)  # Vertical center alignment
         
         # Quick select buttons (Material 3 Outlined Button)
@@ -2433,10 +2460,10 @@ class CloneWiperApp(QMainWindow):
                 font-size: 13px;
                 font-weight: 500;
                 font-family: 'Roboto', 'Segoe UI', sans-serif;
-                padding: 0px 16px;
+                padding: 0px 12px;
                 border: 1px solid {MD3_COLORS['outline']};
                 border-radius: 20px;
-                min-width: 92px;
+                min-width: 80px;
                 text-align: center;
             }}
             QPushButton:hover {{
@@ -2782,7 +2809,9 @@ class CloneWiperApp(QMainWindow):
         self.clear_select_btn.setEnabled(False)
         self.clear_select_btn.clicked.connect(self._clear_selection)
         footer_layout.addWidget(self.clear_select_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
-        self.main_layout.addWidget(footer)
+        
+        self.footer.setWidget(footer_content)
+        self.main_layout.addWidget(self.footer)
     
     def _get_instruction_text(self) -> str:
         """Get the initial instruction text with hash mode descriptions."""
@@ -2868,9 +2897,10 @@ class CloneWiperApp(QMainWindow):
     
     def _add_folder_to_list(self, path: str):
         """Add a folder to the path list if not already present."""
-        items = [self.path_list_widget.item(i).text() for i in range(self.path_list_widget.count())]
+        items = [self.path_list_widget.item(i).data(Qt.UserRole) for i in range(self.path_list_widget.count())]
         if path not in items:
-            item = QListWidgetItem(path)
+            item = QListWidgetItem("") # Keep text empty to avoid duplication with custom widget
+            item.setData(Qt.UserRole, path)
             item.setSizeHint(QSize(-1, 24))
             self.path_list_widget.addItem(item)
 
@@ -2915,7 +2945,7 @@ class CloneWiperApp(QMainWindow):
             self._add_folder_to_list(path)
     
     def _start_scanning(self):
-        paths = [self.path_list_widget.item(i).text() for i in range(self.path_list_widget.count())]
+        paths = [self.path_list_widget.item(i).data(Qt.UserRole) for i in range(self.path_list_widget.count())]
         if not paths:
             dialog = CustomDialog(self, title="Warning", message="Please select at least one folder to scan.", buttons=["OK"])
             dialog.exec()
@@ -2969,6 +2999,9 @@ class CloneWiperApp(QMainWindow):
         if hasattr(self, 'keep_raw_btn'):
             self.keep_raw_btn.setVisible(False)
         
+        # Reset quick-select highlight for new scan
+        self._highlight_quick_select_mode(None)
+        
         # Clear existing group widgets (but keep center_progress_container and stretches)
         # Reset status label to initial instruction when clearing results
         self.status_label.setText("Use \"+ Add Folder\" or Drag & drop folder here")
@@ -2988,7 +3021,12 @@ class CloneWiperApp(QMainWindow):
         self.center_status_label.setText("Initializing scan...")
         self.center_progress_bar.setVisible(True)  # Show progress bar during scanning
         self.center_progress_bar.setValue(0)
+        self._scan_status_message = "Initializing scan..."
         self.status_label.setVisible(False)  # Hide upper left status during scanning
+        
+        # Hide footer during scanning
+        if hasattr(self, 'footer'):
+            self.footer.setVisible(False)
         
         # Store scan thread reference for potential cancellation
         self._scan_thread = None
@@ -3037,27 +3075,35 @@ class CloneWiperApp(QMainWindow):
     @Slot(float)
     def _on_progress_slot(self, value: float):
         """Slot for progress updates (runs on main thread)."""
-        # Update center progress bar
         if self.scan_btn.text() == "Cancel Scanning":
             self.center_progress_bar.setValue(int(value * 100))
+            self._refresh_center_scan_display()
+
+    def _refresh_center_scan_display(self) -> None:
+        """Keep status text and progress bar in sync during scans."""
+        if self.scan_btn.text() != "Cancel Scanning":
+            return
+        pct = self.center_progress_bar.value()
+        message = getattr(self, "_scan_status_message", "")
+        if pct > 0 and message:
+            self.center_status_label.setText(f"{message} ({pct}%)")
+        elif message:
+            self.center_status_label.setText(message)
     
     @Slot(str)
     def _on_status_slot(self, message: str):
         """Slot for status updates (runs on main thread)."""
-        
-        # Update center status label and progress container if scanning
         if self.scan_btn.text() == "Cancel Scanning":
-            # During scanning: only update center display, hide upper left status completely
-            self.center_status_label.setText(message)
+            self._scan_status_message = message
             self.center_progress_container.setVisible(True)
-            self.center_progress_bar.setVisible(True)  # Show progress bar during scanning
-            self.status_label.setVisible(False)  # Keep hidden during scanning
+            self.center_progress_bar.setVisible(True)
+            self.status_label.setVisible(False)
+            self._refresh_center_scan_display()
         else:
-            # Not scanning: update status bar (for non-scanning messages)
             self.status_label.setText(message)
-            self.status_label.setVisible(True)  # Show when not scanning
+            self.status_label.setVisible(True)
             self.center_progress_container.setVisible(False)
-            self.center_progress_bar.setVisible(False)  # Hide progress bar when not scanning
+            self.center_progress_bar.setVisible(False)
     
     @Slot(dict)
     def _on_results_slot(self, duplicate_groups: Dict[str, List[str]]):
@@ -3094,6 +3140,10 @@ class CloneWiperApp(QMainWindow):
         
         self.status_label.setVisible(False)  # Keep status label hidden
         
+        # Hide footer on cancel
+        if hasattr(self, 'footer'):
+            self.footer.setVisible(False)
+        
         # Clear scan thread reference
         self._scan_thread = None
     
@@ -3129,6 +3179,10 @@ class CloneWiperApp(QMainWindow):
         # Show status label after scan completes
         self.status_label.setVisible(True)
         
+        # Show footer after scan completes
+        if hasattr(self, 'footer'):
+            self.footer.setVisible(True)
+        
         if not duplicate_groups:
             logger.debug(f"DEBUG: No duplicate groups, setting status")
             self.status_label.setText("No duplicate files found.")
@@ -3151,6 +3205,11 @@ class CloneWiperApp(QMainWindow):
     
     def _render_page(self, page_index: int):
         """Render a page of groups."""
+        # Reset quick-select highlight if changing page and not in "All Pages" mode
+        if hasattr(self, 'scope_toggle') and not self.scope_toggle.isChecked():
+            if page_index != self.current_page:
+                self._highlight_quick_select_mode(None)
+
         logger.debug(f"DEBUG: _render_page called with page_index={page_index}, file_groups={len(self.file_groups) if self.file_groups else 0}")
         # Clear existing group widgets (but keep center_progress_container and stretches)
         self._group_widgets.clear()
@@ -3630,6 +3689,17 @@ class CloneWiperApp(QMainWindow):
     
     def _apply_rounded_corners(self):
         """Apply rounded corners mask to the window."""
+        if self._is_windows:
+            try:
+                # DWMWA_WINDOW_CORNER_PREFERENCE = 33
+                # DWMWCP_ROUND = 2
+                hwnd = self.winId()
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 33, ctypes.byref(ctypes.c_int(2)), 4
+                )
+            except Exception:
+                pass
+
         path = QPainterPath()
         rect = self.rect()
         path.addRoundedRect(rect, self._corner_radius, self._corner_radius)
@@ -3868,7 +3938,15 @@ def main():
         return 1
     
     print("Starting CloneWiper (Material 3)...")
+    if sys.platform == 'win32':
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('CloneWiper.App.1')
+        except Exception:
+            pass
     app = QApplication(sys.argv)
+    app_icon = _load_app_icon()
+    if app_icon is not None:
+        app.setWindowIcon(app_icon)
     app.setStyle("Fusion")  # Modern look
     
     # Material Design 3 global styles
