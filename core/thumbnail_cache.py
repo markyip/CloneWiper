@@ -136,17 +136,15 @@ class PersistentThumbnailCache:
     def restrict_to_extensions(self, extensions: Iterable[str]):
         """Remove rows whose file extension is no longer persistently cached."""
         allowed: Set[str] = {ext.lower() for ext in extensions}
+        if not allowed:
+            return
         try:
             with sqlite3.connect(self.db_path, timeout=5) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT path FROM thumbnails")
-                stale_paths = [
-                    (path,)
-                    for (path,) in cursor.fetchall()
-                    if os.path.splitext(path)[1].lower() not in allowed
-                ]
-                if stale_paths:
-                    conn.executemany("DELETE FROM thumbnails WHERE path=?", stale_paths)
+                # Filter in SQL rather than pulling every row into Python: on a large
+                # cache the old approach fetched and re-checked every path client-side.
+                conditions = " AND ".join("LOWER(path) NOT LIKE ?" for _ in allowed)
+                params = [f"%{ext}" for ext in allowed]
+                conn.execute(f"DELETE FROM thumbnails WHERE {conditions}", params)
         except Exception as e:
             logger.debug("Error pruning thumbnail cache by extension: %s", e)
 

@@ -6,7 +6,7 @@ Qt UI provides excellent performance when handling large result sets and support
 
 Key Features:
     - Material Design 3 styled interface
-    - Masonry layout for thumbnail display
+    - Horizontal comparison strip for each duplicate group
     - Asynchronous thumbnail loading (using QThreadPool)
     - Thread-safe signal/slot mechanism
     - Pagination for large result sets
@@ -105,6 +105,16 @@ if not PYSIDE6_AVAILABLE:
     print("Qt UI requires PySide6. Please install it with: pip install PySide6")
     sys.exit(1)
 
+
+
+def format_byte_size(size_bytes: float) -> str:
+    """Compact size label for summaries and group headers."""
+    value = float(size_bytes or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024.0:
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} TB"
 
 
 # Material Design 3 Dark Color Palette
@@ -870,8 +880,15 @@ class ThumbnailWorker(QRunnable):
             self.signals.error.emit(self.file_path, str(e))
 
 
+# One shared frame per file so copies in a group can be compared side by side.
+COMPARE_CARD_WIDTH = 216
+COMPARE_THUMB_HEIGHT = 136
+COMPARE_CARD_HEIGHT = 224
+COMPARE_STRIP_HEIGHT = COMPARE_CARD_HEIGHT + 28
+
+
 class FileCardDelegate(QStyledItemDelegate):
-    """Custom delegate for rendering file cards with thumbnails (masonry layout)."""
+    """Fixed-size card for a horizontal duplicate comparison strip."""
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -917,137 +934,100 @@ class FileCardDelegate(QStyledItemDelegate):
             self.mutex.unlock()
     
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
-        """Return variable height based on aspect ratio (masonry effect)."""
-        path = index.data(Qt.ItemDataRole.UserRole)
-        if not path:
-            return QSize(self.card_width, 200)
-        
-        self.mutex.lock()
-        try:
-            aspect = self.aspect_ratios.get(path)
-            if aspect is None:
-                # Try to infer from file type or use default
-                ext = os.path.splitext(path)[1].lower()
-                if ext in {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp'}:
-                    aspect = 1.0  # Default square-ish
-                elif ext in {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v'}:
-                    aspect = 16.0 / 9.0  # Common video aspect
-                else:
-                    aspect = 1.0
-                self._default_aspects[path] = aspect
-            else:
-                self._default_aspects.pop(path, None)
-        finally:
-            self.mutex.unlock()
-        
-        # Calculate height based on aspect ratio
-        thumb_height = int(self.card_width / aspect) if aspect > 0 else self.card_width
-        thumb_height = max(150, min(thumb_height, self.card_width * 3))
-        
-        # Add space for text/metadata (Material 3 spacing)
-        text_height = 90
-        total_height = thumb_height + text_height
-        
-        return QSize(self.card_width, total_height)
+        """Every card uses the same frame so a group stays one comparison row."""
+        return QSize(COMPARE_CARD_WIDTH, COMPARE_CARD_HEIGHT)
     
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex):
-        """Paint file card with thumbnail, metadata, and selection state."""
+        """Paint a fixed comparison card: same thumb window, then the facts that differ."""
         path = index.data(Qt.ItemDataRole.UserRole)
         if not path:
             return
-        
+
         rect = option.rect
         painter.save()
-        
-        # Selection state
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
         self.mutex.lock()
         try:
             selected = self.selection_state.get(path, False)
             thumb = self.thumbnails.get(path)
-            aspect = self.aspect_ratios.get(path, 1.0)
             meta = self.metadata.get(path, "")
         finally:
             self.mutex.unlock()
-        
-        # Background (Material 3 Card)
+
         border_radius = 12
         card_rect = rect.adjusted(1, 1, -1, -1)
         if selected:
-            # Material 3 error container color with rounded corners
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            painter.setBrush(QBrush(QColor(MD3_COLORS['error_container'])))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRoundedRect(card_rect, border_radius, border_radius)
-            # Red border
-            pen = QPen(QColor(MD3_COLORS['error']), 2)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(card_rect, border_radius, border_radius)
+            fill = QColor("#3A2426")
+            border = QColor(MD3_COLORS['error'])
+            border_width = 2
+        elif path == self._hovered_path:
+            fill = QColor(MD3_COLORS['surface'])
+            border = QColor(MD3_COLORS['primary'])
+            border_width = 2
         else:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            painter.setBrush(QBrush(QColor(MD3_COLORS['surface'])))  # Material 3 surface
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRoundedRect(card_rect, border_radius, border_radius)
-            # Subtle border
-            pen = QPen(QColor(MD3_COLORS['surface_variant']), 1)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(card_rect, border_radius, border_radius)
-        
-        # Thumbnail (Material 3 rounded corners)
-        # Use consistent padding (8px) for all sides
+            fill = QColor(MD3_COLORS['surface'])
+            border = QColor(MD3_COLORS['surface_variant'])
+            border_width = 1
+        painter.setBrush(QBrush(fill))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(card_rect, border_radius, border_radius)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(border, border_width))
+        painter.drawRoundedRect(card_rect, border_radius, border_radius)
+
         padding = 8
-        thumb_x = rect.x() + padding
-        thumb_y = rect.y() + padding
-        content_inset = max(0, thumb_x - card_rect.x())
-        # Keep nested rounded corners optically parallel to the outer card.
-        thumb_radius = max(0, border_radius - content_inset)
-        thumb_height = int(self.card_width / aspect) if aspect > 0 else self.card_width
-        thumb_height = max(150, min(thumb_height, self.card_width * 3))
-        thumb_rect = QRect(thumb_x, thumb_y, self.card_width - (padding * 2), thumb_height)
-        
-        if thumb:
-            # Create rounded thumbnail with full visibility
-            scaled = thumb.scaled(thumb_rect.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            thumb_x = thumb_rect.x() + (thumb_rect.width() - scaled.width()) // 2
-            # Align thumbnail to top of thumb_rect (no extra vertical spacing)
-            thumb_y = thumb_rect.y()
-            
-            # Draw with rounded corners (card radius - padding)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            rounded_rect = QRect(thumb_x, thumb_y, scaled.width(), scaled.height())
-            
-            # Create a rounded rectangle path for clipping
+        thumb_rect = QRect(
+            rect.x() + padding,
+            rect.y() + padding,
+            max(1, rect.width() - padding * 2),
+            COMPARE_THUMB_HEIGHT,
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(MD3_COLORS['surface_variant'])))
+        painter.drawRoundedRect(thumb_rect, 8, 8)
+
+        if thumb and not thumb.isNull():
+            scaled = thumb.scaled(
+                thumb_rect.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            image_x = thumb_rect.x() + (thumb_rect.width() - scaled.width()) // 2
+            image_y = thumb_rect.y() + (thumb_rect.height() - scaled.height()) // 2
             clip_path = QPainterPath()
-            clip_path.addRoundedRect(rounded_rect, thumb_radius, thumb_radius)
+            clip_path.addRoundedRect(thumb_rect, 8, 8)
             painter.setClipPath(clip_path)
-            
-            # Draw pixmap with rounded corners
-            painter.drawPixmap(rounded_rect, scaled)
+            painter.drawPixmap(image_x, image_y, scaled)
             painter.setClipping(False)
-            
-            # Draw subtle border around thumbnail
-            painter.setPen(QPen(QColor(0, 0, 0, 20), 1))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(rounded_rect, thumb_radius, thumb_radius)
         else:
-            # Placeholder (Material 3 surface variant)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            painter.setBrush(QBrush(QColor(MD3_COLORS['surface_variant'])))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRoundedRect(thumb_rect, thumb_radius, thumb_radius)
-            
             painter.setPen(QColor(MD3_COLORS['on_surface_variant']))
-            font = QFont("Roboto", 10)
-            font.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
-            painter.setFont(font)
-            painter.drawText(thumb_rect, Qt.AlignmentFlag.AlignCenter, "Loading...")
-        
-        # Text/metadata (Material 3 Typography)
-        # Use same padding (8px) for text area to align with thumbnail padding
-        text_y = thumb_rect.y() + thumb_height + padding
-        text_rect = QRect(rect.x() + padding, text_y, rect.width() - (padding * 2), rect.height() - (thumb_rect.y() + thumb_height + padding))
-        
+            placeholder_font = QFont("Roboto", 10)
+            placeholder_font.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
+            painter.setFont(placeholder_font)
+            painter.drawText(thumb_rect, Qt.AlignmentFlag.AlignCenter, "No preview")
+
+        badge_label = "Delete" if selected else "Keep"
+        badge = QRect(thumb_rect.x() + 8, thumb_rect.y() + 8, 58, 22)
+        if selected:
+            badge_fill = QColor(MD3_COLORS['error'])
+            badge_text = QColor(MD3_COLORS['on_error'])
+        else:
+            badge_fill = QColor("#1B3D2F")
+            badge_text = QColor(MD3_COLORS['success'])
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(badge_fill))
+        painter.drawRoundedRect(badge, 11, 11)
+        painter.setPen(badge_text)
+        badge_font = QFont("Roboto", 10, QFont.Weight.DemiBold)
+        badge_font.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
+        painter.setFont(badge_font)
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, badge_label)
+
+        text_x = rect.x() + padding
+        text_w = max(1, rect.width() - padding * 2)
+        text_y = thumb_rect.bottom() + 8
+
         name = os.path.basename(path)
         try:
             size_str = self._format_size(os.path.getsize(path))
@@ -1055,91 +1035,37 @@ class FileCardDelegate(QStyledItemDelegate):
         except Exception:
             size_str = ""
             mtime_str = ""
-        
-        parts = [p for p in [size_str, meta, mtime_str] if p]
-        meta_text = " • ".join(parts)
-        
-        # Filename (Material 3 Title Medium) with scrolling
-        painter.setPen(QColor(MD3_COLORS['on_surface']))  # Material 3 on-surface
-        font = QFont("Roboto", 14, QFont.Weight.Medium)
-        font.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
-        painter.setFont(font)
-        name_rect = QRect(text_rect.x(), text_rect.y(), text_rect.width(), 22)
-        
-        # Calculate text width (always calculate, not just when hovering)
-        fm = painter.fontMetrics()
-        name_width = fm.horizontalAdvance(name)
-        is_name_overflow = name_width > name_rect.width()
-        
-        # Store text width for scrolling calculation (always store)
-        existing_dir_width = self._text_widths.get(path, (0, 0))[1]
-        self._text_widths[path] = (name_width, existing_dir_width)
-        
-        # Get scroll offset if hovering
-        name_offset = 0
-        if is_name_overflow and path == self._hovered_path:
-            name_offset = self._name_scroll_offset.get(path, 0)
-            max_offset = max(0, name_width - name_rect.width() + 20)  # Add padding
-            if name_offset > max_offset:
-                name_offset = max_offset
-            elif name_offset < 0:
-                name_offset = 0
-        
-        # Draw filename with clipping and scrolling
-        painter.save()
-        painter.setClipRect(name_rect)
-        if is_name_overflow and path == self._hovered_path:
-            painter.drawText(name_rect.adjusted(-int(name_offset), 0, 0, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, name)
-        else:
-            painter.drawText(name_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, name)
-        painter.restore()
-        
-        # Metadata (Material 3 Body Small)
-        if meta_text:
-            meta_rect = QRect(text_rect.x(), text_rect.y() + 28, text_rect.width(), 22)
-            painter.setPen(QColor(MD3_COLORS['on_surface_variant']))  # Material 3 on-surface-variant
-            font_body = QFont("Roboto", 12)
-            font_body.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
-            painter.setFont(font_body)
-            painter.drawText(meta_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, meta_text)
-        
-        # Directory (Material 3 Label Small) with scrolling
-        dir_path = os.path.dirname(path)
-        if dir_path:
-            dir_rect = QRect(text_rect.x(), text_rect.y() + 52, text_rect.width(), 18)
-            painter.setPen(QColor(MD3_COLORS['on_surface_variant']))
-            font_label = QFont("Roboto", 11)
-            font_label.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
-            painter.setFont(font_label)
-            
-            # Calculate text width (always calculate, not just when hovering)
-            fm = painter.fontMetrics()
-            dir_width = fm.horizontalAdvance(dir_path)
-            is_dir_overflow = dir_width > dir_rect.width()
-            
-            # Store text width for scrolling calculation (always store)
-            existing_name_width = self._text_widths.get(path, (0, 0))[0]
-            self._text_widths[path] = (existing_name_width, dir_width)
-            
-            # Get scroll offset if hovering
-            dir_offset = 0
-            if is_dir_overflow and path == self._hovered_path:
-                dir_offset = self._dir_scroll_offset.get(path, 0)
-                max_offset = max(0, dir_width - dir_rect.width() + 20)  # Add padding
-                if dir_offset > max_offset:
-                    dir_offset = max_offset
-                elif dir_offset < 0:
-                    dir_offset = 0
-            
-            # Draw directory path with clipping and scrolling
-            painter.save()
-            painter.setClipRect(dir_rect)
-            if is_dir_overflow and path == self._hovered_path:
-                painter.drawText(dir_rect.adjusted(-int(dir_offset), 0, 0, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, dir_path)
-            else:
-                painter.drawText(dir_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, dir_path)
-            painter.restore()
-        
+        folder = os.path.basename(os.path.dirname(path)) or os.path.dirname(path)
+
+        painter.setPen(QColor(MD3_COLORS['on_surface']))
+        name_font = QFont("Roboto", 12, QFont.Weight.Medium)
+        name_font.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
+        painter.setFont(name_font)
+        name_rect = QRect(text_x, text_y, text_w, 18)
+        painter.drawText(
+            name_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            painter.fontMetrics().elidedText(name, Qt.TextElideMode.ElideRight, text_w),
+        )
+
+        detail = " · ".join(part for part in (size_str, meta, mtime_str) if part)
+        painter.setPen(QColor(MD3_COLORS['on_surface_variant']))
+        detail_font = QFont("Roboto", 10)
+        detail_font.setFamilies(["Roboto", "Segoe UI", "sans-serif"])
+        painter.setFont(detail_font)
+        detail_rect = QRect(text_x, text_y + 20, text_w, 16)
+        painter.drawText(
+            detail_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            painter.fontMetrics().elidedText(detail, Qt.TextElideMode.ElideRight, text_w),
+        )
+        folder_rect = QRect(text_x, text_y + 38, text_w, 16)
+        painter.drawText(
+            folder_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            painter.fontMetrics().elidedText(folder, Qt.TextElideMode.ElideMiddle, text_w),
+        )
+
         painter.restore()
     
     def _format_size(self, size_bytes: int) -> str:
@@ -1151,223 +1077,25 @@ class FileCardDelegate(QStyledItemDelegate):
         return f"{size_bytes:.2f} TB"
     
     def set_hovered_path(self, path: Optional[str], view):
-        """Set the currently hovered path and start/stop scrolling animation.
-        
-        Logic:
-        1. When name is completely displayed and user still mouse over: 
-           Keep current scroll position, don't reset offset, don't start timer
-        2. When mouse leaves: 
-           Reset scroll offset to 0, trigger repaint to show beginning
-        3. When name is not completely displayed and user hovers:
-           Reset offset to 0, start scrolling animation from beginning
-        """
+        """Repaint the card under the pointer so its border can show hover."""
         if path == self._hovered_path:
             return
-        
-        # Save previous path before changing _hovered_path
-        prev_path = self._hovered_path
-        
-        # Stop previous scrolling timer (but keep offsets for now)
-        if prev_path and prev_path in self._scroll_timers:
-            timer = self._scroll_timers.pop(prev_path)
-            timer.stop()
-            timer.deleteLater()
-        
-        # Update hovered path
+        previous = self._hovered_path
         self._hovered_path = path
-        
-        if path is None:
-            # Case 2: Mouse left - reset scroll positions for the previous path
-            if prev_path:
-                # Always reset scroll offsets to 0 when mouse leaves
-                self._name_scroll_offset[prev_path] = 0
-                self._dir_scroll_offset[prev_path] = 0
-                
-                # Trigger repaint to reset visual position and show beginning of filename
-                model = view.model()
-                if model:
-                    try:
-                        for i in range(model.rowCount()):
-                            idx = model.index(i)
-                            if idx.data(Qt.ItemDataRole.UserRole) == prev_path:
-                                view.update(idx)
-                                break
-                    except (AttributeError, RuntimeError):
-                        pass
-            return
-        
-        # Case 1 & 3: Mouse hovering over a path
-        model = view.model()
+        model = view.model() if view is not None else None
         if model is None:
             return
-        
-        # Get text widths and display area width
-        # name_rect.width() = card_width - 24 (accounting for padding on both sides)
-        name_width, dir_width = self._text_widths.get(path, (0, 0))
-        display_width = self.card_width - 24  # Actual display area width (name_rect.width())
-        
-        # Check if offsets already exist (might be from previous scroll)
-        has_existing_offset = path in self._name_scroll_offset or path in self._dir_scroll_offset
-        
-        # Case 1: Text widths are known - check if text is completely displayed
-        # Text is completely displayed when: name_width <= display_width
-        # This means the last character is within the visible area (no scrolling needed)
-        if name_width > 0 and dir_width > 0:
-            name_fits = name_width <= display_width
-            dir_fits = dir_width <= display_width
-            
-            if name_fits and dir_fits:
-                # Both texts fit completely - keep current position, don't start timer
-                # Don't reset offsets - they might be from a previous scroll to the end
+        for candidate in (previous, path):
+            if not candidate:
+                continue
+            try:
+                for row in range(model.rowCount()):
+                    index = model.index(row)
+                    if index.data(Qt.ItemDataRole.UserRole) == candidate:
+                        view.update(index)
+                        break
+            except (AttributeError, RuntimeError):
                 return
-        
-        # Case 3: Text needs scrolling or widths not calculated yet
-        # If text widths are not calculated yet and offsets exist, don't reset them
-        # Wait for width calculation in _update_scroll to decide if scrolling is needed
-        if name_width > 0 and dir_width > 0:
-            # Text widths are known - text needs scrolling
-            # Only reset offsets if this is first time hovering (no offset exists)
-            if path not in self._name_scroll_offset:
-                self._name_scroll_offset[path] = 0
-            if path not in self._dir_scroll_offset:
-                self._dir_scroll_offset[path] = 0
-        else:
-            # Text widths not calculated yet
-            # If offsets exist, don't reset them - text might be completely displayed
-            # Only initialize if first time hovering
-            if not has_existing_offset:
-                self._name_scroll_offset[path] = 0
-                self._dir_scroll_offset[path] = 0
-            # If offsets exist, keep them and let _update_scroll decide after width calculation
-        
-        # Trigger initial repaint to calculate text widths (if not already calculated)
-        try:
-            for i in range(model.rowCount()):
-                idx = model.index(i)
-                if idx.data(Qt.ItemDataRole.UserRole) == path:
-                    view.update(idx)
-                    break
-        except (AttributeError, RuntimeError):
-            return
-        
-        # Start scrolling animation timer
-        # _update_scroll will stop it if text is completely displayed
-        timer = QTimer()
-        timer.setSingleShot(False)
-        timer.timeout.connect(lambda: self._update_scroll(path, view))
-        timer.start(50)  # Update every 50ms
-        self._scroll_timers[path] = timer
-    
-    def _update_scroll(self, path: str, view):
-        """Update scroll position for hovered text.
-        
-        This is called by the timer when scrolling is active.
-        It handles:
-        - Waiting for text width calculation
-        - Stopping timer if text is completely displayed (keep current position)
-        - Continuing scroll animation if text needs scrolling
-        """
-        # Safety check
-        if path != self._hovered_path:
-            return
-        
-        model = view.model()
-        if model is None:
-            return
-        
-        # Get text widths and display area width
-        # name_rect.width() = card_width - 24 (accounting for padding on both sides)
-        name_width, dir_width = self._text_widths.get(path, (0, 0))
-        display_width = self.card_width - 24  # Actual display area width (name_rect.width())
-        
-        # Wait for text width calculation
-        if name_width == 0 and dir_width == 0:
-            # Trigger repaint to calculate widths
-            try:
-                for i in range(model.rowCount()):
-                    idx = model.index(i)
-                    if idx.data(Qt.ItemDataRole.UserRole) == path:
-                        view.update(idx)
-                        break
-            except (AttributeError, RuntimeError):
-                pass
-            return
-        
-        # Check if scrolling is needed
-        # Text is completely displayed when: name_width <= display_width
-        # This means the last character is within the visible area (no scrolling needed)
-        name_fits = name_width <= display_width
-        dir_fits = dir_width <= display_width
-        
-        # If text is completely displayed, stop timer but keep current position
-        if name_fits and dir_fits:
-            if path in self._scroll_timers:
-                timer = self._scroll_timers.pop(path)
-                timer.stop()
-                timer.deleteLater()
-            # Don't reset offsets - keep current position
-            return
-        
-        # Continue scrolling animation
-        needs_update = False
-        should_stop_timer = False
-        
-        # Update name scroll
-        # name_needs_scroll means name_width > display_width
-        if not name_fits:
-            current_offset = self._name_scroll_offset.get(path, 0)
-            # When the last character is visible: current_offset >= (name_width - display_width)
-            # At this point, the last character is at or before the right edge of visible area
-            min_offset_to_show_end = name_width - display_width
-            
-            if current_offset >= min_offset_to_show_end:
-                # Last character is already visible - stop scrolling for name, keep current position
-                # Don't reset to 0, just stop updating
-                pass  # Keep current offset
-            else:
-                # Scroll forward until last character is visible
-                self._name_scroll_offset[path] = current_offset + 2
-                needs_update = True
-        
-        # Update dir scroll
-        # dir_needs_scroll means dir_width > display_width
-        if not dir_fits:
-            current_offset = self._dir_scroll_offset.get(path, 0)
-            # When the last character is visible: current_offset >= (dir_width - display_width)
-            min_offset_to_show_end = dir_width - display_width
-            
-            if current_offset >= min_offset_to_show_end:
-                # Last character is already visible - stop scrolling for dir, keep current position
-                # Don't reset to 0, just stop updating
-                pass  # Keep current offset
-            else:
-                # Scroll forward until last character is visible
-                self._dir_scroll_offset[path] = current_offset + 2
-                needs_update = True
-        
-        # Check if both texts have reached the end (last character visible)
-        # If so, stop the timer but keep current positions
-        name_at_end = name_fits or (not name_fits and self._name_scroll_offset.get(path, 0) >= (name_width - display_width))
-        dir_at_end = dir_fits or (not dir_fits and self._dir_scroll_offset.get(path, 0) >= (dir_width - display_width))
-        
-        if name_at_end and dir_at_end:
-            # Both texts have reached the end - stop timer, keep positions
-            if path in self._scroll_timers:
-                timer = self._scroll_timers.pop(path)
-                timer.stop()
-                timer.deleteLater()
-            return
-        
-        # Trigger repaint if scroll position changed
-        if needs_update:
-            try:
-                for i in range(model.rowCount()):
-                    idx = model.index(i)
-                    if idx.data(Qt.ItemDataRole.UserRole) == path:
-                        view.update(idx)
-                        break
-            except (AttributeError, RuntimeError):
-                pass
 
 
 class FileListModel(QAbstractListModel):
@@ -1395,6 +1123,8 @@ class FileListModel(QAbstractListModel):
         
         if role == Qt.ItemDataRole.UserRole:
             return path
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return path
         
         return None
     
@@ -1405,7 +1135,7 @@ class FileListModel(QAbstractListModel):
 
 
 class GroupWidget(QFrame):
-    """Collapsible widget for a duplicate group with auto-expanding masonry layout."""
+    """One duplicate group, shown as a fixed-height horizontal comparison strip."""
     
     selection_changed = Signal(str, bool) # path, selected
     
@@ -1428,8 +1158,10 @@ class GroupWidget(QFrame):
         header_layout.setContentsMargins(16, 4, 16, 4)
         header_layout.setSpacing(12)
         
-        self.toggle_btn = QPushButton("▼")
+        self.toggle_btn = QPushButton("▾")
         self.toggle_btn.setFixedSize(32, 32)
+        self.toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle_btn.setToolTip("Collapse or expand this group")
         self.toggle_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: transparent;
@@ -1443,13 +1175,25 @@ class GroupWidget(QFrame):
         self.toggle_btn.clicked.connect(self.toggle)
         header_layout.addWidget(self.toggle_btn)
         
-        total_size = sum(os.path.getsize(f) for f in files if os.path.exists(f))
+        sizes = []
+        for file_path in files:
+            if os.path.exists(file_path):
+                try:
+                    sizes.append(os.path.getsize(file_path))
+                except OSError:
+                    pass
+        total_size = sum(sizes)
+        reclaim = total_size - max(sizes) if len(sizes) > 1 else 0
         size_str = self._format_size(total_size)
-        # Use group index instead of hash ID
+        reclaim_str = self._format_size(reclaim)
+        count_label = f"{len(files)} files"
         if total_groups > 0:
-            title = QLabel(f"Group {group_index + 1}/{total_groups} • {len(files)} files • {size_str}")
+            title_text = f"Group {group_index + 1} of {total_groups}  ·  {count_label}  ·  {size_str}"
         else:
-            title = QLabel(f"{len(files)} files • {size_str}")
+            title_text = f"{count_label}  ·  {size_str}"
+        if reclaim > 0:
+            title_text += f"  ·  {reclaim_str} to reclaim"
+        title = QLabel(title_text)
         title.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; background-color: transparent; font-size: 14px; font-weight: 500; font-family: 'Roboto', 'Segoe UI', sans-serif; border: none;")
         header_layout.addWidget(title)
         
@@ -1457,23 +1201,47 @@ class GroupWidget(QFrame):
         
         layout.addWidget(self.header)
         
-        # List view with masonry delegate
+        # One horizontal row. Extra copies scroll sideways instead of wrapping
+        # into a taller, uneven gallery.
         self.list_view = QListView()
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
         self.list_view.setResizeMode(QListView.ResizeMode.Adjust)
-        self.list_view.setSpacing(12)
-        self.list_view.setUniformItemSizes(False)
+        self.list_view.setSpacing(10)
+        self.list_view.setUniformItemSizes(True)
         self.list_view.setFlow(QListView.Flow.LeftToRight)
-        self.list_view.setWrapping(True)
-        self.list_view.setGridSize(QSize())
+        self.list_view.setWrapping(False)
         self.list_view.setMovement(QListView.Movement.Static)
+        self.list_view.setHorizontalScrollMode(QListView.ScrollMode.ScrollPerPixel)
         self.list_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.list_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.list_view.setFrameShape(QFrame.Shape.NoFrame)
-        self.list_view.setStyleSheet("background-color: transparent;")
+        self.list_view.setFixedHeight(COMPARE_STRIP_HEIGHT)
+        self.list_view.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.list_view.setStyleSheet(f"""
+            QListView {{
+                background-color: transparent;
+                border: none;
+                padding: 8px 8px 0 8px;
+            }}
+            QScrollBar:horizontal {{
+                background-color: transparent;
+                height: 8px;
+                margin: 0 8px 4px 8px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background-color: {MD3_COLORS['surface_variant']};
+                border-radius: 4px;
+                min-width: 24px;
+            }}
+            QScrollBar::handle:horizontal:hover {{
+                background-color: {MD3_COLORS['outline']};
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                width: 0px;
+            }}
+        """)
         
         self.delegate = FileCardDelegate()
-        self.delegate.set_card_width(320)
         self.list_view.setItemDelegate(self.delegate)
         
         # Set model first before any operations that might trigger events
@@ -1506,32 +1274,12 @@ class GroupWidget(QFrame):
         """)
         
     def _update_height(self):
-        """Calculate and set the height of the list_view based on its contents."""
+        """Keep the strip one card tall. Thumbnails no longer change the row height."""
         if not self.is_expanded:
             self.list_view.setFixedHeight(0)
             return
-            
-        # Small delay to let Qt's layout engine settle
-        QTimer.singleShot(10, self._do_update_height)
-
-    def _do_update_height(self):
-        if not self.isVisible():
-            return
-            
-        count = self.model.rowCount()
-        if count == 0:
-            self.list_view.setFixedHeight(0)
-            return
-            
-        # Find maximum Y + height of any item
-        max_bottom = 0
-        for i in range(count):
-            rect = self.list_view.visualRect(self.model.index(i))
-            max_bottom = max(max_bottom, rect.bottom())
-            
-        # Add some padding
-        final_height = max_bottom + 16
-        self.list_view.setFixedHeight(max(100, final_height))
+        if self.list_view.height() != COMPARE_STRIP_HEIGHT:
+            self.list_view.setFixedHeight(COMPARE_STRIP_HEIGHT)
         self.updateGeometry()
 
     def resizeEvent(self, event):
@@ -1549,16 +1297,13 @@ class GroupWidget(QFrame):
         self.is_expanded = not self.is_expanded
         if self.is_expanded:
             self.list_view.show()
-            self.toggle_btn.setText("▼")
-            # Collapsing leaves the view at height 0; restore a temporary
-            # height so Qt can lay out items before the masonry height pass.
-            self.list_view.setFixedHeight(100)
+            self.toggle_btn.setText("▾")
+            self.list_view.setFixedHeight(COMPARE_STRIP_HEIGHT)
             self.list_view.doItemsLayout()
-            QTimer.singleShot(0, self._update_height)
         else:
             self.list_view.hide()
             self.list_view.setFixedHeight(0)
-            self.toggle_btn.setText("▶")
+            self.toggle_btn.setText("▸")
         self.updateGeometry()
         self._update_header_style()
     
@@ -1640,15 +1385,11 @@ class GroupWidget(QFrame):
         # Use QMetaObject.invokeMethod to ensure this runs on the main thread if called directly
         # though signals already handle this.
         self.delegate.set_thumbnail(path, pixmap, aspect)
-        # Update view - force size hint recalculation and layout update
         try:
             for i in range(self.model.rowCount()):
                 idx = self.model.index(i)
                 if idx.data(Qt.ItemDataRole.UserRole) == path:
                     self.list_view.update(idx)
-                    self.model.dataChanged.emit(idx, idx, [])
-                    self.list_view.updateGeometry()
-                    self.list_view.doItemsLayout() 
                     break
         except RuntimeError:
             # Widget was deleted during update, ignore
@@ -2021,7 +1762,9 @@ class CloneWiperApp(QMainWindow):
 
         # Persistent Thumbnail Cache
         self.persistent_cache = PersistentThumbnailCache()
-        self._cleanup_thumbnail_cache(vacuum=True)
+        # VACUUM rewrites the whole cache file and can take seconds on a large cache;
+        # run it in the background so the window isn't blocked from appearing.
+        threading.Thread(target=lambda: self._cleanup_thumbnail_cache(vacuum=True), daemon=True).start()
         self._scroll_anchor: Optional[Tuple[str, int]] = None  # (group_id, scroll_value) for refresh restore
         
         # Thumbnail cache
@@ -2119,8 +1862,8 @@ class CloneWiperApp(QMainWindow):
             }}
         """)
         control_layout = QHBoxLayout(control_panel)
-        control_layout.setContentsMargins(24, 0, 24, 0)
-        control_layout.setSpacing(8)
+        control_layout.setContentsMargins(20, 12, 20, 12)
+        control_layout.setSpacing(12)
         
         # Path selection area (Condensed)
         path_container = QFrame()
@@ -2129,14 +1872,15 @@ class CloneWiperApp(QMainWindow):
         path_hbox.setContentsMargins(0, 0, 0, 0)
         path_hbox.setSpacing(12)
         
-        path_label = QLabel("Scan Folders:")
-        path_label.setStyleSheet(f"color: {MD3_COLORS['on_surface_variant']}; font-size: 13px; font-weight: 500; font-family: 'Roboto', 'Segoe UI', sans-serif;")
+        path_label = QLabel("Folders")
+        path_label.setStyleSheet(f"color: {MD3_COLORS['on_surface_variant']}; font-size: 13px; font-weight: 600; font-family: 'Roboto', 'Segoe UI', sans-serif;")
         path_hbox.addWidget(path_label)
         
         # Path List Widget (With Scrollbar)
         self.path_list_widget = QListWidget()
         self.path_list_widget.setMinimumWidth(300)
-        self.path_list_widget.setFixedHeight(22) # Default height (20px item + 2px container)
+        self.path_list_widget.setFixedHeight(36)
+        self.path_list_widget.setToolTip("Folders included in the next scan. Select one and press Delete to remove it.")
         self.path_list_widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.path_list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.path_list_widget.setStyleSheet(f"""
@@ -2150,25 +1894,14 @@ class CloneWiperApp(QMainWindow):
                 padding: 0px;
             }}
             QListWidget::item {{
-                padding: 0px;
+                padding: 4px 8px;
                 border-radius: 6px;
-                margin: 0px 2px 0px 2px;
-                min-height: 24px;
-                height: 24px;
-            }}
-            QListWidget::item:only-child {{
-                /* Vertically center when only one item */
-                min-height: 24px;
-                height: 24px;
-                padding-top: 0px;
-                padding-bottom: 0px;
+                margin: 2px;
+                min-height: 28px;
             }}
             QListWidget::item:selected {{
                 background-color: {MD3_COLORS['primary_container']};
                 color: {MD3_COLORS['on_primary_container']};
-                padding: 0px;
-                min-height: 24px;
-                height: 24px;
             }}
             QScrollBar:vertical {{
                 background-color: transparent;
@@ -2194,18 +1927,27 @@ class CloneWiperApp(QMainWindow):
         path_hbox.addWidget(self.path_list_widget)
         
         # Add Folder Button (Icon Only or Small)
-        add_btn = QPushButton("+ Add Folder")
-        add_btn.setFixedSize(110, 32)
+        add_btn = QPushButton("Add folder")
+        add_btn.setFixedHeight(36)
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setToolTip("Choose a folder to scan")
         add_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {MD3_COLORS['primary_container']};
                 color: {MD3_COLORS['on_primary_container']};
-                font-size: 12px;
-                font-weight: 500;
+                font-size: 13px;
+                font-weight: 600;
                 border: none;
-                border-radius: 16px;
+                border-radius: 18px;
+                padding: 0 16px;
             }}
-            QPushButton:hover {{ background-color: #d0bcff; }}
+            QPushButton:hover {{
+                background-color: #EADDFF;
+                color: #381E72;
+            }}
+            QPushButton:focus {{
+                border: 2px solid {MD3_COLORS['primary']};
+            }}
         """)
         add_btn.clicked.connect(self._browse_path)
         path_hbox.addWidget(add_btn)
@@ -2216,26 +1958,42 @@ class CloneWiperApp(QMainWindow):
         control_layout.addStretch()
         
         # Hash Mode Selection (no label, centered text like other dropdowns)
-        self.hash_mode_combo = CenteredComboBox()
+        self.hash_mode_combo = QComboBox()
         self.hash_mode_combo.addItems([
-            "MD5 Only", 
-            "Single Perceptual Hash", 
-            "Multi-Algorithm Perceptual Hash",
-            "Single P-Hash + ORB",
-            "Multi-Algo P-Hash + ORB"
+            "Exact match",
+            "Similar photos",
+            "Similar photos (recommended)",
+            "Similar + visual check",
+            "Strict + visual check",
+            "Strict + AI check",
         ])
+        self._hash_mode_tips = [
+            "MD5. Keeps only byte-for-byte identical files. Fastest, and the right choice for documents and audio.",
+            "One perceptual hash. Also finds resized or recompressed photos, with more lookalikes.",
+            "Four perceptual hashes have to mostly agree. Recommended balance of speed and accuracy.",
+            "Perceptual hash, then an ORB feature check, so fewer lookalikes survive.",
+            "Four-hash vote plus an ORB check. Strictest visual mode, and the slowest.",
+            "Four-hash vote plus an AI embedding check. Use when a false match would be costly.",
+        ]
         self.hash_mode_combo.setCurrentIndex(2)  # Default to multi-algorithm
-        self.hash_mode_combo.setFixedHeight(32)
+        self.hash_mode_combo.setFixedHeight(36)
+        self.hash_mode_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.hash_mode_combo.setToolTip(self._hash_mode_tips[2])
+        for index, tip in enumerate(self._hash_mode_tips):
+            self.hash_mode_combo.setItemData(index, tip, Qt.ItemDataRole.ToolTipRole)
+        self.hash_mode_combo.currentIndexChanged.connect(
+            lambda index: self.hash_mode_combo.setToolTip(self._hash_mode_tips[index])
+        )
         self.hash_mode_combo.setStyleSheet(f"""
             QComboBox {{
                 background-color: {MD3_COLORS['bg_subtle']};
                 color: {MD3_COLORS['on_surface']};
                 border: 1px solid {MD3_COLORS['outline']};
                 border-radius: 8px;
-                padding: 4px 12px;
+                min-width: 240px;
+                padding: 4px 28px 4px 12px;
                 font-size: 13px;
-                font-weight: 500;
-                min-width: 200px;
+                font-weight: 600;
             }}
             QComboBox:hover {{
                 border-color: {MD3_COLORS['primary']};
@@ -2260,24 +2018,34 @@ class CloneWiperApp(QMainWindow):
                 border-radius: 4px;
             }}
         """)
-        # Use the same centered delegate as sort combo
-        self.hash_mode_combo.setItemDelegate(CenteredComboDelegate(self.hash_mode_combo))
         control_layout.addWidget(self.hash_mode_combo)
         
         # Scan Button (Filled)
-        self.scan_btn = QPushButton("Start Scanning")
-        self.scan_btn.setFixedSize(140, 32)
+        self.scan_btn = QPushButton("Scan")
+        self.scan_btn.setFixedHeight(36)
+        self.scan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.scan_btn.setToolTip("Scan the folders above for duplicates")
         self.scan_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {MD3_COLORS['primary']};
                 color: {MD3_COLORS['on_primary']};
-                font-size: 12px;
-                font-weight: 600;
-                border-radius: 16px;
-                letter-spacing: 0.5px;
+                font-size: 13px;
+                font-weight: 700;
+                border: none;
+                border-radius: 18px;
+                padding: 0 22px;
             }}
-            QPushButton:hover {{ background-color: {MD3_COLORS['primary_container']}; }}
-            QPushButton:disabled {{ background-color: {MD3_COLORS['surface_variant']}; color: {MD3_COLORS['on_surface_variant']}; }}
+            QPushButton:hover {{
+                background-color: #EADDFF;
+                color: #381E72;
+            }}
+            QPushButton:focus {{
+                border: 2px solid {MD3_COLORS['on_primary']};
+            }}
+            QPushButton:disabled {{
+                background-color: {MD3_COLORS['surface_variant']};
+                color: {MD3_COLORS['on_surface_variant']};
+            }}
         """)
         self.scan_btn.clicked.connect(self._start_scanning)
         control_layout.addWidget(self.scan_btn)
@@ -2285,7 +2053,9 @@ class CloneWiperApp(QMainWindow):
         
         # Status bar (Material 3)
         status_bar = QFrame()
-        status_bar.setFixedHeight(30) # Compact status bar
+        self.status_bar = status_bar
+        status_bar.setFixedHeight(36)
+        status_bar.setVisible(False)
         status_bar.setStyleSheet(f"""
             QFrame {{
                 background-color: {MD3_COLORS['bg_tertiary']};
@@ -2296,10 +2066,11 @@ class CloneWiperApp(QMainWindow):
         status_layout.setContentsMargins(24, 0, 24, 0)
         status_layout.setSpacing(16)
         
-        self.status_label = QLabel("")  # Will be updated during scanning/results
+        self.status_label = QLabel("")
         self.status_label.setStyleSheet(f"""
-            color: {MD3_COLORS['on_surface_variant']};
-            font-size: 14px;
+            color: {MD3_COLORS['on_surface']};
+            font-size: 13px;
+            font-weight: 500;
             font-family: 'Roboto', 'Segoe UI', sans-serif;
             padding: 0px;
         """)
@@ -2357,7 +2128,7 @@ class CloneWiperApp(QMainWindow):
         
         # Center status label for scanning progress and initial instruction
         self.center_status_label = QLabel()
-        self.center_status_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.center_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         # Enable word wrapping for long status messages
         self.center_status_label.setWordWrap(True)
         # Enable HTML formatting
@@ -2484,32 +2255,42 @@ class CloneWiperApp(QMainWindow):
             }}
         """
         
-        self.keep_newest_btn = QPushButton("Keep Newest")
+        self.keep_newest_btn = QPushButton("Keep newest")
         self.keep_newest_btn.setFixedHeight(40)
+        self.keep_newest_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.keep_newest_btn.setToolTip("Keep the most recently modified file in each group")
         self.keep_newest_btn.setStyleSheet(outlined_button_style)
         self.keep_newest_btn.clicked.connect(lambda: self._quick_select('newest'))
         footer_layout.addWidget(self.keep_newest_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         
-        self.keep_oldest_btn = QPushButton("Keep Oldest")
+        self.keep_oldest_btn = QPushButton("Keep oldest")
         self.keep_oldest_btn.setFixedHeight(40)
+        self.keep_oldest_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.keep_oldest_btn.setToolTip("Keep the earliest file in each group")
         self.keep_oldest_btn.setStyleSheet(outlined_button_style)
         self.keep_oldest_btn.clicked.connect(lambda: self._quick_select('oldest'))
         footer_layout.addWidget(self.keep_oldest_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         
-        self.keep_best_btn = QPushButton("Keep Best")
+        self.keep_best_btn = QPushButton("Keep best")
         self.keep_best_btn.setFixedHeight(40)
+        self.keep_best_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.keep_best_btn.setToolTip("Keep the highest-resolution image, then the largest file")
         self.keep_best_btn.setStyleSheet(outlined_button_style)
         self.keep_best_btn.clicked.connect(lambda: self._quick_select('best_res'))
         footer_layout.addWidget(self.keep_best_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         
-        self.keep_smallest_btn = QPushButton("Keep Smallest")
+        self.keep_smallest_btn = QPushButton("Keep smallest")
         self.keep_smallest_btn.setFixedHeight(40)
+        self.keep_smallest_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.keep_smallest_btn.setToolTip("Keep the highest-resolution image, then the smallest file")
         self.keep_smallest_btn.setStyleSheet(outlined_button_style)
         self.keep_smallest_btn.clicked.connect(lambda: self._quick_select('keep_smallest'))
         footer_layout.addWidget(self.keep_smallest_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         
         self.keep_raw_btn = QPushButton("Keep RAW")
         self.keep_raw_btn.setFixedHeight(40)
+        self.keep_raw_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.keep_raw_btn.setToolTip("Prefer the RAW file when a group also contains a JPEG")
         self.keep_raw_btn.setStyleSheet(outlined_button_style)
         self.keep_raw_btn.clicked.connect(lambda: self._quick_select('keep_raw'))
         footer_layout.addWidget(self.keep_raw_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
@@ -2532,13 +2313,14 @@ class CloneWiperApp(QMainWindow):
         toggle_hbox.setAlignment(Qt.AlignmentFlag.AlignVCenter)  # Vertical center alignment
         toggle_container.setStyleSheet("background-color: transparent;") # Ensure transparent background for container
         
-        self.scope_label = QLabel("Current Page")
-        self.scope_label.setMinimumWidth(86)
+        self.scope_label = QLabel("This page")
+        self.scope_label.setMinimumWidth(72)
         self.scope_label.setStyleSheet(f"color: {MD3_COLORS['on_surface']}; font-size: 13px; font-family: 'Roboto', 'Segoe UI', sans-serif;")
         self.scope_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         
         self.scope_toggle = ToggleSwitch(active_color=MD3_COLORS['primary'], bg_color=MD3_COLORS['surface_variant'])
-        self.scope_toggle.setToolTip("Toggle quick select scope between the current page and all pages.")
+        self.scope_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.scope_toggle.setToolTip("Apply Keep actions to this page, or to every page")
         self.scope_toggle.toggled.connect(self._update_scope_label)
         
         toggle_hbox.addWidget(self.scope_label, alignment=Qt.AlignmentFlag.AlignVCenter)
@@ -2663,6 +2445,8 @@ class CloneWiperApp(QMainWindow):
         # Set text alignment to center for dropdown items
         # Note: CenteredComboDelegate is already defined at the start of _setup_ui
         self.sort_combo.setItemDelegate(CenteredComboDelegate(self.sort_combo))
+        self.sort_combo.setToolTip("Sort duplicate groups")
+        self.sort_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sort_combo.currentTextChanged.connect(self._apply_sorting)
         footer_layout.addWidget(self.sort_combo, alignment=Qt.AlignmentFlag.AlignVCenter)
         
@@ -2695,6 +2479,8 @@ class CloneWiperApp(QMainWindow):
         
         self.prev_btn = QPushButton("◀")
         self.prev_btn.setFixedSize(40, 40)
+        self.prev_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.prev_btn.setToolTip("Previous page")
         self.prev_btn.setStyleSheet(icon_button_style)
         self.prev_btn.clicked.connect(self._prev_page)
         footer_layout.addWidget(self.prev_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
@@ -2762,6 +2548,8 @@ class CloneWiperApp(QMainWindow):
         
         self.next_btn = QPushButton("▶")
         self.next_btn.setFixedSize(40, 40)
+        self.next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.next_btn.setToolTip("Next page")
         self.next_btn.setStyleSheet(icon_button_style)
         self.next_btn.clicked.connect(self._next_page)
         footer_layout.addWidget(self.next_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
@@ -2769,8 +2557,10 @@ class CloneWiperApp(QMainWindow):
         footer_layout.addStretch()
         
         # Delete button (Material 3 Error Button)
-        self.delete_btn = QPushButton("Delete")
+        self.delete_btn = QPushButton("Delete selected")
         self.delete_btn.setFixedHeight(40)
+        self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.delete_btn.setToolTip("Move the marked copies to the Recycle Bin. One file in each group should stay.")
         self.delete_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {MD3_COLORS['error']};
@@ -2803,8 +2593,10 @@ class CloneWiperApp(QMainWindow):
         footer_layout.addWidget(self.delete_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         
         # Clear Selection button (Material 3 Text/Outlined Button)
-        self.clear_select_btn = QPushButton("Clear Selection")
+        self.clear_select_btn = QPushButton("Clear")
         self.clear_select_btn.setFixedHeight(40)
+        self.clear_select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_select_btn.setToolTip("Unmark every file currently marked for deletion")
         self.clear_select_btn.setStyleSheet(outlined_button_style)
         self.clear_select_btn.setEnabled(False)
         self.clear_select_btn.clicked.connect(self._clear_selection)
@@ -2814,19 +2606,19 @@ class CloneWiperApp(QMainWindow):
         self.main_layout.addWidget(self.footer)
     
     def _get_instruction_text(self) -> str:
-        """Get the initial instruction text with hash mode descriptions."""
+        """Empty-state copy. Mode details live on the mode menu tooltip."""
         return (
-            "<div style='text-align: left; line-height: 1.6;'>"
-            "<p style='font-size: 16px; font-weight: 500; margin-bottom: 12px;'>"
-            "Use \"+ Add Folder\" or Drag & drop folder here"
+            "<div style='text-align: center;'>"
+            "<p style='font-size: 28px; font-weight: 600; margin: 0 0 8px 0;'>"
+            "Find duplicate files"
             "</p>"
-            "<p style='font-size: 13px; font-weight: 400; color: #CAC4D0; margin-top: 16px;'>"
-            "<b>Hash Modes:</b><br>"
-            "• <b>MD5 Only</b> - Fast exact duplicates (byte-for-byte identical files)<br>"
-            "• <b>Single Perceptual Hash</b> - Balanced speed/accuracy for similar images<br>"
-            "• <b>Multi-Algorithm Perceptual Hash</b> - Most accurate (detects resized/compressed duplicates)<br>"
-            "• <b>Single P-Hash + ORB</b> - Single hash with ORB verification (faster, accurate)<br>"
-            "• <b>Multi-Algo P-Hash + ORB</b> - Multi-algorithm with ORB verification (most accurate)"
+            "<p style='font-size: 15px; color: #CAC4D0; margin: 0 0 16px 0;'>"
+            "Add a folder, or drop one anywhere in this area."
+            "</p>"
+            "<p style='font-size: 13px; color: #938F99; margin: 0; line-height: 1.55;'>"
+            "Exact match finds identical files.<br>"
+            "Similar photos also catches resized and recompressed images.<br>"
+            "Visual and AI checks drop lookalikes before anything is deleted."
             "</p>"
             "</div>"
         )
@@ -2834,20 +2626,18 @@ class CloneWiperApp(QMainWindow):
     def _adjust_path_list_height(self):
         """Dynamically adjust path list height based on items (max 1.5 rows)."""
         count = self.path_list_widget.count()
-        if count == 0:
-            h = 26  # Empty: default height (24px item + 2px container)
-        elif count == 1:
-            h = 26  # Single folder: 24px item + 2px container
-            item = self.path_list_widget.item(0)
-            if item:
-                item.setSizeHint(QSize(-1, 24))
+        if count <= 1:
+            h = 36
+            if count == 1:
+                item = self.path_list_widget.item(0)
+                if item:
+                    item.setSizeHint(QSize(-1, 32))
         else:
-            # Show about 1.5 compact rows.
-            h = 38
+            h = 58
             for i in range(count):
                 item = self.path_list_widget.item(i)
                 if item:
-                    item.setSizeHint(QSize(-1, 24))
+                    item.setSizeHint(QSize(-1, 32))
         self.path_list_widget.setFixedHeight(h)
         self.updateGeometry()
 
@@ -2944,7 +2734,116 @@ class CloneWiperApp(QMainWindow):
         for path in paths:
             self._add_folder_to_list(path)
     
+    def _ensure_previous_scan_stopped(self) -> bool:
+        """Make sure no previous scan thread is still running before starting a new one.
+
+        A single ScanEngine instance is reused across scans; if an old scan thread is
+        still alive when a new one starts, both would mutate the engine's shared state
+        (scan_cancelled, file_groups_raw, caches) concurrently. Returns True once it's
+        safe to proceed, False if the old thread refused to stop in time.
+        """
+        old_thread = getattr(self, '_scan_thread', None)
+        if old_thread is None or not old_thread.is_alive():
+            return True
+        self.engine.scan_cancelled = True
+        old_thread.join(timeout=10.0)
+        if old_thread.is_alive():
+            logger.debug("DEBUG: Previous scan thread did not stop within timeout")
+            dialog = CustomDialog(
+                self, title="Busy",
+                message="The previous scan is still shutting down. Please try again in a moment.",
+                buttons=["OK"]
+            )
+            dialog.exec()
+            return False
+        return True
+
+    def _ensure_embedding_verification_ready(self) -> bool:
+        """Make sure AI Embedding verification can actually run before starting a scan
+        with it enabled: onnxruntime must be installed, and the small pretrained model
+        must be downloaded (with the user's consent, since it needs one internet fetch).
+        Returns True once ready, False if the user should not proceed.
+        """
+        from core.engine import (
+            ONNXRUNTIME_AVAILABLE, is_embedding_model_downloaded, download_embedding_model,
+            EMBEDDING_MODEL_URL, EMBEDDING_MODEL_APPROX_SIZE_MB, EMBEDDING_MODEL_FILENAME
+        )
+
+        if not ONNXRUNTIME_AVAILABLE:
+            dialog = CustomDialog(
+                self, title="Missing Dependency",
+                message=(
+                    "AI Embedding verification requires the <b>onnxruntime</b> package, "
+                    "which isn't installed.<br><br>Install it with:<br><code>pip install onnxruntime</code>"
+                ),
+                buttons=["OK"]
+            )
+            dialog.exec()
+            return False
+
+        if is_embedding_model_downloaded():
+            return True
+
+        confirm = CustomDialog(
+            self, title="Download AI Model",
+            message=(
+                f"AI Embedding verification needs a one-time download of a small pretrained "
+                f"vision model (<b>{EMBEDDING_MODEL_FILENAME}</b>, ~{EMBEDDING_MODEL_APPROX_SIZE_MB}MB) from:"
+                f"<br>{EMBEDDING_MODEL_URL}<br><br>"
+                f"It will be cached locally afterward &mdash; no further downloads needed. Download now?"
+            ),
+            buttons=["Cancel", "Download"]
+        )
+        if confirm.exec() != "Download":
+            return False
+
+        progress_dialog = QDialog(self)
+        progress_dialog.setWindowTitle("CloneWiper")
+        progress_dialog.setModal(True)
+        progress_dialog.setFixedSize(380, 120)
+        layout = QVBoxLayout(progress_dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        label = QLabel(f"Downloading AI model (~{EMBEDDING_MODEL_APPROX_SIZE_MB}MB)...")
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        layout.addWidget(label)
+        layout.addWidget(bar)
+
+        class _DownloadSignals(QObject):
+            progress = Signal(float)
+            done = Signal(bool)
+
+        signals = _DownloadSignals()
+        signals.progress.connect(lambda p: bar.setValue(int(p * 100)))
+
+        outcome = {'success': False}
+
+        def _on_done(success: bool):
+            outcome['success'] = success
+            progress_dialog.accept()
+
+        signals.done.connect(_on_done)
+
+        def _worker():
+            ok = download_embedding_model(progress_callback=signals.progress.emit)
+            signals.done.emit(ok)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        progress_dialog.exec()
+
+        if not outcome['success']:
+            dialog = CustomDialog(
+                self, title="Download Failed",
+                message="Could not download the AI model. Check your internet connection and try again.",
+                buttons=["OK"]
+            )
+            dialog.exec()
+            return False
+        return True
+
     def _start_scanning(self):
+        if not self._ensure_previous_scan_stopped():
+            return
         paths = [self.path_list_widget.item(i).data(Qt.UserRole) for i in range(self.path_list_widget.count())]
         if not paths:
             dialog = CustomDialog(self, title="Warning", message="Please select at least one folder to scan.", buttons=["OK"])
@@ -2959,23 +2858,28 @@ class CloneWiperApp(QMainWindow):
             return
         
         self.scan_paths = valid_paths
-        
-        # Update button to "Cancel Scanning"
-        self.scan_btn.setText("Cancel Scanning")
+
+        # Get hash mode: 0=MD5, 1=Single Perceptual, 2=Multi-Algorithm, 3=Single+ORB,
+        # 4=Multi+ORB, 5=Multi+AI Embedding
+        hash_mode = self.hash_mode_combo.currentIndex()
+        use_imagehash = 0 < hash_mode < 6  # True for perceptual hash modes
+        use_multi_hash = hash_mode in (2, 4, 5)  # True for multi-algorithm modes
+        use_orb_verification = hash_mode == 3 or hash_mode == 4  # True for ORB modes
+        use_embedding_verification = hash_mode == 5  # True for AI embedding mode
+
+        if use_embedding_verification and not self._ensure_embedding_verification_ready():
+            return
+
+        # Update button to "Cancel"
+        self.scan_btn.setText("Cancel")
         self.scan_btn.setEnabled(True)
         # Disconnect previous connection and connect to cancel function
         self.scan_btn.clicked.disconnect()
         self.scan_btn.clicked.connect(self._cancel_scanning)
-        
+
         # Center progress container will be shown via status callback
         # Don't update status_label during scanning to avoid duplication with center display
-        
-        # Get hash mode: 0=MD5, 1=Single Perceptual, 2=Multi-Algorithm, 3=Single+ORB, 4=Multi+ORB
-        hash_mode = self.hash_mode_combo.currentIndex()
-        use_imagehash = hash_mode > 0 and hash_mode < 5  # True for perceptual hash modes
-        use_multi_hash = hash_mode == 2 or hash_mode == 4  # True for multi-algorithm modes
-        use_orb_verification = hash_mode == 3 or hash_mode == 4  # True for ORB modes
-        
+
         # Clear previous results
         self.file_groups = {}
         self.file_groups_raw = {}
@@ -3004,7 +2908,8 @@ class CloneWiperApp(QMainWindow):
         
         # Clear existing group widgets (but keep center_progress_container and stretches)
         # Reset status label to initial instruction when clearing results
-        self.status_label.setText("Use \"+ Add Folder\" or Drag & drop folder here")
+        self.status_label.setText("")
+        self.status_bar.setVisible(False)
         items_to_remove = []
         for i in range(self.results_layout.count()):
             item = self.results_layout.itemAt(i)
@@ -3022,7 +2927,8 @@ class CloneWiperApp(QMainWindow):
         self.center_progress_bar.setVisible(True)  # Show progress bar during scanning
         self.center_progress_bar.setValue(0)
         self._scan_status_message = "Initializing scan..."
-        self.status_label.setVisible(False)  # Hide upper left status during scanning
+        self.status_label.setVisible(False)
+        self.status_bar.setVisible(False)
         
         # Hide footer during scanning
         if hasattr(self, 'footer'):
@@ -3045,7 +2951,7 @@ class CloneWiperApp(QMainWindow):
                 self.engine.status_callback("Scan thread started...")
                 self.engine.progress_callback(0.01)
                 
-                self.engine.scan_duplicate_files(valid_paths, use_imagehash, use_multi_hash, use_orb_verification)
+                self.engine.scan_duplicate_files(valid_paths, use_imagehash, use_multi_hash, use_orb_verification, use_embedding_verification)
                 logger.debug("DEBUG: Scan completed")
             except Exception as e:
                 logger.debug("Scan thread exception: %s", e, exc_info=True)
@@ -3075,13 +2981,13 @@ class CloneWiperApp(QMainWindow):
     @Slot(float)
     def _on_progress_slot(self, value: float):
         """Slot for progress updates (runs on main thread)."""
-        if self.scan_btn.text() == "Cancel Scanning":
+        if self.scan_btn.text() == "Cancel":
             self.center_progress_bar.setValue(int(value * 100))
             self._refresh_center_scan_display()
 
     def _refresh_center_scan_display(self) -> None:
         """Keep status text and progress bar in sync during scans."""
-        if self.scan_btn.text() != "Cancel Scanning":
+        if self.scan_btn.text() != "Cancel":
             return
         pct = self.center_progress_bar.value()
         message = getattr(self, "_scan_status_message", "")
@@ -3093,22 +2999,27 @@ class CloneWiperApp(QMainWindow):
     @Slot(str)
     def _on_status_slot(self, message: str):
         """Slot for status updates (runs on main thread)."""
-        if self.scan_btn.text() == "Cancel Scanning":
+        if self.scan_btn.text() == "Cancel":
             self._scan_status_message = message
             self.center_progress_container.setVisible(True)
             self.center_progress_bar.setVisible(True)
             self.status_label.setVisible(False)
+            self.status_bar.setVisible(False)
             self._refresh_center_scan_display()
         else:
             self.status_label.setText(message)
-            self.status_label.setVisible(True)
+            self.status_label.setVisible(bool(message))
+            self.status_bar.setVisible(bool(message))
             self.center_progress_container.setVisible(False)
             self.center_progress_bar.setVisible(False)
     
     @Slot(dict)
     def _on_results_slot(self, duplicate_groups: Dict[str, List[str]]):
         """Slot for results updates (runs on main thread)."""
-        self._cleanup_thumbnail_cache()
+        # Cache maintenance doesn't need to happen before the user sees their results;
+        # run it in the background instead of blocking the GUI thread right when
+        # results are ready to render.
+        threading.Thread(target=self._cleanup_thumbnail_cache, daemon=True).start()
         self._display_results(duplicate_groups)
 
     def _cleanup_thumbnail_cache(self, vacuum: bool = False):
@@ -3132,21 +3043,24 @@ class CloneWiperApp(QMainWindow):
         self.center_progress_bar.setVisible(False)  # Hide progress bar
         
         # Update UI
-        self.scan_btn.setText("Start Scanning")
+        self.scan_btn.setText("Scan")
         self.scan_btn.setEnabled(True)
         # Reconnect button to start scanning
         self.scan_btn.clicked.disconnect()
         self.scan_btn.clicked.connect(self._start_scanning)
         
-        self.status_label.setVisible(False)  # Keep status label hidden
+        self.status_label.setVisible(False)
+        self.status_bar.setVisible(False)
         
         # Hide footer on cancel
         if hasattr(self, 'footer'):
             self.footer.setVisible(False)
-        
-        # Clear scan thread reference
-        self._scan_thread = None
-    
+
+        # Note: intentionally not clearing self._scan_thread here. The thread is only
+        # cooperatively cancelled (checks scan_cancelled periodically) and may still be
+        # running; _ensure_previous_scan_stopped() needs this reference to join it before
+        # a new scan starts.
+
     def _display_results(self, duplicate_groups: Dict[str, List[str]]):
         """Display scan results."""
         logger.debug(f"DEBUG: _display_results called with {len(duplicate_groups)} groups")
@@ -3156,14 +3070,17 @@ class CloneWiperApp(QMainWindow):
         self.center_progress_bar.setVisible(False)  # Hide progress bar
         
         # Restore button to "Start Scanning" state
-        self.scan_btn.setText("Start Scanning")
+        self.scan_btn.setText("Scan")
         self.scan_btn.setEnabled(True)
         # Reconnect button to start scanning
         self.scan_btn.clicked.disconnect()
         self.scan_btn.clicked.connect(self._start_scanning)
         
-        self.file_groups_raw = duplicate_groups
-        
+        # Copy rather than alias: this dict is also held by the engine as its own
+        # file_groups_raw, so keeping the same object risks the UI iterating it while
+        # a stray scan thread mutates it.
+        self.file_groups_raw = dict(duplicate_groups)
+
         # Apply current sorting
         current_sort = self.sort_combo.currentText()
         logger.debug(f"DEBUG: Applying current sorting: {current_sort}")
@@ -3176,25 +3093,36 @@ class CloneWiperApp(QMainWindow):
         logger.debug(f"DEBUG: Enabling scan button, hiding progress bar")
         self.center_progress_bar.setValue(0)
         
-        # Show status label after scan completes
+        if not duplicate_groups:
+            self._results_summary = ""
+            self.center_progress_container.setVisible(True)
+            self.center_progress_bar.setVisible(False)
+            self.center_status_label.setText(
+                "<div style='text-align: center;'>"
+                "<p style='font-size: 24px; font-weight: 600; margin: 0 0 8px 0;'>"
+                "No duplicates in these folders"
+                "</p>"
+                "<p style='font-size: 14px; color: #CAC4D0; margin: 0;'>"
+                "Try another folder, or switch to a broader photo mode if you expected similar images."
+                "</p>"
+                "</div>"
+            )
+            self.status_label.setVisible(False)
+            self.status_bar.setVisible(False)
+            if hasattr(self, 'footer'):
+                self.footer.setVisible(False)
+            self.keep_best_btn.setVisible(False)
+            self.keep_smallest_btn.setVisible(False)
+            self.keep_raw_btn.setVisible(False)
+            return
+
+        self._results_summary = self._build_results_summary(duplicate_groups)
+        self.status_label.setText(self._results_summary)
         self.status_label.setVisible(True)
-        
-        # Show footer after scan completes
+        self.status_bar.setVisible(True)
         if hasattr(self, 'footer'):
             self.footer.setVisible(True)
         
-        if not duplicate_groups:
-            logger.debug(f"DEBUG: No duplicate groups, setting status")
-            self.status_label.setText("No duplicate files found.")
-            # Hide image-specific buttons when no results
-            self.keep_best_btn.setVisible(False)
-            self.keep_raw_btn.setVisible(False)
-            return
-        
-        logger.debug(f"DEBUG: Setting status and rendering page")
-        self.status_label.setText(f"Found {len(duplicate_groups)} duplicate groups")
-        
-        # Update button visibility based on applicable files
         self._update_image_button_visibility()
         
         try:
@@ -3202,6 +3130,27 @@ class CloneWiperApp(QMainWindow):
         except Exception as e:
             logger.debug("Error in _render_page: %s", e, exc_info=True)
         logger.debug(f"DEBUG: _display_results completed")
+
+    def _build_results_summary(self, groups: Dict[str, List[str]]) -> str:
+        """One-line result summary: counts plus space recoverable by keeping one file."""
+        file_count = 0
+        reclaim = 0
+        for files in groups.values():
+            sizes = []
+            for file_path in files:
+                try:
+                    sizes.append(os.path.getsize(file_path))
+                except OSError:
+                    continue
+            file_count += len(files)
+            if len(sizes) > 1:
+                reclaim += sum(sizes) - max(sizes)
+        group_word = "group" if len(groups) == 1 else "groups"
+        file_word = "file" if file_count == 1 else "files"
+        summary = f"{len(groups)} {group_word}  ·  {file_count} {file_word}"
+        if reclaim > 0:
+            summary += f"  ·  {format_byte_size(reclaim)} reclaimable if you keep one file per group"
+        return summary
     
     def _render_page(self, page_index: int):
         """Render a page of groups."""
@@ -3213,6 +3162,12 @@ class CloneWiperApp(QMainWindow):
         logger.debug(f"DEBUG: _render_page called with page_index={page_index}, file_groups={len(self.file_groups) if self.file_groups else 0}")
         # Clear existing group widgets (but keep center_progress_container and stretches)
         self._group_widgets.clear()
+        # Drop references to the previous page's thumbnail-worker signal objects. They were
+        # only kept alive to prevent GC while their (now superseded) GroupWidgets were on
+        # screen; retaining them forever leaked a Signals object + closure per thumbnail ever
+        # requested in the app's lifetime.
+        if hasattr(self, '_active_signals'):
+            self._active_signals.clear()
         logger.debug(f"DEBUG: Clearing existing group widgets")
         # Remove all widgets except center_progress_container and stretches
         items_to_remove = []
@@ -3272,7 +3227,7 @@ class CloneWiperApp(QMainWindow):
         
         # Count total thumbnails to load (PDF/EPUB/MOBI/AZW3 files)
         for idx, (group_id, files) in enumerate(page_groups):
-            for file_path in files[:12]:  # Limit preview
+            for file_path in files:
                 if file_path not in self.thumb_cache:
                     ext = os.path.splitext(file_path)[1].lower()
                     if ext in {'.pdf', '.epub', '.mobi', '.azw3'}:
@@ -3292,7 +3247,7 @@ class CloneWiperApp(QMainWindow):
                         group_widget.set_selection(file_path, self.selection_state[file_path])
                 
                 # Request thumbnails
-                for file_path in files[:12]:  # Limit preview
+                for file_path in files:
                     self._request_thumbnail(file_path, group_widget)
             except Exception as e:
                 logger.debug("Error creating GroupWidget for %s: %s", group_id, e, exc_info=True)
@@ -3301,12 +3256,14 @@ class CloneWiperApp(QMainWindow):
         QTimer.singleShot(50, lambda: self.scroll_area.verticalScrollBar().setValue(0))
         
         # Set initial status - show thumbnail loading if applicable, otherwise show groups info
+        summary = getattr(self, "_results_summary", "")
+        page_label = f"Page {page_index + 1} of {total_pages}"
         if self._thumbnail_total > 0:
-            status_text = f"Loading thumbnails: 0/{self._thumbnail_total}"
+            status_text = f"{summary}   ·   Loading previews 0/{self._thumbnail_total}" if summary else f"Loading previews 0/{self._thumbnail_total}"
         else:
-            status_text = f"Groups {start+1}-{end} / {total}  (Page {page_index+1}/{total_pages})"
-        logger.debug(f"DEBUG: Setting status to: {status_text}")
-        self.status_label.setText(status_text)
+            status_text = f"{summary}   ·   {page_label}" if summary else page_label
+        self.status_label.setText(status_text.strip())
+        self.status_bar.setVisible(True)
         logger.debug(f"DEBUG: _render_page completed, created {len(self._group_widgets)} group widgets")
         
         # Force update
@@ -3335,7 +3292,9 @@ class CloneWiperApp(QMainWindow):
                 # Count how many have started loading (marked as True)
                 started_count = sum(1 for loading in self._pending_thumbnails.values() if loading)
                 # Show progress: started loading / total
-                self.status_label.setText(f"Loading thumbnails: {started_count}/{self._thumbnail_total}")
+                detail = f"Loading previews {started_count}/{self._thumbnail_total}"
+                summary = getattr(self, "_results_summary", "")
+                self.status_label.setText(f"{summary}   ·   {detail}" if summary else detail)
         
         # Submit worker
         worker = ThumbnailWorker(file_path, 300, self._thumb_page_token, cache=self.persistent_cache)
@@ -3369,16 +3328,15 @@ class CloneWiperApp(QMainWindow):
             if self._thumbnail_total > 0:
                 remaining = self._thumbnail_total - self._thumbnail_loaded
                 if remaining > 0:
-                    self.status_label.setText(f"Loading thumbnails: {self._thumbnail_loaded}/{self._thumbnail_total}")
+                    detail = f"Loading previews {self._thumbnail_loaded}/{self._thumbnail_total}"
+                    summary = getattr(self, "_results_summary", "")
+                    self.status_label.setText(f"{summary}   ·   {detail}" if summary else detail)
                 else:
-                    # All thumbnails loaded, restore normal status
                     if self.file_groups:
-                        all_groups = list(self.file_groups.items())
-                        total = len(all_groups)
-                        start = self.current_page * self.groups_per_page
-                        end = min(total, start + self.groups_per_page)
-                        total_pages = max(0, (total - 1) // self.groups_per_page) + 1 if total > 0 else 1
-                        self.status_label.setText(f"Groups {start+1}-{end} / {total}  (Page {self.current_page+1}/{total_pages})")
+                        total_pages = max(0, (len(self.file_groups) - 1) // self.groups_per_page) + 1
+                        summary = getattr(self, "_results_summary", "")
+                        page_label = f"Page {self.current_page + 1} of {total_pages}"
+                        self.status_label.setText(f"{summary}   ·   {page_label}" if summary else page_label)
         
         # Check if stale - if group_widget is provided and still valid, always accept
         # Otherwise, check time difference (allow up to 60 seconds for slow loading)
@@ -3711,9 +3669,9 @@ class CloneWiperApp(QMainWindow):
         selected_count = sum(1 for v in self.selection_state.values() if v)
         self.delete_btn.setEnabled(selected_count > 0)
         if selected_count > 0:
-            self.delete_btn.setText(f"Delete ({selected_count})")
+            self.delete_btn.setText(f"Delete {selected_count}")
         else:
-            self.delete_btn.setText("Delete")
+            self.delete_btn.setText("Delete selected")
         
         # Also update clear selection button
         if hasattr(self, 'clear_select_btn'):
@@ -3759,7 +3717,7 @@ class CloneWiperApp(QMainWindow):
     def _update_scope_label(self, apply_all_pages: bool):
         """Keep quick-select scope wording aligned with the toggle state."""
         if hasattr(self, "scope_label"):
-            self.scope_label.setText("All Pages" if apply_all_pages else "Current Page")
+            self.scope_label.setText("All results" if apply_all_pages else "This page")
 
     def _highlight_quick_select_mode(self, mode: str):
         """Visually mark the last quick-select strategy the user applied."""
@@ -3902,12 +3860,21 @@ class CloneWiperApp(QMainWindow):
                         group_by_type=False
                     )
                     # Update status
-                    self.status_label.setText(f"Found {len(self.file_groups)} duplicate groups")
+                    self._results_summary = self._build_results_summary(self.file_groups)
+                    self.status_label.setText(self._results_summary)
+                    self.status_bar.setVisible(True)
                     # Refresh current page
                     self._refresh_display()
                 else:
                     # No more duplicate groups
-                    self.status_label.setText("No duplicate files found.")
+                    self._results_summary = ""
+                    self.status_label.setVisible(False)
+                    self.status_bar.setVisible(False)
+                    self.center_progress_container.setVisible(True)
+                    self.center_progress_bar.setVisible(False)
+                    self.center_status_label.setText(self._get_instruction_text())
+                    if hasattr(self, "footer"):
+                        self.footer.setVisible(False)
                     self._group_widgets.clear()
                     while self.results_layout.count() > 1:
                         item = self.results_layout.takeAt(0)

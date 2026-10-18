@@ -12,6 +12,8 @@ mutagen>=1.47.0       # For music album art and metadata
 # opencv-python>=4.8.0  # For video thumbnails (standard version, no CUDA)
 # opencv-contrib-python>=4.8.0  # For additional features including video thumbnails
 # pypdfium2>=0.20.0     # For high-quality PDF rendering (preferred over PyMuPDF for PDF)
+# onnxruntime>=1.16.0   # For "AI Embedding" similarity verification (CNN-based, more resistant
+#                       # to false positives than ORB/SSIM/SIFT). Model is downloaded on first use.
 
 # GPU Acceleration for ORB (Optional, requires CUDA-enabled OpenCV)
 # Note: Standard opencv-python does NOT include CUDA support

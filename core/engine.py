@@ -37,8 +37,12 @@ from typing import Dict, List, Set, Optional, Callable, Tuple, TYPE_CHECKING
 if TYPE_CHECKING:
     import numpy as np
 import sys
+import re
 
 logger = logging.getLogger(__name__)
+
+# Trailing copy markers only. Camera names like IMG_0001 must stay intact.
+_COPY_SUFFIX_RE = re.compile(r"(?i)(?:[ _-]copy|\s*\(\d+\))+$")
 
 # Try to import psutil for advanced CPU detection (hybrid architecture support)
 try:
@@ -81,6 +85,100 @@ try:
     OPENCV_AVAILABLE = True
 except ImportError:
     OPENCV_AVAILABLE = False
+
+# ONNX Runtime for AI embedding-based similarity verification (optional)
+try:
+    import onnxruntime  # type: ignore[reportMissingImports]
+    ONNXRUNTIME_AVAILABLE = True
+except ImportError:
+    ONNXRUNTIME_AVAILABLE = False
+
+# Small pretrained MobileNetV2 classifier (ImageNet) from the official ONNX Model Zoo.
+# Its output vector is used as a semantic embedding for similarity verification: two
+# images that a CNN "sees" the same way are far less likely to be a coincidental
+# false positive than two images that merely share a perceptual hash or ORB keypoints.
+EMBEDDING_MODEL_URL = "https://github.com/onnx/models/raw/main/validated/vision/classification/mobilenet/model/mobilenetv2-7.onnx"
+EMBEDDING_MODEL_FILENAME = "mobilenetv2-7.onnx"
+EMBEDDING_MODEL_APPROX_SIZE_MB = 14
+EMBEDDING_INPUT_SIZE = 224
+EMBEDDING_SIMILARITY_THRESHOLD = 0.85
+EMBEDDING_COLOR_SIMILARITY_THRESHOLD = 0.90  # worst-grid-cell color match; guards the classifier's color-invariance blind spot
+EMBEDDING_MEAN = (0.485, 0.456, 0.406)
+EMBEDDING_STD = (0.229, 0.224, 0.225)
+
+
+def get_embedding_model_dir() -> str:
+    """Return (and create) the local cache directory for downloaded ML models."""
+    try:
+        import platform
+        system = platform.system()
+        if system == "Windows":
+            base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+            if base:
+                model_dir = os.path.join(base, "CloneWiper", "models")
+                os.makedirs(model_dir, exist_ok=True)
+                return model_dir
+        home = os.path.expanduser("~")
+        model_dir = os.path.join(home, ".CloneWiper", "models")
+        os.makedirs(model_dir, exist_ok=True)
+        return model_dir
+    except Exception:
+        return os.path.join(os.getcwd(), "models")
+
+
+def get_embedding_model_path() -> str:
+    return os.path.join(get_embedding_model_dir(), EMBEDDING_MODEL_FILENAME)
+
+
+def is_embedding_model_downloaded() -> bool:
+    """Check whether the embedding model is already cached locally (and not truncated)."""
+    path = get_embedding_model_path()
+    try:
+        return os.path.exists(path) and os.path.getsize(path) > 1_000_000
+    except Exception:
+        return False
+
+
+def download_embedding_model(progress_callback: Optional[Callable[[float], None]] = None) -> bool:
+    """Download the pretrained embedding model to the local cache, validating it loads
+    before committing. Safe to call from a background thread. Returns True on success."""
+    import urllib.request
+
+    dest = get_embedding_model_path()
+    tmp_dest = dest + ".part"
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+        def _reporthook(block_num, block_size, total_size):
+            if progress_callback and total_size > 0:
+                downloaded = block_num * block_size
+                try:
+                    progress_callback(min(1.0, downloaded / total_size))
+                except Exception:
+                    pass
+
+        urllib.request.urlretrieve(EMBEDDING_MODEL_URL, tmp_dest, _reporthook)
+
+        # Validate before committing: a corrupt/partial download should not silently
+        # become "the model is ready".
+        try:
+            import onnxruntime as ort
+            ort.InferenceSession(tmp_dest, providers=['CPUExecutionProvider'])
+        except Exception as e:
+            logger.warning(f"Downloaded embedding model failed validation: {e}")
+            os.remove(tmp_dest)
+            return False
+
+        os.replace(tmp_dest, dest)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to download embedding model: {e}")
+        try:
+            if os.path.exists(tmp_dest):
+                os.remove(tmp_dest)
+        except Exception:
+            pass
+        return False
 
 
 @dataclass
@@ -132,6 +230,38 @@ class UnionFind:
         for x in self.parent:
             result[self.find(x)].append(x)
         return dict(result)
+
+
+def iter_capped_pairs(items: List, max_pair_items: int = 256, window: int = 64, key=None):
+    """Yield candidate pairs, capping work on large inputs.
+
+    Small inputs yield every pair. Large inputs are not Hamming-sorted, so pairing
+    only lexicographic neighbors drops true near-duplicates that landed in the same
+    bucket. Each item is instead compared with `window` partners spread across the
+    bucket.
+    """
+    del key  # Kept for callers; hex order is not a similarity order.
+    item_count = len(items)
+    if item_count <= 1:
+        return
+    if item_count <= max_pair_items:
+        for i, item1 in enumerate(items):
+            for item2 in items[i + 1:]:
+                yield item1, item2
+        return
+
+    stride = max(1, item_count // window)
+    seen = set()
+    for i in range(item_count):
+        for step in range(1, window + 1):
+            j = (i + step * stride) % item_count
+            if j == i:
+                continue
+            pair_id = (i, j) if i < j else (j, i)
+            if pair_id in seen:
+                continue
+            seen.add(pair_id)
+            yield items[pair_id[0]], items[pair_id[1]]
 
 
 class ScanEngine:
@@ -280,7 +410,16 @@ class ScanEngine:
         self._orb_cache = {}  # file_path -> (keypoints, descriptors)
         self._orb_cache_lock = threading.Lock()
         self._orb_cache_max_size = 1000  # Maximum cached ORB descriptors to prevent unbounded growth
-        
+
+        # AI embedding verification (alternative to ORB/SSIM/SIFT, method='embedding')
+        self.embedding_similarity_threshold = EMBEDDING_SIMILARITY_THRESHOLD
+        self.embedding_color_similarity_threshold = EMBEDDING_COLOR_SIMILARITY_THRESHOLD
+        self._embedding_session = None  # Lazily-loaded onnxruntime.InferenceSession
+        self._embedding_session_failed = False  # Sticky flag to avoid retrying a broken session every pair
+        self._embedding_cache: 'OrderedDict[str, object]' = OrderedDict()  # file_path -> normalized embedding vector
+        self._embedding_cache_max_size = 500
+        self._embedding_cache_lock = threading.Lock()
+
         # Persistent cache DB
         self._phash_db = None
         self._phash_db_lock = threading.Lock()
@@ -1543,17 +1682,11 @@ class ScanEngine:
                     )
 
             def iter_phash_bucket_pairs(bucket_items):
-                item_count = len(bucket_items)
-                if item_count <= max_bucket_pair_items:
-                    for i, item1 in enumerate(bucket_items):
-                        for item2 in bucket_items[i + 1:]:
-                            yield item1, item2
-                    return
-                sorted_items = sorted(bucket_items, key=lambda item: item[0])
-                for i, item1 in enumerate(sorted_items):
-                    end = min(item_count, i + large_bucket_window + 1)
-                    for item2 in sorted_items[i + 1:end]:
-                        yield item1, item2
+                yield from iter_capped_pairs(
+                    bucket_items,
+                    max_pair_items=max_bucket_pair_items,
+                    window=large_bucket_window,
+                )
 
             active_buckets = [items for items in lsh_buckets.values() if len(items) >= 2]
             total_active_buckets = len(active_buckets)
@@ -2125,6 +2258,231 @@ class ScanEngine:
                         pass
         
         return partial_groups
+
+    def _parse_multi_hash_parts(self, hash_val: str) -> Optional[Tuple[str, str, str, str]]:
+        """Return the four perceptual-hash components stored on an image hash.
+
+        Scan results are prefixed with ``img_``, so a multi-hash looks like
+        ``img_{avg}_{phash}_{dhash}_{whash}`` (five segments). Comparing on a
+        raw four-way split never matched that form, and similarity voting
+        never ran.
+        """
+        if not hash_val or not isinstance(hash_val, str):
+            return None
+        body = hash_val[4:] if hash_val.startswith('img_') else hash_val
+        parts = body.split('_')
+        if len(parts) != 4:
+            return None
+        return parts[0], parts[1], parts[2], parts[3]
+
+    def _photo_stem(self, file_path: str) -> str:
+        """Basename without extension or a trailing copy marker."""
+        stem = os.path.splitext(os.path.basename(file_path))[0]
+        stem = _COPY_SUFFIX_RE.sub('', stem).strip()
+        return stem.lower()
+
+    def _cluster_by_partial_hash(self, files: List[str]) -> List[List[str]]:
+        """Split files into clusters that share a start/middle/end fingerprint."""
+        clusters: Dict[str, List[str]] = defaultdict(list)
+        for file_path in files:
+            partial = self.calculate_partial_hash(file_path)
+            if partial:
+                clusters[partial].append(file_path)
+        return [group for group in clusters.values() if len(group) > 1]
+
+    def _pair_is_similar(
+        self,
+        hash1: str,
+        hash2: str,
+        parsed_image_objs: Dict,
+        hash_to_files: Dict[str, List[str]],
+        skip_orb_verification: bool,
+    ) -> bool:
+        """True when enough perceptual algorithms agree, and verification passes."""
+        objs1 = parsed_image_objs.get(hash1)
+        objs2 = parsed_image_objs.get(hash2)
+        if not objs1 or not objs2:
+            return False
+
+        agreements = 0
+        threshold = self.hamming_threshold
+        for hash_a, hash_b in zip(objs1, objs2):
+            if not hash_a or not hash_b:
+                continue
+            try:
+                if (hash_a - hash_b) <= threshold:
+                    agreements += 1
+            except Exception:
+                continue
+        if agreements < self.min_agreement:
+            return False
+
+        should_verify = (
+            self.opencv_verification_method
+            and not skip_orb_verification
+            and not self.defer_orb_verification
+        )
+        if not should_verify:
+            return True
+        files1 = hash_to_files.get(hash1, [])
+        files2 = hash_to_files.get(hash2, [])
+        return bool(self._verify_similarity_opencv(
+            hash1, hash2, files1, files2, method=self.opencv_verification_method
+        ))
+
+    def _assemble_similarity_groups(
+        self,
+        similarity_pairs: List[Tuple[str, str]],
+        hash_to_files: Dict[str, List[str]],
+        parsed_image_objs: Dict,
+        skip_orb_verification: bool,
+    ) -> Tuple[Dict[str, List[str]], Set[str]]:
+        """Cluster agreed pairs, then drop members that are not similar to the representative."""
+        hash_uf = UnionFind()
+        direct_pairs = set()
+        for hash1, hash2 in similarity_pairs:
+            hash_uf.find(hash1)
+            hash_uf.find(hash2)
+            hash_uf.union(hash1, hash2)
+            direct_pairs.add((hash1, hash2))
+            direct_pairs.add((hash2, hash1))
+
+        duplicate_groups: Dict[str, List[str]] = {}
+        processed: Set[str] = set()
+        seen_groups = set()
+        for _root, group in hash_uf.groups().items():
+            if len(group) < 2:
+                continue
+            group_id = min(group)
+            if group_id in seen_groups:
+                continue
+            seen_groups.add(group_id)
+
+            confirmed_group = [group_id]
+            for hash_val in group:
+                if hash_val == group_id:
+                    continue
+                directly_linked = (group_id, hash_val) in direct_pairs
+                if directly_linked or self._pair_is_similar(
+                    group_id, hash_val, parsed_image_objs, hash_to_files, skip_orb_verification
+                ):
+                    confirmed_group.append(hash_val)
+
+            all_files: List[str] = []
+            for hash_val in confirmed_group:
+                all_files.extend(hash_to_files.get(hash_val, []))
+            unique_files = list(dict.fromkeys(all_files))
+            if len(unique_files) > 1:
+                duplicate_groups[group_id] = unique_files
+                processed.update(confirmed_group)
+        return duplicate_groups, processed
+
+    def _group_by_similarity_single_hash(self, hash_groups: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        """Group exact hashes, and single perceptual hashes within the Hamming threshold."""
+        duplicate_groups: Dict[str, List[str]] = {}
+        phash_to_files: Dict[str, List[str]] = defaultdict(list)
+
+        for hash_val, files in hash_groups.items():
+            unique_files = list(dict.fromkeys(files))
+            body = ''
+            if isinstance(hash_val, str) and hash_val.startswith('img_'):
+                body = hash_val[4:]
+            if body and '_' not in body:
+                phash_to_files[body].extend(unique_files)
+            elif len(unique_files) > 1:
+                duplicate_groups[hash_val] = unique_files
+
+        if len(phash_to_files) < 2 and not any(len(v) > 1 for v in phash_to_files.values()):
+            return duplicate_groups
+        if not IMAGEHASH_AVAILABLE:
+            for phash, files in phash_to_files.items():
+                unique_files = list(dict.fromkeys(files))
+                if len(unique_files) > 1:
+                    duplicate_groups[f"img_{phash}"] = unique_files
+            return duplicate_groups
+
+        phash_objs = {}
+        for phash in phash_to_files:
+            try:
+                phash_objs[phash] = imagehash.hex_to_hash(phash)
+            except Exception:
+                phash_objs[phash] = None
+
+        uf = UnionFind()
+        phashes = list(phash_to_files.keys())
+        for phash in phashes:
+            uf.find(phash)
+
+        threshold = self.hamming_threshold
+        pairs = []
+        if len(phashes) > 120:
+            buckets = defaultdict(list)
+            num_bands = 8
+            bits_per_band = 8
+            for phash in phashes:
+                obj = phash_objs.get(phash)
+                if obj is None:
+                    continue
+                try:
+                    hash_bits = obj.hash.flatten()
+                    for band_idx in range(num_bands):
+                        start_bit = (band_idx * bits_per_band) % 64
+                        sampled_bits = [
+                            int(hash_bits[(start_bit + i * 7) % 64]) for i in range(bits_per_band)
+                        ]
+                        bucket_key = (band_idx, int(''.join(map(str, sampled_bits)), 2))
+                        buckets[bucket_key].append(phash)
+                except Exception:
+                    continue
+            seen_pairs = set()
+            for bucket_items in buckets.values():
+                if len(bucket_items) < 2:
+                    continue
+                for ph1, ph2 in iter_capped_pairs(bucket_items):
+                    pair_key = (ph1, ph2) if ph1 < ph2 else (ph2, ph1)
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
+                    pairs.append(pair_key)
+        else:
+            for i, ph1 in enumerate(phashes):
+                for ph2 in phashes[i + 1:]:
+                    pairs.append((ph1, ph2))
+
+        for ph1, ph2 in pairs:
+            obj1 = phash_objs.get(ph1)
+            obj2 = phash_objs.get(ph2)
+            if obj1 is None or obj2 is None:
+                continue
+            try:
+                if obj1 - obj2 <= threshold:
+                    uf.union(ph1, ph2)
+            except Exception:
+                continue
+
+        for _root, members in uf.groups().items():
+            representative = min(members)
+            rep_obj = phash_objs.get(representative)
+            confirmed = []
+            for phash in members:
+                if phash == representative:
+                    confirmed.append(phash)
+                    continue
+                other = phash_objs.get(phash)
+                if rep_obj is None or other is None:
+                    continue
+                try:
+                    if rep_obj - other <= threshold:
+                        confirmed.append(phash)
+                except Exception:
+                    continue
+            grouped_files: List[str] = []
+            for phash in confirmed:
+                grouped_files.extend(phash_to_files.get(phash, []))
+            unique_files = list(dict.fromkeys(grouped_files))
+            if len(unique_files) > 1:
+                duplicate_groups[f"img_{representative}"] = unique_files
+        return duplicate_groups
     
     def _group_by_similarity_multi_hash(self, hash_groups: Dict[str, List[str]], skip_orb_verification: bool = False) -> Dict[str, List[str]]:
         """
@@ -2167,18 +2525,20 @@ class ScanEngine:
         #   while still detecting duplicates.
         HAMMING_THRESHOLD = self.hamming_threshold
         
-        # Voting mechanism: require at least N out of 4 algorithms to agree
-        # Use configurable agreement from instance (default: 3)
-        MIN_AGREEMENT = self.min_agreement
-        
-        # Parse multi-hash strings and group by similarity
-        hash_to_files = {}  # hash_string -> [files]
+        # Perceptual multi-hashes go through voting. Everything else (MD5, video
+        # composites, single-hash fallbacks) is an exact match only — dropping
+        # those keys used to hide document and audio duplicates in image modes.
+        hash_to_files = {}
+        exact_plain_groups = {}
         for hash_val, files in hash_groups.items():
-            if hash_val and isinstance(hash_val, str) and '_' in hash_val:
-                hash_to_files[hash_val] = files
-        
+            unique_files = list(dict.fromkeys(files))
+            if self._parse_multi_hash_parts(hash_val):
+                hash_to_files[hash_val] = unique_files
+            elif len(unique_files) > 1:
+                exact_plain_groups[hash_val] = unique_files
+
         if not hash_to_files:
-            return {}
+            return exact_plain_groups
         
         # Build similarity groups with optimizations
         duplicate_groups = {}
@@ -2190,14 +2550,7 @@ class ScanEngine:
         # Optimization: Pre-parse all hashes to avoid repeated parsing
         parsed_hashes = {}  # hash_string -> (avg, phash, dhash, whash) or None
         for hash_val, files in hash_list:
-            try:
-                parts = hash_val.split('_')
-                if len(parts) == 4:
-                    parsed_hashes[hash_val] = tuple(parts)
-                else:
-                    parsed_hashes[hash_val] = None
-            except Exception:
-                parsed_hashes[hash_val] = None
+            parsed_hashes[hash_val] = self._parse_multi_hash_parts(hash_val)
         
         parsed_image_objs = {}
         for hash_val, _fl in hash_list:
@@ -2234,15 +2587,14 @@ class ScanEngine:
                         orb_uf = UnionFind()
                         for f in unique_files:
                             orb_uf.find(f)
-                        
-                        for i, file1 in enumerate(unique_files):
-                            for file2 in unique_files[i + 1:]:
-                                logger.debug(f"DEBUG: Verifying exact match pair: {os.path.basename(file1)} <-> {os.path.basename(file2)}")
-                                if self._verify_similarity_opencv(hash_val, hash_val, [file1], [file2], method=self.opencv_verification_method):
-                                    logger.debug(f"DEBUG: ORB verification passed for pair")
-                                    orb_uf.union(file1, file2)
-                                else:
-                                    logger.debug(f"DEBUG: ORB verification failed for pair")
+
+                        for file1, file2 in iter_capped_pairs(unique_files):
+                            logger.debug(f"DEBUG: Verifying exact match pair: {os.path.basename(file1)} <-> {os.path.basename(file2)}")
+                            if self._verify_similarity_opencv(hash_val, hash_val, [file1], [file2], method=self.opencv_verification_method):
+                                logger.debug(f"DEBUG: ORB verification passed for pair")
+                                orb_uf.union(file1, file2)
+                            else:
+                                logger.debug(f"DEBUG: ORB verification failed for pair")
                         
                         group_count = 0
                         for _root, group_files in orb_uf.groups().items():
@@ -2287,36 +2639,16 @@ class ScanEngine:
             
             logger.debug(f"DEBUG: LSH created {len(lsh_buckets)} buckets")
             candidate_pairs = set()
-            max_bucket_pair_items = 256
-            large_bucket_window = 64
-
-            def iter_bucket_pairs(bucket_items):
-                """Yield deterministic candidate pairs, pruning very large LSH buckets."""
-                item_count = len(bucket_items)
-                if item_count <= max_bucket_pair_items:
-                    for i, item1 in enumerate(bucket_items):
-                        for item2 in bucket_items[i + 1:]:
-                            yield item1, item2
-                    return
-
-                # Dense buckets can degrade into O(n^2). Sort by hash string and only
-                # compare nearby entries; the pHash/avg-hash filters below still decide
-                # whether the pair is close enough to keep.
-                sorted_items = sorted(bucket_items, key=lambda item: item[0])
-                for i, item1 in enumerate(sorted_items):
-                    end = min(item_count, i + large_bucket_window + 1)
-                    for item2 in sorted_items[i + 1:end]:
-                        yield item1, item2
 
             for bucket_key, bucket_items in lsh_buckets.items():
                 if len(bucket_items) < 2:
                     continue
-                for (hash1, files1, h_avg1, h_phash1), (hash2, files2, h_avg2, h_phash2) in iter_bucket_pairs(bucket_items):
+                for (hash1, files1, h_avg1, h_phash1), (hash2, files2, h_avg2, h_phash2) in iter_capped_pairs(
+                    bucket_items, key=lambda item: item[0]
+                ):
                     if hash1 == hash2:
                         continue
                     try:
-                        if h_avg1 and h_avg2 and (h_avg1 - h_avg2) > HAMMING_THRESHOLD * 2:
-                            continue
                         phash_dist = h_phash1 - h_phash2 if h_phash1 and h_phash2 else 999
                         if phash_dist <= HAMMING_THRESHOLD * 2:
                             if hash1 < hash2:
@@ -2333,65 +2665,11 @@ class ScanEngine:
                 hash1, hash2 = pair
                 if hash1 in processed or hash2 in processed:
                     return None
-                
-                objs1 = parsed_image_objs.get(hash1)
-                objs2 = parsed_image_objs.get(hash2)
-                if not objs1 or not objs2:
-                    return None
-                
-                try:
-                    h_avg1, h_phash1, h_dhash1, h_whash1 = objs1
-                    h_avg2, h_phash2, h_dhash2, h_whash2 = objs2
-                    
-                    agreements = 0
-                    distances = {}
-                    
-                    # Check all algorithms
-                    if h_avg1 and h_avg2:
-                        dist = h_avg1 - h_avg2
-                        distances['avg'] = dist
-                        if dist <= HAMMING_THRESHOLD:
-                            agreements += 1
-                    if h_phash1 and h_phash2:
-                        dist = h_phash1 - h_phash2
-                        distances['phash'] = dist
-                        if dist <= HAMMING_THRESHOLD:
-                            agreements += 1
-                    if h_dhash1 and h_dhash2:
-                        dist = h_dhash1 - h_dhash2
-                        distances['dhash'] = dist
-                        if dist <= HAMMING_THRESHOLD:
-                            agreements += 1
-                    if h_whash1 and h_whash2:
-                        dist = h_whash1 - h_whash2
-                        distances['whash'] = dist
-                        if dist <= HAMMING_THRESHOLD:
-                            agreements += 1
-                    
-                    files1 = hash_to_files.get(hash1, [])
-                    files2 = hash_to_files.get(hash2, [])
-                    if agreements >= MIN_AGREEMENT:
-                        logger.debug(f"DEBUG: Hash similarity match: {os.path.basename(files1[0]) if files1 else 'N/A'} <-> {os.path.basename(files2[0]) if files2 else 'N/A'}")
-                        logger.debug(f"DEBUG:   Agreements: {agreements}/{4}, distances: {distances}, threshold: {HAMMING_THRESHOLD}, min_agreement: {MIN_AGREEMENT}")
-                        # Optional OpenCV verification for higher accuracy
-                        # Skip ORB if deferred (for large datasets, verify only on deletion)
-                        should_verify_now = self.opencv_verification_method and not skip_orb_verification and not self.defer_orb_verification
-                        if should_verify_now:
-                            files1 = hash_to_files.get(hash1, [])
-                            files2 = hash_to_files.get(hash2, [])
-                            logger.debug(f"DEBUG: ORB verification called for pair: {os.path.basename(files1[0]) if files1 else 'N/A'} <-> {os.path.basename(files2[0]) if files2 else 'N/A'}")
-                            verification_result = self._verify_similarity_opencv(hash1, hash2, files1, files2, method=self.opencv_verification_method)
-                            logger.debug(f"DEBUG: ORB verification result: {verification_result}")
-                            if not verification_result:
-                                logger.debug(f"DEBUG: ORB verification failed, rejecting pair")
-                                return None  # Verification failed
-                            logger.debug(f"DEBUG: ORB verification passed")
-                        elif self.defer_orb_verification and self.opencv_verification_method:
-                            logger.debug(f"DEBUG: ORB verification deferred (will verify on deletion)")
-                        return (hash1, hash2)
-                    return None
-                except Exception:
-                    return None
+                if self._pair_is_similar(
+                    hash1, hash2, parsed_image_objs, hash_to_files, skip_orb_verification
+                ):
+                    return (hash1, hash2)
+                return None
             
             # Parallel comparison of candidate pairs (priority-ordered, bounded inflight)
             similarity_pairs = []
@@ -2481,150 +2759,247 @@ class ScanEngine:
                             while len(inflight_pairs) < max_pair_inflight and submit_pair():
                                 pass
             
-            # Build groups from similarity pairs using Union-Find
-            hash_uf = UnionFind()
-            for hash1, hash2 in similarity_pairs:
-                hash_uf.find(hash1)
-                hash_uf.find(hash2)
-                hash_uf.union(hash1, hash2)
-            
-            seen_groups = set()
-            for _root, group in hash_uf.groups().items():
-                if len(group) < 2:
-                    continue
-                group_id = min(group)
-                if group_id in seen_groups:
-                    continue
-                seen_groups.add(group_id)
-                
-                all_files = []
-                for h in group:
-                    if h in hash_to_files:
-                        all_files.extend(hash_to_files[h])
-                
-                if len(all_files) > 1:
-                    unique_files = list(dict.fromkeys(all_files))
-                    if len(unique_files) > 1:
-                        duplicate_groups[group_id] = unique_files
-                        processed.update(group)
+            grouped, newly_processed = self._assemble_similarity_groups(
+                similarity_pairs, hash_to_files, parsed_image_objs, skip_orb_verification
+            )
+            duplicate_groups.update(grouped)
+            processed.update(newly_processed)
         
         else:
-            # For small datasets, use original sequential approach (simpler and faster)
-            # More aggressive comparison limit for small datasets
-            MAX_COMPARISONS = min(500, total_hashes - 1)  # Reduced from 1000 to 500
-            
-            for i, (hash1, files1) in enumerate(remaining_hashes):
-                if hash1 in processed:
+            # Small libraries compare every remaining pair. The previous loop stopped
+            # at the first hash already claimed by an earlier seed, so later true
+            # matches in the same list were never examined.
+            similarity_pairs = []
+            for i, (hash1, _files1) in enumerate(remaining_hashes):
+                if hash1 in processed or self.scan_cancelled:
                     continue
-                
-                objs1 = parsed_image_objs.get(hash1)
-                if not objs1:
-                    continue
-                h_avg1, h_phash1, h_dhash1, h_whash1 = objs1
-                
-                # Find similar hashes
-                similar_files = list(files1)
-                
-                comparisons_made = 0
-                for j, (hash2, files2) in enumerate(remaining_hashes[i+1:], start=i+1):
-                    if hash2 in processed or comparisons_made >= MAX_COMPARISONS:
-                        break
-                    
-                    comparisons_made += 1
-                    
-                    objs2 = parsed_image_objs.get(hash2)
-                    if not objs2:
+                for hash2, _files2 in remaining_hashes[i + 1:]:
+                    if hash2 in processed:
                         continue
-                    h_avg2, h_phash2, h_dhash2, h_whash2 = objs2
-                    
-                    # Two-phase: Quick check with average_hash first
-                    agreements = 0
-                    if h_avg1 and h_avg2:
-                        try:
-                            dist = h_avg1 - h_avg2
-                            if dist <= HAMMING_THRESHOLD:
-                                agreements += 1
-                            elif dist > HAMMING_THRESHOLD * 2:
-                                # Early exit: very different, skip detailed comparison
-                                continue
-                        except Exception:
-                            pass
-                    
-                    # Detailed comparison only if average_hash was close
-                    if agreements > 0 or h_avg1 is None:
-                        if h_phash1 and h_phash2:
-                            try:
-                                if h_phash1 - h_phash2 <= HAMMING_THRESHOLD:
-                                    agreements += 1
-                            except Exception:
-                                pass
-                        
-                        if h_dhash1 and h_dhash2:
-                            try:
-                                if h_dhash1 - h_dhash2 <= HAMMING_THRESHOLD:
-                                    agreements += 1
-                            except Exception:
-                                pass
-                        
-                        if h_whash1 and h_whash2:
-                            try:
-                                if h_whash1 - h_whash2 <= HAMMING_THRESHOLD:
-                                    agreements += 1
-                            except Exception:
-                                pass
-                    
-                    if agreements >= MIN_AGREEMENT:
-                        logger.debug(f"DEBUG: Hash similarity match (small dataset path): {os.path.basename(similar_files[0]) if similar_files else 'N/A'} <-> {os.path.basename(files2[0]) if files2 else 'N/A'}")
-                        logger.debug(f"DEBUG:   Agreements: {agreements}/{4}, threshold: {HAMMING_THRESHOLD}, min_agreement: {MIN_AGREEMENT}")
-                        # Optional OpenCV verification for higher accuracy
-                        # Skip ORB if deferred (for large datasets, verify only on deletion)
-                        should_verify_now = self.opencv_verification_method and not skip_orb_verification and not self.defer_orb_verification
-                        if should_verify_now:
-                            logger.debug(f"DEBUG: ORB verification called (small dataset path)")
-                            if not self._verify_similarity_opencv(hash1, hash2, similar_files, files2, method=self.opencv_verification_method):
-                                logger.debug(f"DEBUG: ORB verification failed (small dataset path), skipping match")
-                                continue  # Verification failed, skip this match
-                            logger.debug(f"DEBUG: ORB verification passed (small dataset path)")
-                        elif self.defer_orb_verification and self.opencv_verification_method:
-                            logger.debug(f"DEBUG: ORB verification deferred (small dataset path)")
-                        similar_files.extend(files2)
-                        processed.add(hash2)
-                
-                if len(similar_files) > 1:
-                    unique_files = list(dict.fromkeys(similar_files))
-                    if len(unique_files) > 1:
-                        duplicate_groups[hash1] = unique_files
-                
-                processed.add(hash1)
+                    if self._pair_is_similar(
+                        hash1, hash2, parsed_image_objs, hash_to_files, skip_orb_verification
+                    ):
+                        similarity_pairs.append((hash1, hash2))
+            grouped, newly_processed = self._assemble_similarity_groups(
+                similarity_pairs, hash_to_files, parsed_image_objs, skip_orb_verification
+            )
+            duplicate_groups.update(grouped)
+            processed.update(newly_processed)
         
         # Merge exact match groups with similarity groups
         duplicate_groups.update(exact_match_groups)
+        duplicate_groups.update(exact_plain_groups)
         
         return duplicate_groups
     
+    def _load_pil_image_for_embedding(self, file_path: str) -> Optional['Image.Image']:
+        """Load an image as a PIL RGB image for embedding computation, covering RAW and
+        other formats the standard Image.open() can't handle directly."""
+        if self.is_raw_image_file(file_path):
+            try:
+                import rawpy
+                with rawpy.imread(file_path) as raw:
+                    try:
+                        thumb = raw.extract_thumb()
+                        if thumb.format == rawpy.ThumbFormat.JPEG:
+                            import io
+                            return Image.open(io.BytesIO(thumb.data)).convert('RGB')
+                        return Image.fromarray(thumb.data).convert('RGB')
+                    except Exception:
+                        rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True, half_size=True)
+                        return Image.fromarray(rgb).convert('RGB')
+            except Exception:
+                pass  # Fall through to the generic loader below
+
+        try:
+            img = self._load_image_from_prefetch(file_path)
+            if img is not None:
+                return img.convert('RGB')
+        except Exception:
+            pass
+
+        # Last resort: the grayscale fallback used by OpenCV verification (handles
+        # 10-bit TIFF etc.); replicate to 3 channels so preprocessing still works.
+        gray = self._load_image_alternative(file_path)
+        if gray is not None:
+            try:
+                return Image.fromarray(gray).convert('RGB')
+            except Exception:
+                return None
+        return None
+
+    def _preprocess_for_embedding(self, pil_img: 'Image.Image') -> 'np.ndarray':
+        """Resize/normalize a PIL image into the NCHW float32 tensor the model expects."""
+        import numpy as np
+        img = pil_img.resize((EMBEDDING_INPUT_SIZE, EMBEDDING_INPUT_SIZE), Image.Resampling.BILINEAR)
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        mean = np.array(EMBEDDING_MEAN, dtype=np.float32)
+        std = np.array(EMBEDDING_STD, dtype=np.float32)
+        arr = (arr - mean) / std
+        arr = arr.transpose(2, 0, 1)  # HWC -> CHW
+        return np.expand_dims(arr, axis=0)  # add batch dim
+
+    def _get_embedding_session(self):
+        """Lazily load the ONNX embedding model. Returns None (sticky) if unavailable."""
+        if self._embedding_session is not None:
+            return self._embedding_session
+        if self._embedding_session_failed:
+            return None
+
+        if not ONNXRUNTIME_AVAILABLE:
+            logger.warning("onnxruntime not installed: AI embedding verification unavailable")
+            self._embedding_session_failed = True
+            return None
+
+        model_path = get_embedding_model_path()
+        if not is_embedding_model_downloaded():
+            logger.warning(f"Embedding model not found at {model_path}: AI embedding verification unavailable")
+            self._embedding_session_failed = True
+            return None
+
+        try:
+            import onnxruntime as ort
+            self._embedding_session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+            return self._embedding_session
+        except Exception as e:
+            logger.warning(f"Failed to load embedding model: {e}")
+            self._embedding_session_failed = True
+            return None
+
+    def _compute_embedding(self, file_path: str) -> Optional['np.ndarray']:
+        """Compute (and cache) an L2-normalized embedding vector plus a color-histogram
+        signature for a file. Returns (embedding, color_histogram) or None.
+
+        The color histogram exists to cover a real blind spot: an ImageNet classifier's
+        logits (and, separately, ORB run on grayscale) are largely color-invariant, so a
+        product photo that differs only by color (e.g. blue vs red, same layout) can score
+        a high cosine similarity despite being a clearly different image. Requiring the
+        color histograms to also match closes that gap cheaply.
+        """
+        import numpy as np
+
+        with self._embedding_cache_lock:
+            cached = self._embedding_cache.get(file_path)
+        if cached is not None:
+            return cached
+
+        session = self._get_embedding_session()
+        if session is None:
+            return None
+
+        pil_img = self._load_pil_image_for_embedding(file_path)
+        if pil_img is None:
+            return None
+
+        try:
+            input_tensor = self._preprocess_for_embedding(pil_img)
+            input_name = session.get_inputs()[0].name
+            outputs = session.run(None, {input_name: input_tensor})
+            vec = outputs[0].flatten().astype(np.float32)
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+
+            color_signature = self._compute_color_signature(pil_img)
+
+            result = (vec, color_signature)
+            with self._embedding_cache_lock:
+                if len(self._embedding_cache) >= self._embedding_cache_max_size:
+                    self._embedding_cache.pop(next(iter(self._embedding_cache)))
+                self._embedding_cache[file_path] = result
+            return result
+        except Exception as e:
+            logger.debug(f"DEBUG: Embedding computation failed for {file_path}: {e}")
+            return None
+        finally:
+            try:
+                pil_img.close()
+            except Exception:
+                pass
+
+    def _compute_color_signature(self, pil_img: 'Image.Image') -> 'np.ndarray':
+        """Small position-aware color thumbnail (24x24 RGB, 0-1 floats) used as a color
+        signature. A whole-image color histogram was tried first, but it discards spatial
+        position: a small colored region on a large shared background barely moves a
+        global histogram (the background dominates the average), so a product photo
+        that's identical except one colored part gets swapped would still look
+        "same color" on average. Keeping position lets the comparison catch that."""
+        import numpy as np
+        small = pil_img.resize((24, 24), Image.Resampling.BILINEAR).convert('RGB')
+        return np.asarray(small, dtype=np.float32) / 255.0
+
+    def _color_signature_similarity(self, sig1: 'np.ndarray', sig2: 'np.ndarray', grid: int = 4) -> float:
+        """Compare two color signatures by their single most-different grid cell, not the
+        average difference — a small swapped region should fail even if it's a small
+        fraction of total pixels, which an average (or a histogram) would dilute away."""
+        import numpy as np
+        size = sig1.shape[0]
+        cell = size // grid
+        worst_mad = 0.0
+        for gy in range(grid):
+            for gx in range(grid):
+                c1 = sig1[gy * cell:(gy + 1) * cell, gx * cell:(gx + 1) * cell]
+                c2 = sig2[gy * cell:(gy + 1) * cell, gx * cell:(gx + 1) * cell]
+                mad = float(np.mean(np.abs(c1 - c2)))
+                worst_mad = max(worst_mad, mad)
+        return 1.0 - worst_mad
+
+    def _verify_similarity_embedding(self, file1: str, file2: str) -> bool:
+        """Verify similarity using cosine similarity of CNN embeddings, gated by a
+        position-aware color check. Semantic content comparison is far more resistant to
+        coincidental low-level-structure matches (flat backgrounds, shared texture) than
+        perceptual hashing or ORB/SIFT; the color check catches the classifier's own
+        color-invariance blind spot (see _compute_embedding)."""
+        import numpy as np
+        result1 = self._compute_embedding(file1)
+        result2 = self._compute_embedding(file2)
+        if result1 is None or result2 is None:
+            return False  # Can't verify, so don't confirm as duplicate
+        try:
+            vec1, sig1 = result1
+            vec2, sig2 = result2
+            similarity = float(np.dot(vec1, vec2))
+            if similarity < self.embedding_similarity_threshold:
+                return False
+            color_similarity = self._color_signature_similarity(sig1, sig2)
+            return color_similarity >= self.embedding_color_similarity_threshold
+        except Exception:
+            return False
+
     def _verify_similarity_opencv(self, hash1: str, hash2: str, files1: List[str], files2: List[str], method: str = 'ssim') -> bool:
         """
-        Verify image similarity using OpenCV methods.
-        
+        Verify image similarity using OpenCV methods, or AI embeddings.
+
         Methods (speed order, fastest to slowest):
         - 'orb': ORB feature matching (~100x faster than SIFT, good accuracy)
         - 'ssim': Structural Similarity Index (medium speed, high accuracy)
         - 'sift': Scale-Invariant Feature Transform (slowest, highest accuracy)
-        
+        - 'embedding': CNN embedding cosine similarity (semantic, most resistant to
+          false positives from shared texture/structure; requires onnxruntime + model)
+
         Args:
             hash1, hash2: Hash strings (not used, but kept for consistency)
             files1, files2: File paths to compare
-            method: Verification method ('orb', 'ssim', or 'sift')
-            
+            method: Verification method ('orb', 'ssim', 'sift', or 'embedding')
+
         Returns:
             True if images are similar, False otherwise
         """
+        if method == 'embedding':
+            file1 = files1[0] if files1 else None
+            file2 = files2[0] if files2 else None
+            if not file1 or not file2 or not os.path.exists(file1) or not os.path.exists(file2):
+                return False
+            return self._verify_similarity_embedding(file1, file2)
+
         try:
             import cv2
             import numpy as np
         except ImportError:
-            # OpenCV not available, skip verification
-            return True  # Default to accepting if OpenCV not available
+            # OpenCV not available: verification cannot run, so reject rather than
+            # silently accept unverified pairs as duplicates.
+            logger.warning("OpenCV not available: skipping similarity verification, treating candidate as not confirmed")
+            return False
         
         try:
             import cv2
@@ -2650,7 +3025,7 @@ class ScanEngine:
                 
                 if not file1 or not file2 or not os.path.exists(file1) or not os.path.exists(file2):
                     logger.debug(f"DEBUG: OpenCV {method} verification skipped: files not found or invalid")
-                    return True  # Default to accepting if files don't exist
+                    return False  # Can't verify, so don't confirm as duplicate
                 
                 # Read images - try OpenCV first, fallback to PIL/rawpy for unsupported formats
                 # OpenCV may fail for: 10-bit TIFF, RAW formats (ARW, CR2, NEF, etc.)
@@ -2668,31 +3043,31 @@ class ScanEngine:
                 if img1 is None:
                     img1 = self._load_image_alternative(file1)
                     if img1 is None:
-                        # Skip this pair if we can't read the image
-                        return True  # Default to accepting if images can't be read
-                
+                        # Can't read the image, so can't verify: don't confirm as duplicate
+                        return False
+
                 if img2 is None:
                     img2 = self._load_image_alternative(file2)
                     if img2 is None:
-                        # Skip this pair if we can't read the image
-                        return True  # Default to accepting if images can't be read
-                
+                        # Can't read the image, so can't verify: don't confirm as duplicate
+                        return False
+
                 if img1 is None or img2 is None:
-                    return True  # Default to accepting if images can't be read
+                    return False  # Can't verify, so don't confirm as duplicate
                 
                 # Resize to same size for comparison (use smaller dimension)
                 # Validate images before resizing
                 if img1 is None or img2 is None or len(img1.shape) < 2 or len(img2.shape) < 2:
                     logger.debug(f"DEBUG: Invalid images before resize - img1: {img1.shape if img1 is not None else None}, img2: {img2.shape if img2 is not None else None}")
-                    return True  # Default to accepting if images are invalid
-                
+                    return False  # Can't verify, so don't confirm as duplicate
+
                 h1, w1 = img1.shape[:2]
                 h2, w2 = img2.shape[:2]
-                
+
                 # Ensure valid dimensions
                 if h1 <= 0 or w1 <= 0 or h2 <= 0 or w2 <= 0:
                     logger.debug(f"DEBUG: Invalid image dimensions - img1: {w1}x{h1}, img2: {w2}x{h2}")
-                    return True  # Default to accepting if dimensions are invalid
+                    return False  # Can't verify, so don't confirm as duplicate
                 
                 target_size = (min(w1, w2, 384), min(h1, h2, 384))  # Max 384x384 for better feature extraction (balance between speed and quality)
                 
@@ -2701,7 +3076,7 @@ class ScanEngine:
                     img2_resized = cv2.resize(img2, target_size, interpolation=cv2.INTER_AREA)
                 except Exception as resize_error:
                     logger.debug(f"DEBUG: Image resize failed: {resize_error} (img1: {w1}x{h1}, img2: {w2}x{h2}, target: {target_size})")
-                    return True  # Default to accepting if resize fails
+                    return False  # Can't verify, so don't confirm as duplicate
                 
                 if method == 'orb':
                     logger.debug(f"DEBUG: Calling _verify_orb for {os.path.basename(file1)} <-> {os.path.basename(file2)}")
@@ -2721,7 +3096,7 @@ class ScanEngine:
             
         except Exception as e:
             logger.debug(f"DEBUG: OpenCV {method} verification failed: {e}")
-            return True  # Default to accepting on error
+            return False  # Can't verify, so don't confirm as duplicate
     
     def _imread_safe(self, file_path: str, flags: int = None) -> Optional['np.ndarray']:
         """
@@ -3369,25 +3744,19 @@ class ScanEngine:
                 name_mtime_groups[(basename, mtime)].append(file_path)
 
             for group_files in name_mtime_groups.values():
-                if len(group_files) > 1:
+                if len(group_files) < 2:
+                    continue
+                # Same name, size, and timestamp is a strong hint, not proof.
+                # Confirm the bytes actually match before skipping the hash phase.
+                for cluster in self._cluster_by_partial_hash(group_files):
                     group_id = f"exact_size_name_ts_{group_id_counter}_{size}"
-                    exact_duplicate_groups[group_id] = group_files
-                    matched_in_group.update(group_files)
+                    exact_duplicate_groups[group_id] = cluster
+                    matched_in_group.update(cluster)
                     group_id_counter += 1
 
-            if len(size_group_files) - len(matched_in_group) == 2:
-                remaining_pair = [f for f in size_group_files if f not in matched_in_group]
-                if not self.is_image_file(remaining_pair[0]):
-                    group_id = f"exact_size_pair_{group_id_counter}_{size}"
-                    exact_duplicate_groups[group_id] = remaining_pair
-                    matched_in_group.update(remaining_pair)
-                    group_id_counter += 1
-                else:
-                    remaining_files.extend(remaining_pair)
-            else:
-                remaining_files.extend(
-                    file_path for file_path in size_group_files if file_path not in matched_in_group
-                )
+            remaining_files.extend(
+                file_path for file_path in size_group_files if file_path not in matched_in_group
+            )
 
         if report_ui:
             self._report_scan_progress(
@@ -3488,18 +3857,15 @@ class ScanEngine:
         merged_groups = duplicate_groups.copy()
         processed_pairs = set()
         
-        # Group files by base name (without extension) and similar timestamp
+        # Group by the real photo stem. Stripping every underscore turned
+        # IMG_0001 and IMG_0002 into the same key and merged unrelated bursts.
         base_name_groups = defaultdict(list)
         for file_path, (mtime, is_raw, hash_val) in file_info.items():
-            base_name = os.path.splitext(os.path.basename(file_path))[0]
-            # Normalize base name (remove common suffixes like _1, -copy, etc.)
-            normalized_base = base_name.lower().rsplit('_', 1)[0].rsplit('-', 1)[0]
-            time_bucket = int(mtime / time_threshold)
-            base_name_groups[(normalized_base, time_bucket)].append((file_path, mtime, is_raw, hash_val))
+            base_name_groups[self._photo_stem(file_path)].append((file_path, mtime, is_raw, hash_val))
         
-        # Check for RAW/JPEG pairs in the same base name group
-        for (base_name, time_bucket), files in base_name_groups.items():
-            if len(files) < 2:
+        # Check for RAW/JPEG pairs that share a stem and were taken together
+        for base_name, files in base_name_groups.items():
+            if not base_name or len(files) < 2:
                 continue
             
             # Separate RAW and JPEG files
@@ -3537,31 +3903,35 @@ class ScanEngine:
         
         return merged_groups
     
-    def scan_duplicate_files(self, scan_paths: List[str], use_imagehash: bool = False, use_multi_hash: bool = True, use_orb_verification: bool = False):
+    def scan_duplicate_files(self, scan_paths: List[str], use_imagehash: bool = False, use_multi_hash: bool = True, use_orb_verification: bool = False, use_embedding_verification: bool = False):
         """
         Main scanning function.
-        
+
         Args:
             scan_paths: List of directory paths to scan
             use_imagehash: Whether to use perceptual hashing for images and videos
             use_multi_hash: If True, use multi-algorithm hash; if False, use single algorithm (phash)
             use_orb_verification: If True, use ORB verification for perceptual hash matches
+            use_embedding_verification: If True, use CNN embedding similarity instead of ORB
+                (takes precedence over use_orb_verification if both are set)
         """
         try:
             self.scan_cancelled = False
             self.use_imagehash = use_imagehash and IMAGEHASH_AVAILABLE
             self.use_multi_hash = use_multi_hash if self.use_imagehash else False
-            
-            # Set OpenCV verification method if ORB verification is enabled
-            if use_orb_verification:
+
+            # Set verification method: embedding takes precedence over ORB if both are set
+            if use_embedding_verification:
+                self.opencv_verification_method = 'embedding'
+            elif use_orb_verification:
                 self.opencv_verification_method = 'orb'
             else:
                 self.opencv_verification_method = None
-            
+
             # Debug: Log hash mode and availability
-            logger.debug(f"DEBUG: scan_duplicate_files called with use_imagehash={use_imagehash}, use_multi_hash={use_multi_hash}, use_orb_verification={use_orb_verification}")
+            logger.debug(f"DEBUG: scan_duplicate_files called with use_imagehash={use_imagehash}, use_multi_hash={use_multi_hash}, use_orb_verification={use_orb_verification}, use_embedding_verification={use_embedding_verification}")
             logger.debug(f"DEBUG: Final settings: use_imagehash={self.use_imagehash}, use_multi_hash={self.use_multi_hash}, opencv_method={self.opencv_verification_method}")
-            
+
             # Check OpenCV availability (already imported at module level)
             if OPENCV_AVAILABLE:
                 try:
@@ -3751,8 +4121,16 @@ class ScanEngine:
                 force=True,
             )
             if not potential_duplicates_by_size:
-                self.status_callback("No duplicate files found.")
-                self.results_callback({})
+                self._flush_cache_writes()
+                if exact_duplicate_groups:
+                    if self.use_imagehash:
+                        exact_duplicate_groups = self._merge_raw_jpeg_by_timestamp(exact_duplicate_groups)
+                    self.status_callback("Scan complete.")
+                    self.file_groups_raw = dict(exact_duplicate_groups)
+                    self.results_callback(dict(exact_duplicate_groups))
+                else:
+                    self.status_callback("No duplicate files found.")
+                    self.results_callback({})
                 return
             
             # Phase 3: Partial hash pre-filtering (if not using imagehash)
@@ -3952,16 +4330,19 @@ class ScanEngine:
                 # This reduces false positives by requiring multiple algorithms to agree
                 self.status_callback(f"{phase_num}/{total_phases} Scanning: Grouping duplicates by similarity...")
                 duplicate_groups = self._group_by_similarity_multi_hash(hash_groups, skip_orb_verification=True)
+            elif self.use_imagehash:
+                # Single perceptual hash still has to allow a small Hamming distance.
+                # Exact string equality misses resized and recompressed copies.
+                self.status_callback(f"{phase_num}/{total_phases} Scanning: Grouping similar images...")
+                duplicate_groups = self._group_by_similarity_single_hash(hash_groups)
             else:
-                # Single hash or MD5: Use exact match (original behavior)
-                # ORB verification will be done in a separate phase
+                # MD5: identical hashes are identical files
                 self.status_callback(f"{phase_num}/{total_phases} Scanning: Grouping duplicates...")
                 
                 for hash_val, files in hash_groups.items():
                     if len(files) > 1:
                         unique_files = list(dict.fromkeys(files))
                         if len(unique_files) > 1:
-                            # No ORB verification here - it will be done in a separate phase
                             duplicate_groups[hash_val] = unique_files
             
             # Phase 5 (or 4): ORB Verification (if enabled)
@@ -4037,11 +4418,22 @@ class ScanEngine:
                                     timestamp_bucket = int(file_timestamps[file_path])
                                     name_timestamp_groups[(basename, timestamp_bucket)].append(file_path)
                             
-                            # If all files in this size group share the same (basename, timestamp), skip ORB
+                            # Files sharing size+name+timestamp are very likely identical, but that's
+                            # metadata, not content: verify one representative pair before trusting the
+                            # whole subgroup, so a same-metadata-but-different-content file (e.g. a
+                            # sync tool overwriting a file in place) still gets caught.
                             if len(name_timestamp_groups) == 1:
-                                skip_subgroups.append(size_files)
                                 basename, ts = list(name_timestamp_groups.keys())[0]
-                                logger.debug(f"DEBUG: Skipping ORB for subgroup with same size+name+timestamp: {len(size_files)} files, size={size}, name={basename}, timestamp={ts}")
+                                representative_ok = self._verify_similarity_opencv(
+                                    hash_val, hash_val, [size_files[0]], [size_files[1]],
+                                    method=self.opencv_verification_method
+                                )
+                                if representative_ok:
+                                    skip_subgroups.append(size_files)
+                                    logger.debug(f"DEBUG: Skipping ORB for subgroup with same size+name+timestamp (representative pair verified): {len(size_files)} files, size={size}, name={basename}, timestamp={ts}")
+                                else:
+                                    logger.debug(f"DEBUG: Representative pair failed verification despite matching size+name+timestamp: size={size}, name={basename}, timestamp={ts}")
+                                    need_orb_files.extend(size_files)
                             else:
                                 # Files with same size but different name/timestamp - need ORB verification
                                 need_orb_files.extend(size_files)
